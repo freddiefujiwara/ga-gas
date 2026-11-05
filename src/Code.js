@@ -10,6 +10,12 @@
  *   metrics    (default "screenPageViews,activeUsers,sessions") - comma separated
  *   dimensions (default "pagePath") - comma separated; empty means totals only
  *   limit      (default 25)
+ *   offset     (default 0) - row offset for paging together with limit
+ *   filter     - dimension filter clauses separated by ";", each clause is
+ *                "<dimension>:<matchType>:<value>", matchType is one of
+ *                exact / contains / beginsWith / endsWith / regexp.
+ *                Multiple clauses are combined with AND. Example:
+ *                filter=pagePath:contains:/blog/;sessionDefaultChannelGroup:exact:Organic Search
  *
  * The GA4 property ID comes from the Script Property GA4_PROPERTY_ID,
  * so it is never written in the source (see README "Setup").
@@ -30,9 +36,59 @@ function parseListParam_(value, fallback) {
     .filter((s) => s);
 }
 
+const MATCH_TYPES = {
+  exact: 'EXACT',
+  contains: 'CONTAINS',
+  beginsWith: 'BEGINS_WITH',
+  endsWith: 'ENDS_WITH',
+  regexp: 'FULL_REGEXP',
+};
+
+function parseFilterClauses_(value) {
+  if (value == null || value === '') {
+    return [];
+  }
+  return String(value)
+    .split(';')
+    .map((s) => s.trim())
+    .filter((s) => s)
+    .map((clause) => {
+      const first = clause.indexOf(':');
+      const second = clause.indexOf(':', first + 1);
+      if (first < 1 || second < 0) {
+        throw new Error(
+          'Invalid filter clause (expected <dimension>:<matchType>:<value>): ' + clause
+        );
+      }
+      const fieldName = clause.slice(0, first).trim();
+      const matchType = MATCH_TYPES[clause.slice(first + 1, second).trim()];
+      const filterValue = clause.slice(second + 1);
+      if (!fieldName || !matchType || filterValue === '') {
+        throw new Error(
+          'Invalid filter clause (expected <dimension>:<matchType>:<value>): ' + clause
+        );
+      }
+      return { fieldName, matchType, value: filterValue };
+    });
+}
+
+function buildDimensionFilter_(clauses) {
+  const expressions = clauses.map((c) => ({
+    filter: {
+      fieldName: c.fieldName,
+      stringFilter: { matchType: c.matchType, value: c.value, caseSensitive: false },
+    },
+  }));
+  if (expressions.length === 1) {
+    return expressions[0];
+  }
+  return { andGroup: { expressions } };
+}
+
 function parseRunParams_(parameter) {
   const p = parameter || {};
   const limit = Number(p.limit);
+  const offset = Number(p.offset);
   return {
     startDate: p.start || DEFAULT_START,
     endDate: p.end || DEFAULT_END,
@@ -42,6 +98,8 @@ function parseRunParams_(parameter) {
       DEFAULT_DIMENSIONS
     ),
     limit: Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : DEFAULT_LIMIT,
+    offset: Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0,
+    filters: parseFilterClauses_(p.filter),
   };
 }
 
@@ -51,7 +109,11 @@ function buildReportRequest_(params) {
     metrics: params.metrics.map((name) => ({ name })),
     dimensions: params.dimensions.map((name) => ({ name })),
     limit: String(params.limit),
+    offset: String(params.offset || 0),
   };
+  if (params.filters && params.filters.length > 0) {
+    body.dimensionFilter = buildDimensionFilter_(params.filters);
+  }
   if (params.dimensions.length > 0 && params.metrics.length > 0) {
     body.orderBys = [{ metric: { metricName: params.metrics[0] }, desc: true }];
   }
@@ -98,6 +160,8 @@ function doGet(e) {
       endDate: params.endDate,
       metrics: params.metrics,
       dimensions: params.dimensions,
+      filters: params.filters,
+      offset: params.offset,
       data: result.data,
     });
   } catch (err) {
@@ -108,6 +172,8 @@ function doGet(e) {
 if (typeof exports !== 'undefined') {
   exports.doGet = doGet;
   exports.parseListParam_ = parseListParam_;
+  exports.parseFilterClauses_ = parseFilterClauses_;
+  exports.buildDimensionFilter_ = buildDimensionFilter_;
   exports.parseRunParams_ = parseRunParams_;
   exports.buildReportRequest_ = buildReportRequest_;
   exports.fetchReport_ = fetchReport_;

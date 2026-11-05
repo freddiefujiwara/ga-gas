@@ -16,6 +16,8 @@ Muse の API 接続の仕組みは OAuth の入口が単一ドメインのサー
 - `metrics`（既定 screenPageViews,activeUsers,sessions）：カンマ区切り
 - `dimensions`（既定 pagePath）：カンマ区切り。空にすると合計のみ
 - `limit`（既定 25）
+- `offset`（既定 0）：limit と組み合わせてページングする
+- `filter`：ディメンションの絞り込み。書式は `<ディメンション>:<マッチ種別>:<値>`、マッチ種別は exact / contains / beginsWith / endsWith / regexp。複数条件は `;` 区切りで AND 結合。例：`filter=pagePath:contains:/blog/`
 
 ## Setup
 
@@ -38,4 +40,4 @@ Muse の API 接続の仕組みは OAuth の入口が単一ドメインのサー
 ## 注意
 
 - GAS の認可は黙って失効することがある。/exec がエラーやサインイン画面を返したら、エディタで doGet を実行して同意をやり直す。
-- Drive 上の置き場所：本番プロジェクトは API フォルダ内（2026-11-06 にマイドライブ直下から移動）。
+- Drive 上の置き場所：本番プロジェクトは API フォルダ内（2026-11-06 にマイドライブ直下から移動）。ステージング用プロジェクト ga4-gas-staging も同日作成（Script ID: 1fHczPxzhetaG4QC2whqGfUGwMuOXWY9o3p-1dquqIcKuv7IatyGp7xiU）。GitHub リポジトリ freddiefujiwara/ga4-gas で管理し、PR（ブランチ push）→ ステージング、main マージ → 本番に CI デプロイされる。

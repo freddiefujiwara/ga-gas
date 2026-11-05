@@ -171,6 +171,8 @@ describe('Code.js', () => {
         metrics: ['screenPageViews', 'activeUsers', 'sessions'],
         dimensions: ['pagePath'],
         limit: 25,
+        offset: 0,
+        filters: [],
       });
     });
 
@@ -181,6 +183,85 @@ describe('Code.js', () => {
     it('rejects zero and negative limits', () => {
       expect(Code.parseRunParams_({ limit: '0' }).limit).toBe(25);
       expect(Code.parseRunParams_({ limit: '-3' }).limit).toBe(25);
+    });
+
+    it('parses a valid offset and rejects invalid ones', () => {
+      expect(Code.parseRunParams_({ offset: '25' }).offset).toBe(25);
+      expect(Code.parseRunParams_({ offset: '2.9' }).offset).toBe(2);
+      expect(Code.parseRunParams_({ offset: '-5' }).offset).toBe(0);
+      expect(Code.parseRunParams_({ offset: 'abc' }).offset).toBe(0);
+    });
+  });
+
+  describe('parseFilterClauses_', () => {
+    it('returns an empty list for missing or empty input', () => {
+      expect(Code.parseFilterClauses_(null)).toEqual([]);
+      expect(Code.parseFilterClauses_('')).toEqual([]);
+    });
+
+    it('parses a single clause', () => {
+      expect(Code.parseFilterClauses_('pagePath:contains:/blog/')).toEqual([
+        { fieldName: 'pagePath', matchType: 'CONTAINS', value: '/blog/' },
+      ]);
+    });
+
+    it('parses multiple clauses and keeps colons inside the value', () => {
+      const clauses = Code.parseFilterClauses_(
+        'pagePath:beginsWith:/blog/;sessionDefaultChannelGroup:exact:Organic Search'
+      );
+      expect(clauses).toEqual([
+        { fieldName: 'pagePath', matchType: 'BEGINS_WITH', value: '/blog/' },
+        {
+          fieldName: 'sessionDefaultChannelGroup',
+          matchType: 'EXACT',
+          value: 'Organic Search',
+        },
+      ]);
+    });
+
+    it('supports endsWith and regexp', () => {
+      expect(Code.parseFilterClauses_('pagePath:endsWith:.html')[0].matchType).toBe(
+        'ENDS_WITH'
+      );
+      expect(Code.parseFilterClauses_('pagePath:regexp:^/a:b$')[0]).toEqual({
+        fieldName: 'pagePath',
+        matchType: 'FULL_REGEXP',
+        value: '^/a:b$',
+      });
+    });
+
+    it('throws for malformed clauses', () => {
+      expect(() => Code.parseFilterClauses_('pagePath')).toThrow('Invalid filter clause');
+      expect(() => Code.parseFilterClauses_('pagePath:typo:x')).toThrow(
+        'Invalid filter clause'
+      );
+      expect(() => Code.parseFilterClauses_('pagePath:exact:')).toThrow(
+        'Invalid filter clause'
+      );
+      expect(() => Code.parseFilterClauses_(':exact:x')).toThrow('Invalid filter clause');
+    });
+  });
+
+  describe('buildDimensionFilter_', () => {
+    it('returns a plain filter for one clause', () => {
+      const filter = Code.buildDimensionFilter_([
+        { fieldName: 'pagePath', matchType: 'EXACT', value: '/' },
+      ]);
+      expect(filter).toEqual({
+        filter: {
+          fieldName: 'pagePath',
+          stringFilter: { matchType: 'EXACT', value: '/', caseSensitive: false },
+        },
+      });
+    });
+
+    it('wraps multiple clauses in an AND group', () => {
+      const filter = Code.buildDimensionFilter_([
+        { fieldName: 'pagePath', matchType: 'CONTAINS', value: '/blog/' },
+        { fieldName: 'deviceCategory', matchType: 'EXACT', value: 'mobile' },
+      ]);
+      expect(filter.andGroup.expressions).toHaveLength(2);
+      expect(filter.andGroup.expressions[1].filter.fieldName).toBe('deviceCategory');
     });
   });
 
@@ -207,6 +288,61 @@ describe('Code.js', () => {
         limit: 10,
       });
       expect(body.orderBys).toBeUndefined();
+    });
+
+    it('includes offset and dimensionFilter when provided', () => {
+      const body = Code.buildReportRequest_({
+        startDate: '28daysAgo',
+        endDate: 'today',
+        metrics: ['sessions'],
+        dimensions: ['pagePath'],
+        limit: 10,
+        offset: 30,
+        filters: [{ fieldName: 'pagePath', matchType: 'CONTAINS', value: '/blog/' }],
+      });
+      expect(body.offset).toBe('30');
+      expect(body.dimensionFilter.filter.fieldName).toBe('pagePath');
+    });
+
+    it('defaults the offset to 0 and omits dimensionFilter without filters', () => {
+      const body = Code.buildReportRequest_({
+        startDate: '28daysAgo',
+        endDate: 'today',
+        metrics: ['sessions'],
+        dimensions: ['pagePath'],
+        limit: 10,
+      });
+      expect(body.offset).toBe('0');
+      expect(body.dimensionFilter).toBeUndefined();
+    });
+  });
+
+  describe('doGet with filter and offset', () => {
+    it('passes filter and offset through to the request', () => {
+      setProperty(PROPERTY_ID);
+      mockFetch(200, { rows: [] });
+      Code.doGet({
+        parameter: { filter: 'pagePath:contains:/list-of-stuff/', offset: '50', limit: '10' },
+      });
+      const json = lastJson();
+      expect(json.ok).toBe(true);
+      expect(json.filters).toEqual([
+        { fieldName: 'pagePath', matchType: 'CONTAINS', value: '/list-of-stuff/' },
+      ]);
+      expect(json.offset).toBe(50);
+      const body = JSON.parse(global.UrlFetchApp.fetch.mock.calls[0][1].payload);
+      expect(body.offset).toBe('50');
+      expect(body.limit).toBe('10');
+      expect(body.dimensionFilter.filter.stringFilter.value).toBe('/list-of-stuff/');
+    });
+
+    it('returns an error JSON for an invalid filter clause', () => {
+      setProperty(PROPERTY_ID);
+      mockFetch(200, { rows: [] });
+      Code.doGet({ parameter: { filter: 'pagePath' } });
+      const json = lastJson();
+      expect(json.ok).toBe(false);
+      expect(json.error).toContain('Invalid filter clause');
     });
   });
 });

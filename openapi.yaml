@@ -49,6 +49,19 @@ paths:
           schema:
             type: integer
             default: 25
+        - name: offset
+          in: query
+          description: Row offset for paging together with limit.
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: filter
+          in: query
+          description: Dimension filter clauses separated by ";", each "<dimension>:<matchType>:<value>" with matchType one of exact, contains, beginsWith, endsWith, regexp. Multiple clauses are combined with AND.
+          required: false
+          schema:
+            type: string
       responses:
         '200':
           description: JSON with ok=true and the runReport result under data, or ok=false with an error.
