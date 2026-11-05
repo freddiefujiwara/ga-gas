@@ -10,6 +10,15 @@ Muse の API 接続の仕組みは OAuth の入口が単一ドメインのサー
 
 ※ ANYONE_ANONYMOUS のため、URLを知っている人は誰でも集計を読める。公開物（ブログ・SNS・他のリポジトリ）に載せないこと。
 
+## 一時アクセスリンク（トークン）
+
+フロント（/ga/）公開に合わせ、トークン発行後は `t` パラメータ必須になる（他のアプリの一時アクセスリンクと同じ方式）。
+
+- 発行：Apps Script エディタで `issueShareToken` を実行すると、ログに `https://freddiefujiwara.com/ga/?t=<token>` が出る。有効期間は30日。発行し直すと旧トークンは無効になる
+- 保管：スクリプトプロパティに SHA-256 ハッシュ（SHARE_TOKEN_HASH）と有効期限（SHARE_EXPIRES_AT）のみ。生トークンは保存しない
+- 無効化：`revokeShareToken` を実行する
+- 未発行の間はゲート無効（移行期間用）。本番は発行済みにして運用する
+
 ## パラメータ
 
 - `start`（既定 28daysAgo）/ `end`（既定 today）：GA4 の日付表現（YYYY-MM-DD も可）

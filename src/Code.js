@@ -22,6 +22,57 @@
  */
 
 const GA4_API_BASE = 'https://analyticsdata.googleapis.com/v1beta/properties/';
+const FRONTEND_URL = 'https://freddiefujiwara.com/ga/';
+const SHARE_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+// --- Temporary share token (same scheme as the other apps' share links) ---
+// The /exec URL itself is anonymous, so once a token has been issued the
+// data endpoints require it: the frontend (/ga/) carries it as "?t=".
+// Only the SHA-256 hash and the expiry are stored, in Script Properties.
+// Issuing a new token overwrites the old one, which invalidates old links.
+// Until the first token is issued the gate is disabled.
+
+function hashShareToken_(token) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(token))
+    .map((byte) => ((byte % 256) + 256) % 256)
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function issueShareToken() {
+  const now = new Date();
+  const expires = new Date(now.getTime() + SHARE_TTL_SECONDS * 1000);
+  const token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('SHARE_TOKEN_HASH', hashShareToken_(token));
+  props.setProperty('SHARE_EXPIRES_AT', expires.toISOString());
+  const url = FRONTEND_URL + '?t=' + token;
+  console.log('Share URL (expires ' + expires.toISOString() + '): ' + url);
+  return url;
+}
+
+function revokeShareToken() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('SHARE_TOKEN_HASH');
+  props.deleteProperty('SHARE_EXPIRES_AT');
+  console.log('Share token revoked');
+}
+
+function validateShareToken_(token, now) {
+  const props = PropertiesService.getScriptProperties();
+  const hash = props.getProperty('SHARE_TOKEN_HASH');
+  if (!hash) {
+    return true;
+  }
+  if (!token) {
+    return false;
+  }
+  const expiresAt = props.getProperty('SHARE_EXPIRES_AT');
+  if (!expiresAt || expiresAt <= (now || new Date()).toISOString()) {
+    return false;
+  }
+  return hashShareToken_(token) === hash;
+}
 const DEFAULT_START = '28daysAgo';
 const DEFAULT_END = 'today';
 const DEFAULT_METRICS = 'screenPageViews,activeUsers,sessions';
@@ -147,7 +198,11 @@ function doGet(e) {
         error: 'GA4_PROPERTY_ID is not set in Script Properties',
       });
     }
-    const params = parseRunParams_((e && e.parameter) || {});
+    const parameter = (e && e.parameter) || {};
+    if (!validateShareToken_(parameter.t)) {
+      return jsonOut_({ ok: false, error: 'unauthorized' });
+    }
+    const params = parseRunParams_(parameter);
     const body = buildReportRequest_(params);
     const result = fetchReport_(propertyId, body);
     if (result.status !== 200) {
@@ -171,6 +226,10 @@ function doGet(e) {
 
 if (typeof exports !== 'undefined') {
   exports.doGet = doGet;
+  exports.issueShareToken = issueShareToken;
+  exports.revokeShareToken = revokeShareToken;
+  exports.validateShareToken_ = validateShareToken_;
+  exports.hashShareToken_ = hashShareToken_;
   exports.parseListParam_ = parseListParam_;
   exports.parseFilterClauses_ = parseFilterClauses_;
   exports.buildDimensionFilter_ = buildDimensionFilter_;

@@ -1,18 +1,43 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { createHash } from 'node:crypto';
 import * as Code from '../src/Code.js';
 
 const PROPERTY_ID = '561730442';
 
 describe('Code.js', () => {
   let outputs;
+  let store;
+  let uuidCounter;
 
   beforeEach(() => {
     vi.clearAllMocks();
     outputs = [];
+    store = {};
+    uuidCounter = 0;
     delete global.UrlFetchApp;
     delete global.ContentService;
     delete global.PropertiesService;
     delete global.ScriptApp;
+    delete global.Utilities;
+
+    global.Utilities = {
+      DigestAlgorithm: { SHA_256: 'SHA_256' },
+      computeDigest: vi.fn((algo, value) => [
+        ...createHash('sha256').update(String(value)).digest(),
+      ]),
+      getUuid: vi.fn(() => '00000000-0000-4000-8000-00000000000' + uuidCounter++),
+    };
+    global.PropertiesService = {
+      getScriptProperties: () => ({
+        getProperty: (key) => (key in store ? store[key] : null),
+        setProperty: (key, value) => {
+          store[key] = value;
+        },
+        deleteProperty: (key) => {
+          delete store[key];
+        },
+      }),
+    };
 
     global.ContentService = {
       createTextOutput: vi.fn((text) => {
@@ -33,11 +58,11 @@ describe('Code.js', () => {
   });
 
   const setProperty = (value) => {
-    global.PropertiesService = {
-      getScriptProperties: () => ({
-        getProperty: vi.fn(() => value),
-      }),
-    };
+    if (value == null) {
+      delete store.GA4_PROPERTY_ID;
+    } else {
+      store.GA4_PROPERTY_ID = value;
+    }
   };
 
   const mockFetch = (status, body) => {
@@ -343,6 +368,77 @@ describe('Code.js', () => {
       const json = lastJson();
       expect(json.ok).toBe(false);
       expect(json.error).toContain('Invalid filter clause');
+    });
+  });
+
+  describe('share token gate', () => {
+    const enableGate = (expiresAt) => {
+      store.SHARE_TOKEN_HASH = Code.hashShareToken_('tok123');
+      store.SHARE_EXPIRES_AT = expiresAt || '2999-01-01T00:00:00.000Z';
+    };
+
+    it('is disabled until a token is issued', () => {
+      expect(Code.validateShareToken_(undefined)).toBe(true);
+      expect(Code.validateShareToken_('anything')).toBe(true);
+    });
+
+    it('accepts the issued token and rejects others', () => {
+      enableGate();
+      expect(Code.validateShareToken_('tok123')).toBe(true);
+      expect(Code.validateShareToken_('wrong')).toBe(false);
+      expect(Code.validateShareToken_(undefined)).toBe(false);
+      expect(Code.validateShareToken_('')).toBe(false);
+    });
+
+    it('rejects an expired token', () => {
+      enableGate('2000-01-01T00:00:00.000Z');
+      expect(Code.validateShareToken_('tok123')).toBe(false);
+    });
+
+    it('rejects when the expiry is missing', () => {
+      store.SHARE_TOKEN_HASH = Code.hashShareToken_('tok123');
+      expect(Code.validateShareToken_('tok123')).toBe(false);
+    });
+
+    it('blocks doGet without a valid token once issued', () => {
+      setProperty(PROPERTY_ID);
+      enableGate();
+      mockFetch(200, { rows: [] });
+      Code.doGet({ parameter: {} });
+      expect(lastJson()).toEqual({ ok: false, error: 'unauthorized' });
+      Code.doGet({ parameter: { t: 'tok123' } });
+      expect(lastJson().ok).toBe(true);
+    });
+
+    it('issueShareToken stores a hash and returns the frontend URL', () => {
+      const url = Code.issueShareToken();
+      expect(url).toMatch(/^https:\/\/freddiefujiwara\.com\/ga\/\?t=[0-9a-f]{64}$/);
+      const token = url.split('?t=')[1];
+      expect(store.SHARE_TOKEN_HASH).toBe(Code.hashShareToken_(token));
+      expect(store.SHARE_TOKEN_HASH).not.toBe(token);
+      expect(new Date(store.SHARE_EXPIRES_AT).getTime()).toBeGreaterThan(Date.now());
+      expect(Code.validateShareToken_(token)).toBe(true);
+    });
+
+    it('issuing a new token invalidates the previous one', () => {
+      const first = Code.issueShareToken().split('?t=')[1];
+      const second = Code.issueShareToken().split('?t=')[1];
+      expect(first).not.toBe(second);
+      expect(Code.validateShareToken_(first)).toBe(false);
+      expect(Code.validateShareToken_(second)).toBe(true);
+    });
+
+    it('revokeShareToken disables the gate again', () => {
+      const token = Code.issueShareToken().split('?t=')[1];
+      Code.revokeShareToken();
+      expect(store.SHARE_TOKEN_HASH).toBeUndefined();
+      expect(Code.validateShareToken_(token)).toBe(true);
+    });
+
+    it('hashShareToken_ produces a SHA-256 hex digest', () => {
+      expect(Code.hashShareToken_('abc')).toBe(
+        'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+      );
     });
   });
 });
