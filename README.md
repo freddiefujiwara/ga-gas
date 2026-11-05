@@ -10,14 +10,15 @@ Muse の API 接続の仕組みは OAuth の入口が単一ドメインのサー
 
 ※ ANYONE_ANONYMOUS のため、URLを知っている人は誰でも集計を読める。公開物（ブログ・SNS・他のリポジトリ）に載せないこと。
 
-## 一時アクセスリンク（トークン）
+## 認証（Googleログイン＋一時アクセスリンク）
 
-フロント（/ga/）公開に合わせ、トークン発行後は `t` パラメータ必須になる（他のアプリの一時アクセスリンクと同じ方式）。
+他のアプリ（health・asset・tweet）と同じ方式。
 
-- 発行：Apps Script エディタで `issueShareToken` を実行すると、ログに `https://freddiefujiwara.com/ga/?t=<token>` が出る。有効期間は30日。発行し直すと旧トークンは無効になる
+- スクリプトプロパティ：`GOOGLE_OAUTH_CLIENT_ID`（health と同じクライアント）と `AVAILABLE_GMAILS`（許可するメールアドレス、カンマ区切り）。両方が設定されている間だけ認証が有効になる
+- データ取得は、検証済み Google ID トークン（`id_token` パラメータまたは Authorization: Bearer）か、一時アクセスリンクの `share_token` パラメータのどちらかで通る
+- 一時アクセスリンク：ログイン状態で `action=issue_share`（ID トークン必須）を呼ぶと30日有効なトークンを発行。再発行で旧トークンは無効。`action=revoke_share` で即時無効化。フロントでは URL の `#share=` フラグメントで受け渡す（サーバーやリファラに残らない）
 - 保管：スクリプトプロパティに SHA-256 ハッシュ（SHARE_TOKEN_HASH）と有効期限（SHARE_EXPIRES_AT）のみ。生トークンは保存しない
-- 無効化：`revokeShareToken` を実行する
-- 未発行の間はゲート無効（移行期間用）。本番は発行済みにして運用する
+- エディタ用の補助：`issueShareToken` を実行するとログに発行済みURLが出る（初期発行用）
 
 ## パラメータ
 

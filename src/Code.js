@@ -25,12 +25,90 @@ const GA4_API_BASE = 'https://analyticsdata.googleapis.com/v1beta/properties/';
 const FRONTEND_URL = 'https://freddiefujiwara.com/ga/';
 const SHARE_TTL_SECONDS = 30 * 24 * 60 * 60;
 
-// --- Temporary share token (same scheme as the other apps' share links) ---
-// The /exec URL itself is anonymous, so once a token has been issued the
-// data endpoints require it: the frontend (/ga/) carries it as "?t=".
+// --- Authentication (same scheme as the other apps: health / asset / tweet) ---
+// Script Properties:
+//   GOOGLE_OAUTH_CLIENT_ID: OAuth client ID used to verify ID tokens
+//   AVAILABLE_GMAILS: comma-separated emails allowed to read the data
+// Data requests accept either a verified Google ID token (id_token
+// parameter or Authorization: Bearer header) or a temporary share token
+// (share_token parameter). The share token travels in the frontend URL
+// hash fragment (#share=...), so it never reaches servers or referrers.
+// issue_share / revoke_share actions require an ID token.
+// While the two properties above are unset, authentication is skipped
+// (migration period only; production runs with them set).
+
+function getScriptProperty_(key) {
+  return PropertiesService.getScriptProperties().getProperty(key) || '';
+}
+
+function isAuthConfigured_() {
+  return Boolean(getScriptProperty_('GOOGLE_OAUTH_CLIENT_ID')) &&
+    getAllowedEmails_().length > 0;
+}
+
+function extractIdToken_(e) {
+  const headers = (e && e.headers) || {};
+  const auth = headers.Authorization || headers.authorization || '';
+  const bearerMatch = String(auth).match(/^Bearer\s+(.+)$/i);
+  if (bearerMatch) {
+    return bearerMatch[1];
+  }
+  return (e && e.parameter && e.parameter.id_token) || '';
+}
+
+function getAllowedEmails_() {
+  return getScriptProperty_('AVAILABLE_GMAILS')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function verifyGoogleIdTokenOrThrow_(idToken) {
+  if (!idToken) {
+    throw new Error('missing id token');
+  }
+  const oauthClientId = getScriptProperty_('GOOGLE_OAUTH_CLIENT_ID');
+  if (!oauthClientId) {
+    throw new Error('missing GOOGLE_OAUTH_CLIENT_ID');
+  }
+  const response = UrlFetchApp.fetch(
+    'https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idToken),
+    { muteHttpExceptions: true }
+  );
+  if (response.getResponseCode() !== 200) {
+    throw new Error('token verification failed');
+  }
+  const payload = JSON.parse(response.getContentText());
+  const validIssuer =
+    payload.iss === 'accounts.google.com' || payload.iss === 'https://accounts.google.com';
+  if (!validIssuer) {
+    throw new Error('invalid iss');
+  }
+  if (payload.aud !== oauthClientId) {
+    throw new Error('invalid aud');
+  }
+  const expSeconds = Number(payload.exp || 0);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(expSeconds) || expSeconds <= nowSeconds) {
+    throw new Error('token expired');
+  }
+  const emailVerified = payload.email_verified === true || payload.email_verified === 'true';
+  if (!emailVerified) {
+    throw new Error('email not verified');
+  }
+  const email = String(payload.email || '').toLowerCase();
+  if (!email) {
+    throw new Error('missing email');
+  }
+  if (!getAllowedEmails_().includes(email)) {
+    throw new Error('forbidden email');
+  }
+  return { email, sub: payload.sub };
+}
+
+// --- Temporary share sessions ---
 // Only the SHA-256 hash and the expiry are stored, in Script Properties.
 // Issuing a new token overwrites the old one, which invalidates old links.
-// Until the first token is issued the gate is disabled.
 
 function hashShareToken_(token) {
   return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(token))
@@ -39,39 +117,51 @@ function hashShareToken_(token) {
     .join('');
 }
 
-function issueShareToken() {
+function issueShareSession_() {
   const now = new Date();
   const expires = new Date(now.getTime() + SHARE_TTL_SECONDS * 1000);
   const token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
   const props = PropertiesService.getScriptProperties();
   props.setProperty('SHARE_TOKEN_HASH', hashShareToken_(token));
   props.setProperty('SHARE_EXPIRES_AT', expires.toISOString());
-  const url = FRONTEND_URL + '?t=' + token;
-  console.log('Share URL (expires ' + expires.toISOString() + '): ' + url);
-  return url;
+  return {
+    share_token: token,
+    issued_at: now.toISOString(),
+    expires_at: expires.toISOString(),
+    ttl_seconds: SHARE_TTL_SECONDS,
+  };
 }
 
-function revokeShareToken() {
+function revokeShareSession_() {
   const props = PropertiesService.getScriptProperties();
   props.deleteProperty('SHARE_TOKEN_HASH');
   props.deleteProperty('SHARE_EXPIRES_AT');
-  console.log('Share token revoked');
+  return { revoked: true };
 }
 
-function validateShareToken_(token, now) {
+function validateShareToken_(token) {
+  if (!token) {
+    return null;
+  }
   const props = PropertiesService.getScriptProperties();
   const hash = props.getProperty('SHARE_TOKEN_HASH');
-  if (!hash) {
-    return true;
-  }
-  if (!token) {
-    return false;
+  if (!hash || hashShareToken_(token) !== hash) {
+    return null;
   }
   const expiresAt = props.getProperty('SHARE_EXPIRES_AT');
-  if (!expiresAt || expiresAt <= (now || new Date()).toISOString()) {
-    return false;
+  if (!expiresAt || expiresAt <= new Date().toISOString()) {
+    return null;
   }
-  return hashShareToken_(token) === hash;
+  return { expires_at: expiresAt };
+}
+
+// Editor helper: issue a token and log the frontend share URL.
+// Useful for bootstrapping before the frontend is deployed.
+function issueShareToken() {
+  const session = issueShareSession_();
+  const url = FRONTEND_URL + '#share=' + session.share_token;
+  console.log('Share URL (expires ' + session.expires_at + '): ' + url);
+  return url;
 }
 const DEFAULT_START = '28daysAgo';
 const DEFAULT_END = 'today';
@@ -199,8 +289,39 @@ function doGet(e) {
       });
     }
     const parameter = (e && e.parameter) || {};
-    if (!validateShareToken_(parameter.t)) {
-      return jsonOut_({ ok: false, error: 'unauthorized' });
+    let shareSession = null;
+    if (parameter.action === 'issue_share' || parameter.action === 'revoke_share') {
+      try {
+        verifyGoogleIdTokenOrThrow_(extractIdToken_(e));
+      } catch (error) {
+        return jsonOut_({ ok: false, status: 401, error: String((error && error.message) || error) });
+      }
+      const result =
+        parameter.action === 'issue_share' ? issueShareSession_() : revokeShareSession_();
+      return jsonOut_(Object.assign({ ok: true }, result));
+    }
+    if (isAuthConfigured_()) {
+      if (parameter.share_token) {
+        shareSession = validateShareToken_(parameter.share_token);
+        if (!shareSession) {
+          return jsonOut_({
+            ok: false,
+            status: 401,
+            error: 'share session expired or invalid',
+          });
+        }
+      } else {
+        try {
+          verifyGoogleIdTokenOrThrow_(extractIdToken_(e));
+        } catch (error) {
+          const message = String((error && error.message) || error);
+          return jsonOut_({
+            ok: false,
+            status: message === 'forbidden email' ? 403 : 401,
+            error: message,
+          });
+        }
+      }
     }
     const params = parseRunParams_(parameter);
     const body = buildReportRequest_(params);
@@ -217,6 +338,7 @@ function doGet(e) {
       dimensions: params.dimensions,
       filters: params.filters,
       offset: params.offset,
+      _share: shareSession ? { expires_at: shareSession.expires_at } : undefined,
       data: result.data,
     });
   } catch (err) {
@@ -227,9 +349,14 @@ function doGet(e) {
 if (typeof exports !== 'undefined') {
   exports.doGet = doGet;
   exports.issueShareToken = issueShareToken;
-  exports.revokeShareToken = revokeShareToken;
+  exports.issueShareSession_ = issueShareSession_;
+  exports.revokeShareSession_ = revokeShareSession_;
   exports.validateShareToken_ = validateShareToken_;
   exports.hashShareToken_ = hashShareToken_;
+  exports.isAuthConfigured_ = isAuthConfigured_;
+  exports.extractIdToken_ = extractIdToken_;
+  exports.getAllowedEmails_ = getAllowedEmails_;
+  exports.verifyGoogleIdTokenOrThrow_ = verifyGoogleIdTokenOrThrow_;
   exports.parseListParam_ = parseListParam_;
   exports.parseFilterClauses_ = parseFilterClauses_;
   exports.buildDimensionFilter_ = buildDimensionFilter_;
