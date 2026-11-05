@@ -1,18 +1,43 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { createHash } from 'node:crypto';
 import * as Code from '../src/Code.js';
 
 const PROPERTY_ID = '561730442';
 
 describe('Code.js', () => {
   let outputs;
+  let store;
+  let uuidCounter;
 
   beforeEach(() => {
     vi.clearAllMocks();
     outputs = [];
+    store = {};
+    uuidCounter = 0;
     delete global.UrlFetchApp;
     delete global.ContentService;
     delete global.PropertiesService;
     delete global.ScriptApp;
+    delete global.Utilities;
+
+    global.Utilities = {
+      DigestAlgorithm: { SHA_256: 'SHA_256' },
+      computeDigest: vi.fn((algo, value) => [
+        ...createHash('sha256').update(String(value)).digest(),
+      ]),
+      getUuid: vi.fn(() => '00000000-0000-4000-8000-00000000000' + uuidCounter++),
+    };
+    global.PropertiesService = {
+      getScriptProperties: () => ({
+        getProperty: (key) => (key in store ? store[key] : null),
+        setProperty: (key, value) => {
+          store[key] = value;
+        },
+        deleteProperty: (key) => {
+          delete store[key];
+        },
+      }),
+    };
 
     global.ContentService = {
       createTextOutput: vi.fn((text) => {
@@ -33,11 +58,11 @@ describe('Code.js', () => {
   });
 
   const setProperty = (value) => {
-    global.PropertiesService = {
-      getScriptProperties: () => ({
-        getProperty: vi.fn(() => value),
-      }),
-    };
+    if (value == null) {
+      delete store.GA4_PROPERTY_ID;
+    } else {
+      store.GA4_PROPERTY_ID = value;
+    }
   };
 
   const mockFetch = (status, body) => {
@@ -343,6 +368,206 @@ describe('Code.js', () => {
       const json = lastJson();
       expect(json.ok).toBe(false);
       expect(json.error).toContain('Invalid filter clause');
+    });
+  });
+
+  describe('share sessions', () => {
+    it('validates an issued token and rejects others', () => {
+      store.SHARE_TOKEN_HASH = Code.hashShareToken_('tok123');
+      store.SHARE_EXPIRES_AT = '2999-01-01T00:00:00.000Z';
+      expect(Code.validateShareToken_('tok123')).toEqual({
+        expires_at: '2999-01-01T00:00:00.000Z',
+      });
+      expect(Code.validateShareToken_('wrong')).toBeNull();
+      expect(Code.validateShareToken_(undefined)).toBeNull();
+      expect(Code.validateShareToken_('')).toBeNull();
+    });
+
+    it('rejects expired or unissued tokens', () => {
+      expect(Code.validateShareToken_('tok123')).toBeNull();
+      store.SHARE_TOKEN_HASH = Code.hashShareToken_('tok123');
+      store.SHARE_EXPIRES_AT = '2000-01-01T00:00:00.000Z';
+      expect(Code.validateShareToken_('tok123')).toBeNull();
+      delete store.SHARE_EXPIRES_AT;
+      expect(Code.validateShareToken_('tok123')).toBeNull();
+    });
+
+    it('issueShareSession_ stores only the hash and returns the token', () => {
+      const session = Code.issueShareSession_();
+      expect(session.share_token).toMatch(/^[0-9a-f]{64}$/);
+      expect(session.ttl_seconds).toBe(30 * 24 * 60 * 60);
+      expect(store.SHARE_TOKEN_HASH).toBe(Code.hashShareToken_(session.share_token));
+      expect(store.SHARE_TOKEN_HASH).not.toBe(session.share_token);
+      expect(Code.validateShareToken_(session.share_token)).not.toBeNull();
+    });
+
+    it('issuing a new token invalidates the previous one', () => {
+      const first = Code.issueShareSession_().share_token;
+      const second = Code.issueShareSession_().share_token;
+      expect(first).not.toBe(second);
+      expect(Code.validateShareToken_(first)).toBeNull();
+      expect(Code.validateShareToken_(second)).not.toBeNull();
+    });
+
+    it('revokeShareSession_ clears the stored token', () => {
+      const token = Code.issueShareSession_().share_token;
+      expect(Code.revokeShareSession_()).toEqual({ revoked: true });
+      expect(store.SHARE_TOKEN_HASH).toBeUndefined();
+      expect(Code.validateShareToken_(token)).toBeNull();
+    });
+
+    it('issueShareToken logs a #share= frontend URL', () => {
+      const url = Code.issueShareToken();
+      expect(url).toMatch(/^https:\/\/freddiefujiwara\.com\/ga\/#share=[0-9a-f]{64}$/);
+    });
+
+    it('hashShareToken_ produces a SHA-256 hex digest', () => {
+      expect(Code.hashShareToken_('abc')).toBe(
+        'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+      );
+    });
+  });
+
+  describe('google id token auth', () => {
+    const CLIENT_ID = 'test-client-id';
+    const EMAIL = 'owner@example.com';
+    const futureExp = () => Math.floor(Date.now() / 1000) + 3600;
+
+    const configureAuth = () => {
+      store.GOOGLE_OAUTH_CLIENT_ID = CLIENT_ID;
+      store.AVAILABLE_GMAILS = 'other@example.com, ' + EMAIL;
+    };
+
+    const mockAuthFetch = (tokeninfo) => {
+      global.UrlFetchApp = {
+        fetch: vi.fn((url) => {
+          if (String(url).startsWith('https://oauth2.googleapis.com/tokeninfo')) {
+            return {
+              getResponseCode: () => tokeninfo.status || 200,
+              getContentText: () => JSON.stringify(tokeninfo.payload || {}),
+            };
+          }
+          return {
+            getResponseCode: () => 200,
+            getContentText: () => JSON.stringify({ rows: [] }),
+          };
+        }),
+      };
+    };
+
+    const goodPayload = (overrides) =>
+      Object.assign(
+        {
+          iss: 'https://accounts.google.com',
+          aud: CLIENT_ID,
+          exp: futureExp(),
+          email_verified: 'true',
+          email: EMAIL,
+          sub: '12345',
+        },
+        overrides || {}
+      );
+
+    it('isAuthConfigured_ reflects the two properties', () => {
+      expect(Code.isAuthConfigured_()).toBe(false);
+      store.GOOGLE_OAUTH_CLIENT_ID = CLIENT_ID;
+      expect(Code.isAuthConfigured_()).toBe(false);
+      store.AVAILABLE_GMAILS = EMAIL;
+      expect(Code.isAuthConfigured_()).toBe(true);
+    });
+
+    it('extractIdToken_ prefers the Bearer header and falls back to the parameter', () => {
+      expect(
+        Code.extractIdToken_({ headers: { Authorization: 'Bearer abc' }, parameter: {} })
+      ).toBe('abc');
+      expect(Code.extractIdToken_({ parameter: { id_token: 'xyz' } })).toBe('xyz');
+      expect(Code.extractIdToken_({})).toBe('');
+      expect(Code.extractIdToken_(null)).toBe('');
+    });
+
+    it('verifies a good token', () => {
+      configureAuth();
+      mockAuthFetch({ payload: goodPayload() });
+      expect(Code.verifyGoogleIdTokenOrThrow_('token')).toEqual({
+        email: EMAIL,
+        sub: '12345',
+      });
+    });
+
+    it('rejects bad tokens for each reason', () => {
+      configureAuth();
+      const cases = [
+        [{ payload: goodPayload({ iss: 'https://evil.example' }) }, 'invalid iss'],
+        [{ payload: goodPayload({ aud: 'other' }) }, 'invalid aud'],
+        [{ payload: goodPayload({ exp: 1 }) }, 'token expired'],
+        [{ payload: goodPayload({ email_verified: 'false' }) }, 'email not verified'],
+        [{ payload: goodPayload({ email: '' }) }, 'missing email'],
+        [{ payload: goodPayload({ email: 'nope@example.com' }) }, 'forbidden email'],
+        [{ status: 400, payload: {} }, 'token verification failed'],
+      ];
+      for (const [tokeninfo, message] of cases) {
+        mockAuthFetch(tokeninfo);
+        expect(() => Code.verifyGoogleIdTokenOrThrow_('token')).toThrow(message);
+      }
+      expect(() => Code.verifyGoogleIdTokenOrThrow_('')).toThrow('missing id token');
+      delete store.GOOGLE_OAUTH_CLIENT_ID;
+      mockAuthFetch({ payload: goodPayload() });
+      expect(() => Code.verifyGoogleIdTokenOrThrow_('token')).toThrow(
+        'missing GOOGLE_OAUTH_CLIENT_ID'
+      );
+    });
+
+    it('doGet serves data with a valid id token', () => {
+      setProperty(PROPERTY_ID);
+      configureAuth();
+      mockAuthFetch({ payload: goodPayload() });
+      Code.doGet({ parameter: { id_token: 'token' } });
+      expect(lastJson().ok).toBe(true);
+    });
+
+    it('doGet rejects a missing token with 401 and a forbidden email with 403', () => {
+      setProperty(PROPERTY_ID);
+      configureAuth();
+      mockAuthFetch({ payload: goodPayload() });
+      Code.doGet({ parameter: {} });
+      expect(lastJson()).toEqual({ ok: false, status: 401, error: 'missing id token' });
+      mockAuthFetch({ payload: goodPayload({ email: 'nope@example.com' }) });
+      Code.doGet({ parameter: { id_token: 'token' } });
+      expect(lastJson().status).toBe(403);
+    });
+
+    it('doGet serves data with a valid share token and reports its expiry', () => {
+      setProperty(PROPERTY_ID);
+      configureAuth();
+      mockAuthFetch({ payload: goodPayload() });
+      const token = Code.issueShareSession_().share_token;
+      Code.doGet({ parameter: { share_token: token } });
+      const json = lastJson();
+      expect(json.ok).toBe(true);
+      expect(json._share.expires_at).toBe(store.SHARE_EXPIRES_AT);
+      Code.doGet({ parameter: { share_token: 'bogus' } });
+      expect(lastJson().status).toBe(401);
+    });
+
+    it('issue_share and revoke_share require an id token', () => {
+      setProperty(PROPERTY_ID);
+      configureAuth();
+      mockAuthFetch({ payload: goodPayload() });
+      Code.doGet({ parameter: { action: 'issue_share' } });
+      expect(lastJson().status).toBe(401);
+      Code.doGet({ parameter: { action: 'issue_share', id_token: 'token' } });
+      const issued = lastJson();
+      expect(issued.ok).toBe(true);
+      expect(issued.share_token).toMatch(/^[0-9a-f]{64}$/);
+      Code.doGet({ parameter: { action: 'revoke_share', id_token: 'token' } });
+      expect(lastJson()).toEqual({ ok: true, revoked: true });
+    });
+
+    it('leaves the gate open while auth is not configured', () => {
+      setProperty(PROPERTY_ID);
+      mockFetch(200, { rows: [] });
+      Code.doGet({ parameter: {} });
+      expect(lastJson().ok).toBe(true);
     });
   });
 });
