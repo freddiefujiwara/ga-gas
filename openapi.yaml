@@ -1,0 +1,58 @@
+openapi: 3.0.0
+info:
+  title: GA4 Data API Bridge
+  version: 1.0.0
+  description: Returns Google Analytics 4 runReport results as JSON, fetched with the owner's Google account via the GA4 Data API.
+servers:
+  - url: https://script.google.com/macros/s/AKfycbypis7IqAtM2u0_h7ysiZ5UgztUEwNYJ1zPMnr8IbTBXiyfiapfRMtD_9CxVpc5G8YVzQ
+    description: Production deployment of the Google Apps Script Web App.
+paths:
+  /exec:
+    get:
+      summary: Run a GA4 report
+      description: |
+        Runs a GA4 Data API runReport for the property configured in the
+        GA4_PROPERTY_ID Script Property and returns the result as JSON.
+      parameters:
+        - name: start
+          in: query
+          description: Start date, a GA4 date expression (e.g. 28daysAgo) or YYYY-MM-DD.
+          required: false
+          schema:
+            type: string
+            default: 28daysAgo
+        - name: end
+          in: query
+          description: End date, a GA4 date expression (e.g. today) or YYYY-MM-DD.
+          required: false
+          schema:
+            type: string
+            default: today
+        - name: metrics
+          in: query
+          description: Comma-separated GA4 metric names.
+          required: false
+          schema:
+            type: string
+            default: screenPageViews,activeUsers,sessions
+        - name: dimensions
+          in: query
+          description: Comma-separated GA4 dimension names. Empty means totals only.
+          required: false
+          schema:
+            type: string
+            default: pagePath
+        - name: limit
+          in: query
+          description: Maximum number of rows.
+          required: false
+          schema:
+            type: integer
+            default: 25
+      responses:
+        '200':
+          description: JSON with ok=true and the runReport result under data, or ok=false with an error.
+          content:
+            application/json:
+              schema:
+                type: object
