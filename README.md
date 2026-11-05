@@ -1,4 +1,4 @@
-# ga4-gas
+# ga-gas
 
 GA4 Data API ブリッジ。Google Apps Script の Web アプリが、所有者の Google アカウント権限で GA4 Data API（runReport）を叩き、結果を JSON で返す。
 
@@ -31,7 +31,7 @@ Muse の API 接続の仕組みは OAuth の入口が単一ドメインのサー
 
 ## Setup
 
-- GCP プロジェクト：ga4-gas-513811（番号 151603615892）。Google Analytics Data API 有効化済み。OAuth 同意画面は External / テストモード（テストユーザー zegenvs@gmail.com）。Apps Script プロジェクト（本番・ステージングとも）にリンクする。
+- GCP プロジェクト：ga-gas-513811（番号 151603615892）。Google Analytics Data API 有効化済み。OAuth 同意画面は External / テストモード（テストユーザー zegenvs@gmail.com）。Apps Script プロジェクト（本番・ステージングとも）にリンクする。
 - スクリプトプロパティ：`GA4_PROPERTY_ID` = 561730442（freddiefujiwara.com の GA4 プロパティ）。本番・ステージングの両プロジェクトに設定する。
 - スコープ：analytics.readonly + script.external_request（appsscript.json で指定）。
 
@@ -50,4 +50,4 @@ Muse の API 接続の仕組みは OAuth の入口が単一ドメインのサー
 ## 注意
 
 - GAS の認可は黙って失効することがある。/exec がエラーやサインイン画面を返したら、エディタで doGet を実行して同意をやり直す。
-- Drive 上の置き場所：本番プロジェクトは API フォルダ内（2026-11-06 にマイドライブ直下から移動）。ステージング用プロジェクト ga4-gas-staging も同日作成（Script ID: 1fHczPxzhetaG4QC2whqGfUGwMuOXWY9o3p-1dquqIcKuv7IatyGp7xiU）。GitHub リポジトリ freddiefujiwara/ga4-gas で管理し、PR（ブランチ push）→ ステージング、main マージ → 本番に CI デプロイされる。
+- Drive 上の置き場所：本番プロジェクトは API フォルダ内（2026-11-06 にマイドライブ直下から移動）。ステージング用プロジェクト ga-gas-staging も同日作成（Script ID: 1fHczPxzhetaG4QC2whqGfUGwMuOXWY9o3p-1dquqIcKuv7IatyGp7xiU）。GitHub リポジトリ freddiefujiwara/ga-gas で管理し、PR（ブランチ push）→ ステージング、main マージ → 本番に CI デプロイされる。
