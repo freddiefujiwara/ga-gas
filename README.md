@@ -41,6 +41,7 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - Instagram / Threads：スクリプトプロパティ `META_ACCESS_TOKEN`（Meta の長期ユーザートークン）で Graph API から取得。`META_APP_ID` / `META_APP_SECRET` を設定すると、期限が近づいたトークンを `fb_exchange_token` で自動延長する（有効期限は `META_TOKEN_EXPIRES_AT` に記録）
 - Threads 専用トークンを使う場合は `META_THREADS_ACCESS_TOKEN` を設定する（未設定なら `META_ACCESS_TOKEN` で代用）。その有効期限は `META_THREADS_TOKEN_EXPIRES_AT` に記録され、`th_refresh_token` で自動延長される
 - トークン未設定・失効のサービスは null になり、他のサービスの取得は続く
+- Instagram の KPI（メインアカウントのみ、スナップショットの `instagram` 内）：`media_count`（投稿数、`instagram_basic` で取得可）、`views_30d`（過去30日の Views 合計）と `non_follower_pct`（そのうちフォロワー以外％、小数1桁）はインサイト由来で、`META_ACCESS_TOKEN` に `instagram_manage_insights` 権限が付くまでは null のまま（付与後は自動で数値が入る）
 
 ## Setup
 
