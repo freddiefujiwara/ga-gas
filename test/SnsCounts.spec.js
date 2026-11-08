@@ -251,7 +251,7 @@ describe('SNS follower counts', () => {
     };
     fetchHandler = (url) => {
       if (url.includes('graph.threads.net') && url.includes(THREADS_ID)) {
-        return res(200, { followers_count: 252 });
+        return res(200, totalValueBody('followers_count', 252));
       }
       if (url.includes('/media?')) {
         return res(200, { data: MEDIA_LIST });
@@ -629,12 +629,13 @@ describe('SNS follower counts', () => {
       fetchHandler = (url) => {
         if (url.includes('graph.threads.net')) {
           threadsUrl = url;
-          return res(200, { followers_count: 252 });
+          return res(200, totalValueBody('followers_count', 252));
         }
         return res(200, { followers_count: 1 });
       };
       mockYouTube({ items: [] });
       Code.collectSnsCounts();
+      expect(threadsUrl).toContain('/threads_insights?metric=followers_count');
       expect(threadsUrl).toContain('access_token=threads-token');
     });
   });
@@ -1031,7 +1032,7 @@ describe('SNS follower counts', () => {
           return res(200, { followers_count: 1988 });
         }
         if (url.includes('graph.threads.net')) {
-          return res(200, { followers_count: 252 });
+          return res(200, totalValueBody('followers_count', 252));
         }
         throw new Error('unexpected url: ' + url);
       };
@@ -1227,7 +1228,7 @@ describe('SNS follower counts', () => {
           return res(200, { followers_count: 1988 });
         }
         if (url.includes('graph.threads.net')) {
-          return res(200, { followers_count: 252 });
+          return res(200, totalValueBody('followers_count', 252));
         }
         throw new Error('unexpected url: ' + url);
       };
