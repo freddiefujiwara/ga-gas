@@ -254,6 +254,9 @@ function issueShareToken() {
 // account: media_count (post count, available with instagram_basic)
 // plus views_30d / non_follower_pct from the account insights, which
 // stay null until the token also has instagram_manage_insights.
+// When the insights calls fail, instagram.insights_error holds a
+// short secret-free summary of the API error (null on success) so the
+// failure is visible in the snapshot instead of silently null.
 
 const SNS_SNAPSHOT_PROPERTY = 'SNS_COUNTS_SNAPSHOT';
 const SNS_YOUTUBE_CHANNEL_ID = 'UCbiDZXbr391oT_vsRiqwPFg';
@@ -290,6 +293,7 @@ function buildSnsCountsResponse_() {
         media_count: null,
         views_30d: null,
         non_follower_pct: null,
+        insights_error: null,
       },
       threads: { followers: null },
     };
@@ -490,8 +494,16 @@ function fetchInstagramMediaCount_() {
 // total_value.breakdowns[].results[] with dimension_values like
 // ["FOLLOWER"] / ["NON_FOLLOWER"]. If that shape is unavailable, a
 // plain per-day request (values[].value summed) fills views_30d only.
+//
+// Diagnostics: the result always carries insights_error — null when
+// the breakdown request succeeded, otherwise a short summary of what
+// the API actually said (or that the daily-totals fallback was used),
+// so a failing insights call is observable in the snapshot and the
+// execution log instead of silently producing null KPIs. Summaries
+// are built only from the response status/body, never from the
+// request URL, because the URL carries the access token.
 function fetchInstagramViewsInsights_() {
-  const result = { views_30d: null, non_follower_pct: null };
+  const result = { views_30d: null, non_follower_pct: null, insights_error: null };
   const token = getScriptProperty_('META_ACCESS_TOKEN');
   if (!token) {
     return result;
@@ -507,7 +519,10 @@ function fetchInstagramViewsInsights_() {
     until +
     '&access_token=' +
     encodeURIComponent(token);
-  const breakdown = parseViewsBreakdown_(fetchInsightsJson_(base + '&metric_type=total_value&breakdown=follower_type'));
+  const breakdownRes = fetchInsightsJson_(
+    base + '&metric_type=total_value&breakdown=follower_type'
+  );
+  const breakdown = parseViewsBreakdown_(breakdownRes.data);
   if (breakdown) {
     result.views_30d = breakdown.total;
     if (breakdown.total > 0) {
@@ -516,23 +531,83 @@ function fetchInstagramViewsInsights_() {
     }
     return result;
   }
-  const total = parseViewsDailyTotal_(fetchInsightsJson_(base));
+  const dailyRes = fetchInsightsJson_(base);
+  const total = parseViewsDailyTotal_(dailyRes.data);
   if (total !== null) {
     result.views_30d = total;
+    result.insights_error =
+      'follower_type breakdown unavailable' +
+      (breakdownRes.error ? ' (' + breakdownRes.error + ')' : '') +
+      '; used daily totals fallback';
+    return result;
   }
+  const notes = [];
+  notes.push(
+    breakdownRes.error
+      ? 'breakdown: ' + breakdownRes.error
+      : 'breakdown: response had no follower_type breakdown'
+  );
+  notes.push(
+    dailyRes.error
+      ? 'daily: ' + dailyRes.error
+      : 'daily: response had no daily values'
+  );
+  result.insights_error = notes.join('; ');
   return result;
 }
 
+// Fetches an insights URL and returns { data, error }: data is the
+// parsed JSON body on HTTP 200 (otherwise null) and error is a short
+// secret-free summary of what went wrong (otherwise null). Exception
+// messages are reduced to the error name because UrlFetchApp messages
+// can embed the failing URL, which carries the access token.
 function fetchInsightsJson_(url) {
+  let res;
   try {
-    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-    if (res.getResponseCode() !== 200) {
-      return null;
-    }
-    return JSON.parse(res.getContentText());
+    res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
   } catch (err) {
-    return null;
+    return {
+      data: null,
+      error: 'fetch exception (' + ((err && err.name) || 'Error') + ')',
+    };
   }
+  const status = res.getResponseCode();
+  const bodyText = res.getContentText();
+  if (status !== 200) {
+    return { data: null, error: summarizeInsightsError_(status, bodyText) };
+  }
+  try {
+    return { data: JSON.parse(bodyText), error: null };
+  } catch (err) {
+    return { data: null, error: 'HTTP 200 with unparseable JSON body' };
+  }
+}
+
+// Builds a compact summary of a Graph API error response, e.g.
+// "HTTP 400 code=10 subcode=1234567: <error.message>". Only fields
+// from the response body are used, and the message is truncated, so
+// no token or other secret can leak into the snapshot or the log.
+function summarizeInsightsError_(status, bodyText) {
+  let summary = 'HTTP ' + status;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch (err) {
+    parsed = null;
+  }
+  const error = parsed && parsed.error;
+  if (error) {
+    if (error.code !== undefined && error.code !== null) {
+      summary += ' code=' + error.code;
+    }
+    if (error.error_subcode !== undefined && error.error_subcode !== null) {
+      summary += ' subcode=' + error.error_subcode;
+    }
+    if (error.message) {
+      summary += ': ' + String(error.message).slice(0, 200);
+    }
+  }
+  return summary;
 }
 
 // Returns { total, follower, nonFollower } in views, or null when the
@@ -613,9 +688,13 @@ function collectSnsCounts() {
       media_count: fetchInstagramMediaCount_(),
       views_30d: igViews.views_30d,
       non_follower_pct: igViews.non_follower_pct,
+      insights_error: igViews.insights_error,
     },
     threads: { followers: fetchThreadsFollowers_() },
   };
+  if (igViews.insights_error) {
+    console.log('Instagram insights error: ' + igViews.insights_error);
+  }
   PropertiesService.getScriptProperties().setProperty(
     SNS_SNAPSHOT_PROPERTY,
     JSON.stringify(snapshot)
@@ -865,6 +944,7 @@ if (typeof exports !== 'undefined') {
   exports.fetchInstagramFollowers_ = fetchInstagramFollowers_;
   exports.fetchInstagramMediaCount_ = fetchInstagramMediaCount_;
   exports.fetchInstagramViewsInsights_ = fetchInstagramViewsInsights_;
+  exports.summarizeInsightsError_ = summarizeInsightsError_;
   exports.parseViewsBreakdown_ = parseViewsBreakdown_;
   exports.parseViewsDailyTotal_ = parseViewsDailyTotal_;
   exports.fetchThreadsFollowers_ = fetchThreadsFollowers_;
