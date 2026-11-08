@@ -260,4 +260,68 @@ describe('Threads OAuth completed inside GAS', () => {
       expect(snapshot.threads.threads_error).toContain('expired');
     });
   });
+
+  describe('debugThreadsFollowers', () => {
+    let logs;
+
+    beforeEach(() => {
+      logs = [];
+      global.Logger = {
+        log: vi.fn((...args) => logs.push(args.join(' '))),
+      };
+    });
+
+    const allLogs = () => logs.join('\n');
+
+    it('logs that no token is set and does not fetch', () => {
+      Code.debugThreadsFollowers();
+      expect(allLogs()).toContain('META_THREADS_ACCESS_TOKEN is not set.');
+      expect(allLogs()).toContain('META_ACCESS_TOKEN is not set either');
+      expect(fetchCalls).toHaveLength(0);
+    });
+
+    it('logs the property user id, the status and the body without leaking the token', () => {
+      store.META_THREADS_ACCESS_TOKEN = 'threads-secret-token';
+      store.THREADS_USER_ID = 'threads-user-42';
+      fetchHandler = (url) => {
+        if (url.includes('graph.threads.net')) {
+          return res(200, { followers_count: 252, id: 'threads-user-42' });
+        }
+        throw new Error('unexpected fetch: ' + url);
+      };
+      Code.debugThreadsFollowers();
+      expect(allLogs()).toContain('META_THREADS_ACCESS_TOKEN is set.');
+      expect(allLogs()).toContain(
+        'Threads user id: threads-user-42 (from THREADS_USER_ID)'
+      );
+      expect(allLogs()).toContain('HTTP 200');
+      expect(allLogs()).toContain('"followers_count":252');
+      expect(allLogs()).not.toContain('threads-secret-token');
+      expect(fetchCalls).toHaveLength(1);
+      expect(fetchCalls[0].url).toBe(
+        'https://graph.threads.net/v1.0/threads-user-42?fields=followers_count&access_token=threads-secret-token'
+      );
+    });
+
+    it('logs the fallback user id and an error body', () => {
+      store.META_THREADS_ACCESS_TOKEN = 'threads-secret-token';
+      fetchHandler = (url) => {
+        if (url.includes('graph.threads.net')) {
+          return res(400, {
+            error: { message: 'Invalid OAuth access token.', code: 190 },
+          });
+        }
+        throw new Error('unexpected fetch: ' + url);
+      };
+      Code.debugThreadsFollowers();
+      expect(allLogs()).toContain(
+        'Threads user id: ' +
+          THREADS_ID +
+          ' (THREADS_USER_ID is not set; using the SNS_THREADS_USER_ID fallback)'
+      );
+      expect(allLogs()).toContain('HTTP 400');
+      expect(allLogs()).toContain('Invalid OAuth access token.');
+      expect(allLogs()).not.toContain('threads-secret-token');
+    });
+  });
 });
