@@ -89,7 +89,7 @@ describe('SNS follower counts', () => {
           value: total,
           breakdowns: [
             {
-              dimension_keys: ['follower_type'],
+              dimension_keys: ['follow_type'],
               results: [
                 { dimension_values: ['FOLLOWER'], value: follower },
                 { dimension_values: ['NON_FOLLOWER'], value: nonFollower },
@@ -103,7 +103,7 @@ describe('SNS follower counts', () => {
 
   const mockGraphSuccess = () => {
     fetchHandler = (url) => {
-      if (url.includes('/insights') && url.includes('breakdown=follower_type')) {
+      if (url.includes('/insights') && url.includes('breakdown=follow_type')) {
         return res(200, insightsBreakdownBody(370, 9630, 10000));
       }
       if (url.includes('graph.facebook.com') && url.includes('fields=media_count')) {
@@ -345,7 +345,7 @@ describe('SNS follower counts', () => {
     it('records both errors when the breakdown and daily requests fail differently', () => {
       store.META_ACCESS_TOKEN = 'meta-token';
       graphWithInsights((url) => {
-        if (url.includes('breakdown=follower_type')) {
+        if (url.includes('breakdown=follow_type')) {
           return res(400, { error: { message: 'breakdown unsupported', code: 100 } });
         }
         return res(500, { error: { message: 'internal boom', code: 1 } });
@@ -379,7 +379,7 @@ describe('SNS follower counts', () => {
     it('falls back to summed daily values when the breakdown is unavailable', () => {
       store.META_ACCESS_TOKEN = 'meta-token';
       graphWithInsights((url) => {
-        if (url.includes('breakdown=follower_type')) {
+        if (url.includes('breakdown=follow_type')) {
           return res(400, { error: { message: 'breakdown unsupported' } });
         }
         return res(200, {
@@ -403,7 +403,7 @@ describe('SNS follower counts', () => {
     it('notes the fallback even when the breakdown response is just unusable', () => {
       store.META_ACCESS_TOKEN = 'meta-token';
       graphWithInsights((url) => {
-        if (url.includes('breakdown=follower_type')) {
+        if (url.includes('breakdown=follow_type')) {
           return res(200, { data: [{ name: 'views', period: 'day' }] });
         }
         return res(200, {
@@ -421,8 +421,45 @@ describe('SNS follower counts', () => {
       expect(kpi.views_30d).toBe(30);
       expect(kpi.non_follower_pct).toBeNull();
       expect(kpi.insights_error).toBe(
-        'follower_type breakdown unavailable; used daily totals fallback'
+        'follow_type breakdown unavailable; used daily totals fallback'
       );
+    });
+
+    it('requests breakdown=follow_type and metric_type=total_value on the daily fallback', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      const insightsUrls = [];
+      graphWithInsights((url) => {
+        insightsUrls.push(url);
+        if (url.includes('breakdown=')) {
+          return res(400, { error: { message: 'breakdown unsupported', code: 100 } });
+        }
+        return res(200, {
+          data: [{ name: 'views', period: 'day', total_value: { value: 777 } }],
+        });
+      });
+      mockYouTube({ items: [] });
+      const kpi = Code.fetchInstagramViewsInsights_();
+      expect(insightsUrls).toHaveLength(2);
+      expect(insightsUrls[0]).toContain('breakdown=follow_type');
+      expect(insightsUrls[1]).not.toContain('breakdown=');
+      expect(insightsUrls[1]).toContain('metric_type=total_value');
+      // The daily fallback also accepts the total_value response shape.
+      expect(kpi.views_30d).toBe(777);
+      expect(kpi.non_follower_pct).toBeNull();
+      expect(kpi.insights_error).toContain('used daily totals fallback');
+    });
+
+    it('parseViewsDailyTotal_ reads the total_value and values[] forms', () => {
+      expect(
+        Code.parseViewsDailyTotal_({ data: [{ total_value: { value: 42 } }] })
+      ).toBe(42);
+      expect(
+        Code.parseViewsDailyTotal_({
+          data: [{ values: [{ value: 1 }, { value: 2 }] }],
+        })
+      ).toBe(3);
+      expect(Code.parseViewsDailyTotal_({ data: [{ name: 'views' }] })).toBeNull();
+      expect(Code.parseViewsDailyTotal_(null)).toBeNull();
     });
 
     it('keeps media_count null when only that request fails', () => {
@@ -431,7 +468,7 @@ describe('SNS follower counts', () => {
         if (url.includes('fields=media_count')) {
           return res(500, { error: { message: 'boom' } });
         }
-        if (url.includes('/insights') && url.includes('breakdown=follower_type')) {
+        if (url.includes('/insights') && url.includes('breakdown=follow_type')) {
           return res(200, insightsBreakdownBody(370, 9630, 10000));
         }
         if (url.includes('graph.facebook.com')) {
