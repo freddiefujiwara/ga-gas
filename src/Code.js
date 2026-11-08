@@ -535,6 +535,15 @@ function fetchInstagramFollowers_(userId) {
   );
 }
 
+// The one Threads insights request both the production fetch and
+// debugThreadsFollowers make: the followers_count metric on the
+// user's threads_insights edge. The URL carries no token; callers
+// append '&access_token=...' themselves so the diagnostic can print
+// the request with the token redacted.
+function threadsFollowersInsightsUrl_(userId) {
+  return THREADS_GRAPH_BASE + userId + '/threads_insights?metric=followers_count';
+}
+
 function fetchThreadsFollowers_() {
   const token =
     getScriptProperty_('META_THREADS_ACCESS_TOKEN') ||
@@ -545,12 +554,50 @@ function fetchThreadsFollowers_() {
   // The OAuth flow stores the authorized account's Threads user id in
   // THREADS_USER_ID; the constant is only the pre-OAuth fallback.
   const userId = getScriptProperty_('THREADS_USER_ID') || SNS_THREADS_USER_ID;
-  return fetchGraphFollowersCount_(
-    THREADS_GRAPH_BASE +
-      userId +
-      '?fields=followers_count&access_token=' +
-      encodeURIComponent(token)
-  );
+  try {
+    const res = UrlFetchApp.fetch(
+      threadsFollowersInsightsUrl_(userId) +
+        '&access_token=' +
+        encodeURIComponent(token),
+      { muteHttpExceptions: true }
+    );
+    if (res.getResponseCode() !== 200) {
+      return null;
+    }
+    return parseThreadsFollowersCount_(JSON.parse(res.getContentText()));
+  } catch (err) {
+    return null;
+  }
+}
+
+// Reads the followers count out of a threads_insights response for
+// metric=followers_count, or null. followers_count does not exist as
+// a field on the Threads user node — the profile request
+// ?fields=followers_count fails with HTTP 500 "Tried accessing
+// nonexisting field (followers_count)" (THApiException code 100,
+// diagnosed in production on 2026-11-09) — so the count only comes
+// from this insights edge. The metric is a current total, not a
+// per-day flow: total_value.value wins when present, otherwise the
+// newest values[] entry is the count. The values are never summed
+// the way daily view counts are. Error bodies and any other shape
+// read as null.
+function parseThreadsFollowersCount_(data) {
+  const totalValue = parseInsightsTotalValue_(data);
+  if (totalValue !== null) {
+    return totalValue;
+  }
+  const entry = data && Array.isArray(data.data) ? data.data[0] : null;
+  const values = entry && Array.isArray(entry.values) ? entry.values : null;
+  if (!values) {
+    return null;
+  }
+  for (let i = values.length - 1; i >= 0; i--) {
+    const value = Number(values[i] && values[i].value);
+    if (Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return null;
 }
 
 function fetchYouTubeSubscribers_() {
@@ -1452,17 +1499,22 @@ function debugScrubToken_(text, token) {
 // keeps storing threads.followers = null after the Threads OAuth
 // flow has completed (as on 2026-11-09: authorization finished and
 // the long-lived token was saved, yet the followers fetch came back
-// null with no error recorded anywhere — fetchGraphFollowersCount_
-// returns null on any non-200 response or exception without keeping
-// the status or body, so the snapshot cannot say why). It logs
-// whether META_THREADS_ACCESS_TOKEN is set (never its value), which
-// user id the production fetch would use, and the raw status/body
-// of the very same request fetchThreadsFollowers_ makes, so the
-// next fix starts from what the Threads Graph API actually returns.
-// It is never called from a trigger or from doGet, and it does not
-// touch the snapshot. The request URL is printed with
-// access_token=<redacted> and the body is scrubbed the same way as
-// in debugSnsInsights.
+// null with no error recorded anywhere — the fetch returns null on
+// any non-200 response or exception without keeping the status or
+// body, so the snapshot cannot say why). Its first production run
+// showed why: the profile request ?fields=followers_count fails
+// with HTTP 500 "Tried accessing nonexisting field
+// (followers_count)", so fetchThreadsFollowers_ now reads the
+// followers_count metric from the threads_insights edge instead.
+// This diagnostic logs whether META_THREADS_ACCESS_TOKEN is set
+// (never its value), which user id the production fetch would use,
+// the raw status/body of the very same insights request
+// fetchThreadsFollowers_ makes, and the count parsed out of it. If
+// the insights edge refuses the token over a missing scope, that
+// error message shows up here verbatim. It is never called from a
+// trigger or from doGet, and it does not touch the snapshot. The
+// request URL is printed with access_token=<redacted> and the body
+// is scrubbed the same way as in debugSnsInsights.
 function debugThreadsFollowers() {
   const threadsToken = getScriptProperty_('META_THREADS_ACCESS_TOKEN');
   Logger.log(
@@ -1486,7 +1538,7 @@ function debugThreadsFollowers() {
         ? ' (from THREADS_USER_ID)'
         : ' (THREADS_USER_ID is not set; using the SNS_THREADS_USER_ID fallback)')
   );
-  const base = THREADS_GRAPH_BASE + userId + '?fields=followers_count';
+  const base = threadsFollowersInsightsUrl_(userId);
   Logger.log('GET ' + base + '&access_token=<redacted>');
   let res;
   try {
@@ -1504,6 +1556,15 @@ function debugThreadsFollowers() {
       0,
       SNS_DEBUG_LOG_LIMIT
     )
+  );
+  let parsed = null;
+  try {
+    parsed = parseThreadsFollowersCount_(JSON.parse(res.getContentText()));
+  } catch (err) {
+    parsed = null;
+  }
+  Logger.log(
+    'parsed followers_count: ' + (parsed === null ? 'null' : parsed)
   );
 }
 
@@ -2640,6 +2701,8 @@ if (typeof exports !== 'undefined') {
   exports.parseViewsBreakdown_ = parseViewsBreakdown_;
   exports.parseViewsDailyTotal_ = parseViewsDailyTotal_;
   exports.fetchThreadsFollowers_ = fetchThreadsFollowers_;
+  exports.parseThreadsFollowersCount_ = parseThreadsFollowersCount_;
+  exports.threadsFollowersInsightsUrl_ = threadsFollowersInsightsUrl_;
   exports.debugThreadsFollowers = debugThreadsFollowers;
   exports.fetchYouTubeSubscribers_ = fetchYouTubeSubscribers_;
   exports.buildSnsDetailResponse_ = buildSnsDetailResponse_;

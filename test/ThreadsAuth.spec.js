@@ -18,6 +18,19 @@ describe('Threads OAuth completed inside GAS', () => {
 
   const daysAgo = (days) => new Date(Date.now() - days * 86400000).toISOString();
 
+  // The threads_insights response shape for metric=followers_count:
+  // the count lives in data[0].total_value.value (followers_count is
+  // not a field on the Threads user node).
+  const threadsInsightsBody = (value) => ({
+    data: [
+      {
+        name: 'followers_count',
+        period: 'day',
+        total_value: { value },
+      },
+    ],
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     outputs = [];
@@ -228,13 +241,81 @@ describe('Threads OAuth completed inside GAS', () => {
       const seenUrls = [];
       fetchHandler = (url) => {
         seenUrls.push(url);
-        return res(200, { followers_count: 252 });
+        return res(200, threadsInsightsBody(252));
       };
       expect(Code.fetchThreadsFollowers_()).toBe(252);
-      expect(seenUrls[0]).toContain('/' + THREADS_ID + '?');
+      expect(seenUrls[0]).toContain('/' + THREADS_ID + '/threads_insights');
+      expect(seenUrls[0]).toContain('metric=followers_count');
       store.THREADS_USER_ID = '999888777';
       expect(Code.fetchThreadsFollowers_()).toBe(252);
-      expect(seenUrls[1]).toContain('/999888777?');
+      expect(seenUrls[1]).toContain('/999888777/threads_insights');
+    });
+  });
+
+  describe('fetchThreadsFollowers_ insights parsing', () => {
+    beforeEach(() => {
+      store.META_THREADS_ACCESS_TOKEN = 'threads-token';
+    });
+
+    it('reads total_value.value out of the insights response', () => {
+      fetchHandler = () => res(200, threadsInsightsBody(252));
+      expect(Code.fetchThreadsFollowers_()).toBe(252);
+    });
+
+    it('reads the newest values entry when there is no total_value', () => {
+      fetchHandler = () =>
+        res(200, {
+          data: [
+            {
+              name: 'followers_count',
+              period: 'day',
+              values: [
+                { value: 240, end_time: '2026-11-07T07:00:00+0000' },
+                { value: 252, end_time: '2026-11-08T07:00:00+0000' },
+              ],
+            },
+          ],
+        });
+      // The newest entry wins; the values are a current total per
+      // day, not a flow to sum (240 + 252 would be wrong).
+      expect(Code.fetchThreadsFollowers_()).toBe(252);
+    });
+
+    it('returns null on an HTTP error with a THApiException body', () => {
+      fetchHandler = () =>
+        res(500, {
+          error: {
+            message: 'Tried accessing nonexisting field (followers_count)',
+            type: 'THApiException',
+            code: 100,
+          },
+        });
+      expect(Code.fetchThreadsFollowers_()).toBeNull();
+    });
+
+    it('parseThreadsFollowersCount_ prefers total_value over values', () => {
+      expect(
+        Code.parseThreadsFollowersCount_({
+          data: [
+            {
+              name: 'followers_count',
+              total_value: { value: 300 },
+              values: [{ value: 252 }],
+            },
+          ],
+        })
+      ).toBe(300);
+    });
+
+    it('parseThreadsFollowersCount_ returns null for error bodies and junk', () => {
+      expect(
+        Code.parseThreadsFollowersCount_({
+          error: { message: 'boom', type: 'THApiException', code: 100 },
+        })
+      ).toBeNull();
+      expect(Code.parseThreadsFollowersCount_({ data: [] })).toBeNull();
+      expect(Code.parseThreadsFollowersCount_(null)).toBeNull();
+      expect(Code.parseThreadsFollowersCount_('nope')).toBeNull();
     });
   });
 
@@ -248,7 +329,7 @@ describe('Threads OAuth completed inside GAS', () => {
           return res(400, { error: { message: 'expired', code: 190 } });
         }
         if (url.includes('graph.threads.net')) {
-          return res(200, { followers_count: 252 });
+          return res(200, threadsInsightsBody(252));
         }
         if (url.includes('graph.facebook.com')) {
           return res(200, { followers_count: 100, media_count: 10 });
@@ -285,7 +366,7 @@ describe('Threads OAuth completed inside GAS', () => {
       store.THREADS_USER_ID = 'threads-user-42';
       fetchHandler = (url) => {
         if (url.includes('graph.threads.net')) {
-          return res(200, { followers_count: 252, id: 'threads-user-42' });
+          return res(200, threadsInsightsBody(252));
         }
         throw new Error('unexpected fetch: ' + url);
       };
@@ -295,11 +376,12 @@ describe('Threads OAuth completed inside GAS', () => {
         'Threads user id: threads-user-42 (from THREADS_USER_ID)'
       );
       expect(allLogs()).toContain('HTTP 200');
-      expect(allLogs()).toContain('"followers_count":252');
+      expect(allLogs()).toContain('"total_value":{"value":252}');
+      expect(allLogs()).toContain('parsed followers_count: 252');
       expect(allLogs()).not.toContain('threads-secret-token');
       expect(fetchCalls).toHaveLength(1);
       expect(fetchCalls[0].url).toBe(
-        'https://graph.threads.net/v1.0/threads-user-42?fields=followers_count&access_token=threads-secret-token'
+        'https://graph.threads.net/v1.0/threads-user-42/threads_insights?metric=followers_count&access_token=threads-secret-token'
       );
     });
 
