@@ -50,7 +50,7 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 
 - Instagram アカウント全体（過去30日、メインアカウント）：`reach_30d`、`accounts_engaged_30d`、`interactions_30d`（total / likes / comments / shares / saves）、`profile_links_taps_30d`、`follows_30d` / `unfollows_30d`（`follows_and_unfollows` の follow_type 内訳）。失敗時は `instagram.detail_error`
   - `profile_links_taps_30d` は2段構え：まず total_value を取り、null または 0 のときは日別 values の30日合計で補完する。採用した形は `profile_links_taps_source`（`"total_value"` / `"daily_sum"`）に記録する（2026-11-09 の本番初回実行で total_value が実態と食い違う 0 を返したための対策）
-  - follows 内訳のラベル照合は大文字小文字を無視した部分一致（`UNFOLLOW` を含む側が unfollows、それ以外の `FOLLOW` を含む側が follows）でラベルの揺れを吸収する。ただし views 内訳のラベル（`FOLLOWER` / `NON_FOLLOWER`）だけは誤読防止のため対象外。どちらにも一致しなかった場合は、観測したラベル一覧が `instagram.detail_error` に `follows_and_unfollows labels: [...]` として記録される
+  - follows 内訳は、2026-11-09 の本番診断で確定した形で読む：`follows_and_unfollows` は `metric_type=total_value`＋`breakdown=follow_type` のときにだけ内訳が返り、ラベルは結果の状態を表す（`FOLLOWER`＝フォローした数 → `follows_30d`、`NON_FOLLOWER`＝フォローを外した数 → `unfollows_30d`）。照合はこの2ラベルの完全一致（大文字小文字は無視）を最優先とし、どちらにも一致しなかった場合は観測したラベル一覧が `instagram.detail_error` に `follows_and_unfollows labels: [...]` として記録される
 - Instagram フォロワー属性（lifetime）：`instagram.demographics` = `age_gender`（`{key, value}` の降順リスト、key は "25-34/F" 形式）、`top_cities` / `top_countries`（各上位10件）。失敗分は `instagram.detail_error` に合算
 - Instagram 投稿ごと（新しい順・最大30件）：`instagram.recent_media[]` = `{id, type, posted_at, caption（80字まで）, permalink, views, reach, likes, comments, shares, saves, avg_watch_sec, total_watch_sec}`。リールの視聴時間はミリ秒→秒に変換。メディア種別で使える metric が違うため、失敗時は metric を絞って再試行する。失敗時は `instagram.media_error`
 - YouTube：`youtube.total_views`（総再生数）と `youtube.video_count`（動画数）を追加。`youtube.recent_videos[]`（新しい順・最大10件）= `{id, title, published_at, views, likes, comments, url}`。失敗時は `youtube.youtube_error`
@@ -66,7 +66,7 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 
 ## 診断関数 `debugSnsInsights`（手動実行専用）
 
-詳細の数値が実態と食い違うときの切り分け用。エディタから手動実行すると、`follows_and_unfollows` と `profile_links_taps` について6つのリクエスト形（A：現行の breakdown=follow_type 形、B：breakdown なし、C：metric_type なし、D：現行の total_value 形、E：metric_type なし＋values の件数・合計、F：period=lifetime）の生応答を実行ログに出す（各応答は先頭3000文字まで、トークンは伏せる）。トリガーや doGet からは呼ばれず、スナップショットにも影響しない。2026-11-09 の本番切り分けで、breakdown=follow_type のラベルはフォロワーかどうかの内訳（FOLLOWER / NON_FOLLOWER）であり、profile_links_taps は現行の両形とも 0 だったことが判明済みで、その原因確定のために使う。
+詳細の数値が実態と食い違うときの切り分け用。エディタから手動実行すると、`follows_and_unfollows` と `profile_links_taps` について6つのリクエスト形（A：現行の breakdown=follow_type 形、B：breakdown なし、C：metric_type なし、D：現行の total_value 形、E：metric_type なし＋values の件数・合計、F：period=lifetime）の生応答を実行ログに出す（各応答は先頭3000文字まで、トークンは伏せる）。トリガーや doGet からは呼ばれず、スナップショットにも影響しない。2026-11-09 の本番切り分けで、breakdown=follow_type のラベルは結果の状態（FOLLOWER＝フォローした数、NON_FOLLOWER＝フォローを外した数）を表すことと、profile_links_taps は現行の両形とも 0 だったことが判明済みで、その原因確定のために使う。
 
 ## Setup
 

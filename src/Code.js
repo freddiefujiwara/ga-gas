@@ -996,10 +996,10 @@ function fetchInstagramAccountDetail_() {
 
 // --- Manual diagnostics: debugSnsInsights -------------------------
 // Run by hand from the Apps Script editor when the account-detail
-// numbers look wrong (as on 2026-11-09, when follows_and_unfollows
-// with breakdown=follow_type turned out to be a follower /
-// non-follower split rather than a follows / unfollows one, and
-// profile_links_taps came back 0 in both the total_value form and
+// numbers look wrong (as on 2026-11-09, when its raw responses
+// pinned down the follows_and_unfollows follow_type labels —
+// FOLLOWER = new follows, NON_FOLLOWER = unfollows — and showed
+// profile_links_taps coming back 0 in both the total_value form and
 // the daily-sum fallback while the Instagram app showed real bio
 // link taps). It logs the raw Graph API responses for six request
 // shapes (A–F) so the next fix starts from what the API actually
@@ -1118,15 +1118,19 @@ function debugScrubToken_(text, token) {
 }
 
 // Reads the follows/unfollows split out of a follows_and_unfollows
-// total_value response. Matching is substring-based and
-// case-insensitive — a value containing UNFOLLOW is the unfollows
-// side, any other value containing FOLLOW is the follows side — so
-// label drift (FOLLOW / FOLLOWS / follow / FOLLOWER_FOLLOWS) is
-// absorbed. The one deliberate exception is the views breakdown's
-// own labels: the exact tokens FOLLOWER and NON_FOLLOWER never
-// count as a split, so a views-shaped response still yields null
-// instead of a wrong split. When nothing matches, the caller
-// records the observed labels via followsBreakdownLabels_.
+// total_value response. Production diagnostics on 2026-11-09
+// (debugSnsInsights) pinned down the only shape this metric returns
+// numbers in: metric_type=total_value plus breakdown=follow_type,
+// and the breakdown's results are labelled by the resulting state —
+// FOLLOWER is the number of accounts that started following (they
+// end up followers) and NON_FOLLOWER is the number that unfollowed
+// (they end up non-followers); without the breakdown the response
+// carries neither total_value nor values at all. Matching is
+// therefore exact (case-insensitive) on those two labels, which
+// take priority over any looser reading. Anything else leaves the
+// split null, and the caller records the observed labels via
+// followsBreakdownLabels_ so an unexpected labelling stays
+// observable instead of being guessed at.
 function parseFollowsBreakdown_(data) {
   const entry = data && Array.isArray(data.data) ? data.data[0] : null;
   const totalValue = entry && entry.total_value;
@@ -1149,15 +1153,10 @@ function parseFollowsBreakdown_(data) {
         String(dim).toUpperCase()
       );
       dims.forEach((dim) => {
-        if (dim.includes('UNFOLLOW')) {
-          unfollows = value;
-        } else if (
-          dim.includes('FOLLOW') &&
-          dim !== 'FOLLOWER' &&
-          dim !== 'NON_FOLLOWER' &&
-          dim !== 'NON-FOLLOWER'
-        ) {
+        if (dim === 'FOLLOWER') {
           follows = value;
+        } else if (dim === 'NON_FOLLOWER' || dim === 'NON-FOLLOWER') {
+          unfollows = value;
         }
       });
     });
