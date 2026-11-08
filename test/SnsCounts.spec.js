@@ -866,6 +866,144 @@ describe('SNS follower counts', () => {
     });
   });
 
+  describe('doGet action=sns_history', () => {
+    const HEADER = Code.SNS_HISTORY_ACCOUNT_COLUMNS;
+
+    // A readable stand-in for a Sheets sheet: rows are the raw cell
+    // values ('' for empty, Date objects for timestamps).
+    const makeReadableSheet = (rows) => ({
+      getLastRow: () => rows.length,
+      getRange: (row, col, numRows, numCols) => ({
+        getValues: () =>
+          rows
+            .slice(row - 1, row - 1 + numRows)
+            .map((r) => r.slice(col - 1, col - 1 + numCols)),
+      }),
+    });
+
+    const dataRow = (overrides) => {
+      const row = Array(HEADER.length).fill('');
+      const set = (column, value) => {
+        row[HEADER.indexOf(column)] = value;
+      };
+      set('collected_at', '2026-11-09T00:00:00.000Z');
+      set('ig_followers', 1988);
+      set('threads_followers', 252);
+      set('youtube_subscribers', 8);
+      set('total_followers', 2248);
+      set('media_count', 2404);
+      set('views_30d', 10000);
+      set('non_follower_pct', 96.3);
+      set('reach_30d', 5000);
+      set('interactions_total', 3000);
+      set('follows_30d', 180);
+      set('unfollows_30d', 30);
+      set('yt_total_views', 123456);
+      Object.entries(overrides || {}).forEach(([column, value]) =>
+        set(column, value)
+      );
+      return row;
+    };
+
+    const serveHistory = (sheet) => {
+      store.GA4_PROPERTY_ID = '561730442';
+      store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
+      global.SpreadsheetApp = {
+        openById: vi.fn(() => ({
+          getSheetByName: (name) => (name === 'account' ? sheet : null),
+        })),
+      };
+      Code.doGet({ parameter: { action: 'sns_history' } });
+      return lastJson();
+    };
+
+    it('returns empty rows while SNS_HISTORY_SHEET_ID is unset', () => {
+      store.GA4_PROPERTY_ID = '561730442';
+      const openById = vi.fn(() => {
+        throw new Error('SpreadsheetApp must not be touched');
+      });
+      global.SpreadsheetApp = { openById };
+      Code.doGet({ parameter: { action: 'sns_history' } });
+      expect(lastJson()).toEqual({ ok: true, action: 'sns_history', rows: [] });
+      expect(openById).not.toHaveBeenCalled();
+    });
+
+    it('returns empty rows when the account sheet is missing or header-only', () => {
+      expect(serveHistory(null).rows).toEqual([]);
+      expect(serveHistory(makeReadableSheet([HEADER])).rows).toEqual([]);
+    });
+
+    it('converts cells: numbers stay numbers, blanks become null, Dates become ISO strings', () => {
+      const sheet = makeReadableSheet([
+        HEADER,
+        dataRow({
+          collected_at: new Date('2026-11-09T06:00:00.000Z'),
+          views_30d: '',
+          follows_30d: '',
+        }),
+      ]);
+      const json = serveHistory(sheet);
+      expect(json.ok).toBe(true);
+      expect(json.action).toBe('sns_history');
+      expect(json.rows).toEqual([
+        {
+          collected_at: '2026-11-09T06:00:00.000Z',
+          ig_followers: 1988,
+          threads_followers: 252,
+          youtube_subscribers: 8,
+          total_followers: 2248,
+          media_count: 2404,
+          views_30d: null,
+          non_follower_pct: 96.3,
+          reach_30d: 5000,
+          interactions_total: 3000,
+          follows_30d: null,
+          unfollows_30d: 30,
+          yt_total_views: 123456,
+        },
+      ]);
+      // Only the 13 served columns come back: no anemone counts, no
+      // taps source, no other sheet columns leak into the response.
+      expect(Object.keys(json.rows[0])).toHaveLength(13);
+    });
+
+    it('sorts ascending by collected_at and drops timestamp-less rows', () => {
+      const sheet = makeReadableSheet([
+        HEADER,
+        dataRow({ collected_at: '2026-11-09T12:00:00.000Z', ig_followers: 2000 }),
+        dataRow({ collected_at: '', ig_followers: 1500 }),
+        dataRow({ collected_at: '2026-11-09T00:00:00.000Z', ig_followers: 1988 }),
+      ]);
+      const json = serveHistory(sheet);
+      expect(json.rows.map((row) => row.ig_followers)).toEqual([1988, 2000]);
+    });
+
+    it('caps the response at the newest 400 rows', () => {
+      const rows = [HEADER];
+      for (let i = 0; i < 405; i += 1) {
+        const at = new Date(Date.UTC(2026, 0, 1) + i * 6 * 3600 * 1000);
+        rows.push(dataRow({ collected_at: at.toISOString(), ig_followers: i }));
+      }
+      const json = serveHistory(makeReadableSheet(rows));
+      expect(json.rows).toHaveLength(400);
+      expect(json.rows[0].ig_followers).toBe(5);
+      expect(json.rows[399].ig_followers).toBe(404);
+    });
+
+    it('rejects anonymous calls while authentication is configured', () => {
+      store.GA4_PROPERTY_ID = '561730442';
+      store.GOOGLE_OAUTH_CLIENT_ID = 'client-id';
+      store.AVAILABLE_GMAILS = 'owner@example.com';
+      store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
+      global.SpreadsheetApp = {
+        openById: vi.fn(() => ({ getSheetByName: () => null })),
+      };
+      Code.doGet({ parameter: { action: 'sns_history' } });
+      expect(lastJson().ok).toBe(false);
+      expect(lastJson().status).toBe(401);
+    });
+  });
+
   describe('Instagram KPIs', () => {
     const graphWithInsights = (insightsHandler) => {
       fetchHandler = (url) => {
