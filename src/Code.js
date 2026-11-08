@@ -356,6 +356,23 @@ function issueShareToken() {
 //     Falls back to META_ACCESS_TOKEN when unset. When its expiry is
 //     recorded in META_THREADS_TOKEN_EXPIRES_AT, it is refreshed with
 //     th_refresh_token in the same way.
+//   THREADS_APP_ID / THREADS_APP_SECRET (optional): credentials of the
+//     dedicated Threads app (use case "Access the Threads API").
+//     THREADS_APP_ID is the Threads app ID shown at the top of the
+//     Threads API Settings screen — the OAuth client_id — which is
+//     NOT the Meta app ID. When
+//     set, the Threads token above can be obtained entirely inside
+//     GAS: run threadsAuthorizeUrl() in the editor, open the logged
+//     URL, and approve; the OAuth callback lands on this Web App's
+//     /exec (see handleThreadsOAuthCallback_) and stores the
+//     long-lived token in META_THREADS_ACCESS_TOKEN, the Threads user
+//     id in THREADS_USER_ID and the acquisition time in
+//     THREADS_TOKEN_AT. refreshThreadsTokenIfNeeded() renews the
+//     token with th_refresh_token once it is 50+ days old, so no
+//     manual re-authorization is needed while the collections keep
+//     running. THREADS_REDIRECT_URI may override the redirect URI
+//     (default: this Web App's own /exec URL); the same URI must be
+//     registered in the Threads app's settings.
 //   SNS_HISTORY_SHEET_ID (optional): spreadsheet that receives one
 //     history row per collection (see appendSnsHistory_). Unset means
 //     no history is written.
@@ -476,7 +493,7 @@ function buildEmptySnsDetail_() {
       recent_media: null,
       media_error: null,
     },
-    threads: { followers: null },
+    threads: { followers: null, threads_error: null },
   };
 }
 
@@ -525,9 +542,12 @@ function fetchThreadsFollowers_() {
   if (!token) {
     return null;
   }
+  // The OAuth flow stores the authorized account's Threads user id in
+  // THREADS_USER_ID; the constant is only the pre-OAuth fallback.
+  const userId = getScriptProperty_('THREADS_USER_ID') || SNS_THREADS_USER_ID;
   return fetchGraphFollowersCount_(
     THREADS_GRAPH_BASE +
-      SNS_THREADS_USER_ID +
+      userId +
       '?fields=followers_count&access_token=' +
       encodeURIComponent(token)
   );
@@ -627,6 +647,213 @@ function refreshThreadsTokenIfNeeded_() {
     );
   } catch (err) {
     return false;
+  }
+}
+
+// --- Threads OAuth (authorization completed inside GAS) ---
+// The dedicated Threads app cannot be added to the existing Meta app
+// from the developer console, so its long-lived token is obtained
+// here instead: the owner runs threadsAuthorizeUrl() in the editor,
+// opens the logged URL and approves the threads_basic scope. Threads
+// redirects the browser back to this Web App's /exec with a code and
+// the state saved below; doGet routes that request to
+// handleThreadsOAuthCallback_, which exchanges the code for a
+// short-lived token, upgrades it to a long-lived one and stores it
+// in META_THREADS_ACCESS_TOKEN (the property fetchThreadsFollowers_
+// already reads). refreshThreadsTokenIfNeeded() then keeps the token
+// alive with th_refresh_token, so the manual authorization is a
+// one-time setup step.
+
+const THREADS_OAUTH_STATE_PROPERTY = 'THREADS_OAUTH_STATE';
+const THREADS_AUTHORIZE_URL = 'https://threads.net/oauth/authorize';
+const THREADS_TOKEN_EXCHANGE_URL = 'https://graph.threads.net/oauth/access_token';
+const THREADS_LONG_LIVED_URL = 'https://graph.threads.net/access_token';
+const THREADS_REFRESH_URL = 'https://graph.threads.net/refresh_access_token';
+// Long-lived Threads tokens live about 60 days; renew at 50 days so a
+// failed attempt still leaves a window to retry before expiry.
+const THREADS_TOKEN_REFRESH_AGE_MS = 50 * 24 * 60 * 60 * 1000;
+
+function threadsRedirectUri_() {
+  const override = getScriptProperty_('THREADS_REDIRECT_URI');
+  if (override) {
+    return override;
+  }
+  try {
+    return ScriptApp.getService().getUrl() || '';
+  } catch (err) {
+    return '';
+  }
+}
+
+// Editor helper: builds the Threads authorization URL and logs it.
+// Open the logged URL in a browser and approve; the callback stores
+// the long-lived token in the Script Properties.
+function threadsAuthorizeUrl() {
+  const appId = getScriptProperty_('THREADS_APP_ID');
+  if (!appId) {
+    console.log('THREADS_APP_ID is not set in Script Properties');
+    return '';
+  }
+  const redirectUri = threadsRedirectUri_();
+  if (!redirectUri) {
+    console.log('Could not determine the Web App URL; set THREADS_REDIRECT_URI');
+    return '';
+  }
+  const state = Utilities.getUuid() + Utilities.getUuid().replace(/-/g, '');
+  PropertiesService.getScriptProperties().setProperty(
+    THREADS_OAUTH_STATE_PROPERTY,
+    state
+  );
+  const url =
+    THREADS_AUTHORIZE_URL +
+    '?client_id=' +
+    encodeURIComponent(appId) +
+    '&redirect_uri=' +
+    encodeURIComponent(redirectUri) +
+    '&scope=threads_basic&response_type=code&state=' +
+    encodeURIComponent(state);
+  console.log('Threads authorize URL: ' + url);
+  return url;
+}
+
+// Exchanges an authorization code for the long-lived Threads token
+// and stores it. Returns { ok, error } with a secret-free error
+// summary on failure (the summaries only reuse API error fields, and
+// transport failures are reported without the request URL, which
+// carries the app secret in the exchange call).
+function handleThreadsOAuthCallback_(code) {
+  const props = PropertiesService.getScriptProperties();
+  const appId = props.getProperty('THREADS_APP_ID');
+  const appSecret = props.getProperty('THREADS_APP_SECRET');
+  const redirectUri = threadsRedirectUri_();
+  if (!appId || !appSecret) {
+    return { ok: false, error: 'THREADS_APP_ID / THREADS_APP_SECRET are not set' };
+  }
+  if (!redirectUri) {
+    return { ok: false, error: 'redirect URI is not available' };
+  }
+  try {
+    const codeRes = UrlFetchApp.fetch(THREADS_TOKEN_EXCHANGE_URL, {
+      method: 'post',
+      payload: {
+        client_id: appId,
+        client_secret: appSecret,
+        grant_type: 'authorization_code',
+        redirect_uri: redirectUri,
+        code: code,
+      },
+      muteHttpExceptions: true,
+    });
+    if (codeRes.getResponseCode() !== 200) {
+      return {
+        ok: false,
+        error:
+          'code exchange: ' +
+          summarizeInsightsError_(codeRes.getResponseCode(), codeRes.getContentText()),
+      };
+    }
+    const shortLived = JSON.parse(codeRes.getContentText());
+    const shortToken = shortLived && shortLived.access_token;
+    if (!shortToken) {
+      return { ok: false, error: 'code exchange: response had no access_token' };
+    }
+    const longRes = UrlFetchApp.fetch(
+      THREADS_LONG_LIVED_URL +
+        '?grant_type=th_exchange_token&client_secret=' +
+        encodeURIComponent(appSecret) +
+        '&access_token=' +
+        encodeURIComponent(shortToken),
+      { muteHttpExceptions: true }
+    );
+    if (longRes.getResponseCode() !== 200) {
+      return {
+        ok: false,
+        error:
+          'long-lived exchange: ' +
+          summarizeInsightsError_(longRes.getResponseCode(), longRes.getContentText()),
+      };
+    }
+    const longLived = JSON.parse(longRes.getContentText());
+    if (!longLived || !longLived.access_token) {
+      return { ok: false, error: 'long-lived exchange: response had no access_token' };
+    }
+    props.setProperty('META_THREADS_ACCESS_TOKEN', longLived.access_token);
+    if (shortLived.user_id != null && shortLived.user_id !== '') {
+      props.setProperty('THREADS_USER_ID', String(shortLived.user_id));
+    }
+    props.setProperty('THREADS_TOKEN_AT', new Date().toISOString());
+    const expiresIn = Number(longLived.expires_in);
+    if (Number.isFinite(expiresIn) && expiresIn > 0) {
+      props.setProperty(
+        'META_THREADS_TOKEN_EXPIRES_AT',
+        new Date(Date.now() + expiresIn * 1000).toISOString()
+      );
+    }
+    props.deleteProperty(THREADS_OAUTH_STATE_PROPERTY);
+    return { ok: true, error: null };
+  } catch (err) {
+    return { ok: false, error: 'network error while contacting graph.threads.net' };
+  }
+}
+
+// Renews the OAuth-obtained Threads token once it is 50+ days old.
+// Tokens recorded without THREADS_TOKEN_AT (registered manually) are
+// left to refreshThreadsTokenIfNeeded_(), which works off the
+// recorded expiry instead. Returns a secret-free error summary on
+// failure and null otherwise, so collectSnsCounts can surface it as
+// the snapshot's threads_error.
+function refreshThreadsTokenIfNeeded() {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty('META_THREADS_ACCESS_TOKEN');
+  if (!token) {
+    return null;
+  }
+  const acquiredAt = props.getProperty('THREADS_TOKEN_AT');
+  if (!acquiredAt) {
+    return null;
+  }
+  const acquiredMs = Date.parse(acquiredAt);
+  if (!Number.isFinite(acquiredMs)) {
+    return null;
+  }
+  if (Date.now() - acquiredMs < THREADS_TOKEN_REFRESH_AGE_MS) {
+    return null;
+  }
+  try {
+    const res = UrlFetchApp.fetch(
+      THREADS_REFRESH_URL +
+        '?grant_type=th_refresh_token&access_token=' +
+        encodeURIComponent(token),
+      { muteHttpExceptions: true }
+    );
+    if (res.getResponseCode() !== 200) {
+      const summary =
+        'refresh: ' +
+        summarizeInsightsError_(res.getResponseCode(), res.getContentText());
+      console.log('Threads token refresh failed: ' + summary);
+      return summary;
+    }
+    const data = JSON.parse(res.getContentText());
+    if (!data || !data.access_token) {
+      const summary = 'refresh: response had no access_token';
+      console.log('Threads token refresh failed: ' + summary);
+      return summary;
+    }
+    props.setProperty('META_THREADS_ACCESS_TOKEN', data.access_token);
+    props.setProperty('THREADS_TOKEN_AT', new Date().toISOString());
+    const expiresIn = Number(data.expires_in);
+    if (Number.isFinite(expiresIn) && expiresIn > 0) {
+      props.setProperty(
+        'META_THREADS_TOKEN_EXPIRES_AT',
+        new Date(Date.now() + expiresIn * 1000).toISOString()
+      );
+    }
+    console.log('Threads token refreshed');
+    return null;
+  } catch (err) {
+    const summary = 'refresh: network error while contacting graph.threads.net';
+    console.log('Threads token refresh failed: ' + summary);
+    return summary;
   }
 }
 
@@ -1969,6 +2196,7 @@ function buildSnsHistoryResponse_() {
 function collectSnsCounts() {
   refreshMetaTokenIfNeeded_();
   refreshThreadsTokenIfNeeded_();
+  const threadsRefreshError = refreshThreadsTokenIfNeeded();
   const igViews = fetchInstagramViewsInsights_();
   const igDetail = fetchInstagramAccountDetail_();
   const igDemographics = fetchInstagramDemographics_();
@@ -2002,8 +2230,14 @@ function collectSnsCounts() {
       recent_media: igMedia.recent_media,
       media_error: igMedia.media_error,
     },
-    threads: { followers: fetchThreadsFollowers_() },
+    threads: {
+      followers: fetchThreadsFollowers_(),
+      threads_error: threadsRefreshError,
+    },
   };
+  if (snapshot.threads.threads_error) {
+    console.log('Threads refresh error: ' + snapshot.threads.threads_error);
+  }
   if (igViews.insights_error) {
     console.log('Instagram insights error: ' + igViews.insights_error);
   }
@@ -2150,9 +2384,45 @@ function jsonOut_(obj) {
   );
 }
 
+function htmlOut_(html) {
+  return ContentService.createTextOutput(html).setMimeType(
+    ContentService.MimeType.HTML
+  );
+}
+
 function doGet(e) {
   try {
     const parameter = (e && e.parameter) || {};
+    // Threads OAuth callback: Threads redirects the owner's browser
+    // here with a code after threadsAuthorizeUrl(). The state saved
+    // by that helper is the credential for this one request — the
+    // redirect carries no ID token — so it is handled before every
+    // other route. A code whose state does not match the saved one is
+    // never treated as an API action; it just gets a plain page.
+    if (parameter.code) {
+      const expectedState = getScriptProperty_(THREADS_OAUTH_STATE_PROPERTY);
+      if (expectedState && parameter.state && parameter.state === expectedState) {
+        const result = handleThreadsOAuthCallback_(parameter.code);
+        if (result.ok) {
+          return htmlOut_(
+            '<!DOCTYPE html><html><body>' +
+              '<p>Threads の認可が完了しました。このタブは閉じて構いません。</p>' +
+              '</body></html>'
+          );
+        }
+        console.log('Threads OAuth callback failed: ' + result.error);
+        return htmlOut_(
+          '<!DOCTYPE html><html><body>' +
+            '<p>Threads の認可に失敗しました。Apps Script の実行ログを確認してください。</p>' +
+            '</body></html>'
+        );
+      }
+      return htmlOut_(
+        '<!DOCTYPE html><html><body>' +
+          '<p>Threads の認可フローが確認できませんでした。threadsAuthorizeUrl() からやり直してください。</p>' +
+          '</body></html>'
+      );
+    }
     if (parameter.action === 'sns_counts') {
       // Public by design: returns only the stored SNS follower snapshot.
       // Handled before the GA4 property check and before authentication.
@@ -2325,6 +2595,11 @@ if (typeof exports !== 'undefined') {
   exports.isTokenRefreshDue_ = isTokenRefreshDue_;
   exports.refreshMetaTokenIfNeeded_ = refreshMetaTokenIfNeeded_;
   exports.refreshThreadsTokenIfNeeded_ = refreshThreadsTokenIfNeeded_;
+  exports.threadsAuthorizeUrl = threadsAuthorizeUrl;
+  exports.handleThreadsOAuthCallback_ = handleThreadsOAuthCallback_;
+  exports.threadsRedirectUri_ = threadsRedirectUri_;
+  exports.refreshThreadsTokenIfNeeded = refreshThreadsTokenIfNeeded;
+  exports.htmlOut_ = htmlOut_;
   exports.appendSnsHistory_ = appendSnsHistory_;
   exports.buildSnsHistoryResponse_ = buildSnsHistoryResponse_;
   exports.SNS_HISTORY_RESPONSE_COLUMNS = SNS_HISTORY_RESPONSE_COLUMNS;
