@@ -77,7 +77,130 @@ describe('SNS follower counts', () => {
   const lastJson = () => JSON.parse(outputs[outputs.length - 1].text);
 
   const mockYouTube = (result) => {
-    global.YouTube = { Channels: { list: vi.fn(() => result) } };
+    global.YouTube = {
+      Channels: {
+        list: vi.fn((part) => (part === 'statistics' ? result : { items: [] })),
+      },
+      PlaylistItems: { list: vi.fn(() => ({ items: [] })) },
+      Videos: { list: vi.fn(() => ({ items: [] })) },
+    };
+  };
+
+  const mockYouTubeFull = () => {
+    global.YouTube = {
+      Channels: {
+        list: vi.fn((part) => {
+          if (part === 'statistics') {
+            return {
+              items: [
+                {
+                  statistics: {
+                    subscriberCount: '8',
+                    viewCount: '123456',
+                    videoCount: '42',
+                  },
+                },
+              ],
+            };
+          }
+          if (part === 'contentDetails') {
+            return {
+              items: [
+                { contentDetails: { relatedPlaylists: { uploads: 'UUuploads' } } },
+              ],
+            };
+          }
+          throw new Error('unexpected part: ' + part);
+        }),
+      },
+      PlaylistItems: {
+        list: vi.fn(() => ({
+          items: [
+            {
+              snippet: {
+                title: '川口の歌',
+                publishedAt: '2026-11-08T00:00:00Z',
+                resourceId: { videoId: 'vid1' },
+              },
+            },
+          ],
+        })),
+      },
+      Videos: {
+        list: vi.fn(() => ({
+          items: [
+            {
+              id: 'vid1',
+              statistics: { viewCount: '1000', likeCount: '50', commentCount: '4' },
+            },
+          ],
+        })),
+      },
+    };
+  };
+
+  const totalValueBody = (name, value, breakdowns) => ({
+    data: [
+      {
+        name,
+        period: 'day',
+        total_value: breakdowns ? { value, breakdowns } : { value },
+      },
+    ],
+  });
+
+  const followsBreakdownBody = () =>
+    totalValueBody('follows_and_unfollows', 150, [
+      {
+        dimension_keys: ['follow_type'],
+        results: [
+          { dimension_values: ['FOLLOWS'], value: 180 },
+          { dimension_values: ['UNFOLLOWS'], value: 30 },
+        ],
+      },
+    ]);
+
+  const demographicsBody = (dims, results) => ({
+    data: [
+      {
+        name: 'follower_demographics',
+        period: 'lifetime',
+        total_value: { value: 1991, breakdowns: [{ dimension_keys: dims, results }] },
+      },
+    ],
+  });
+
+  const MEDIA_LIST = [
+    {
+      id: 'media-reel-1',
+      media_type: 'VIDEO',
+      media_product_type: 'REELS',
+      caption: 'リールのキャプション',
+      timestamp: '2026-11-08T03:00:00+0000',
+      permalink: 'https://www.instagram.com/reel/ABC/',
+      thumbnail_url: 'https://example.com/thumb1.jpg',
+    },
+    {
+      id: 'media-image-1',
+      media_type: 'IMAGE',
+      media_product_type: 'FEED',
+      caption: '写真のキャプション',
+      timestamp: '2026-11-07T03:00:00+0000',
+      permalink: 'https://www.instagram.com/p/DEF/',
+    },
+  ];
+
+  const mediaInsightsBody = (pairs) => ({
+    data: pairs.map(([name, value]) => ({
+      name,
+      period: 'lifetime',
+      values: [{ value }],
+    })),
+  });
+
+  const metricFromUrl = (url) => {
+    const match = url.match(/[?&]metric=([a-z_]+)/);
+    return match ? match[1] : null;
   };
 
   const insightsBreakdownBody = (follower, nonFollower, total) => ({
@@ -102,21 +225,113 @@ describe('SNS follower counts', () => {
   });
 
   const mockGraphSuccess = () => {
+    const accountTotals = {
+      reach: 5000,
+      accounts_engaged: 1200,
+      total_interactions: 3000,
+      likes: 2000,
+      comments: 300,
+      shares: 400,
+      saves: 300,
+      profile_links_taps: 46,
+    };
     fetchHandler = (url) => {
+      if (url.includes('graph.threads.net') && url.includes(THREADS_ID)) {
+        return res(200, { followers_count: 252 });
+      }
+      if (url.includes('/media?')) {
+        return res(200, { data: MEDIA_LIST });
+      }
+      if (url.includes('media-reel-1/insights')) {
+        return res(
+          200,
+          mediaInsightsBody([
+            ['views', 1000],
+            ['reach', 900],
+            ['likes', 50],
+            ['comments', 5],
+            ['shares', 3],
+            ['saved', 7],
+            ['total_interactions', 65],
+            ['ig_reels_avg_watch_time', 8500],
+            ['ig_reels_video_view_total_time', 765432],
+          ])
+        );
+      }
+      if (url.includes('media-image-1/insights')) {
+        return res(
+          200,
+          mediaInsightsBody([
+            ['views', 100],
+            ['reach', 90],
+            ['likes', 10],
+            ['comments', 1],
+            ['shares', 0],
+            ['saved', 2],
+            ['total_interactions', 13],
+          ])
+        );
+      }
+      if (url.includes('fields=media_count')) {
+        return res(200, { media_count: 2404 });
+      }
+      if (url.includes('/insights') && url.includes('metric=follower_demographics')) {
+        if (url.includes('breakdown=age,gender')) {
+          return res(
+            200,
+            demographicsBody(
+              ['age', 'gender'],
+              [
+                { dimension_values: ['35-44', 'M'], value: 300 },
+                { dimension_values: ['25-34', 'F'], value: 500 },
+              ]
+            )
+          );
+        }
+        if (url.includes('breakdown=city')) {
+          return res(
+            200,
+            demographicsBody(
+              ['city'],
+              [
+                { dimension_values: ['Tokyo'], value: 100 },
+                { dimension_values: ['Kawaguchi'], value: 800 },
+              ]
+            )
+          );
+        }
+        if (url.includes('breakdown=country')) {
+          return res(
+            200,
+            demographicsBody(
+              ['country'],
+              [
+                { dimension_values: ['JP'], value: 1500 },
+                { dimension_values: ['US'], value: 20 },
+              ]
+            )
+          );
+        }
+        throw new Error('unexpected demographics url: ' + url);
+      }
+      if (url.includes('/insights') && url.includes('metric=follows_and_unfollows')) {
+        return res(200, followsBreakdownBody());
+      }
       if (url.includes('/insights') && url.includes('breakdown=follow_type')) {
         return res(200, insightsBreakdownBody(370, 9630, 10000));
       }
-      if (url.includes('graph.facebook.com') && url.includes('fields=media_count')) {
-        return res(200, { media_count: 2404 });
+      if (url.includes('/insights')) {
+        const metric = metricFromUrl(url);
+        if (metric in accountTotals) {
+          return res(200, totalValueBody(metric, accountTotals[metric]));
+        }
+        throw new Error('unexpected insights metric: ' + metric);
       }
       if (url.includes('graph.facebook.com') && url.includes(MAIN_IG_ID)) {
         return res(200, { followers_count: 1988 });
       }
       if (url.includes('graph.facebook.com') && url.includes(SUB_IG_ID)) {
         return res(200, { followers_count: 59 });
-      }
-      if (url.includes('graph.threads.net') && url.includes(THREADS_ID)) {
-        return res(200, { followers_count: 252 });
       }
       throw new Error('unexpected url: ' + url);
     };
@@ -142,7 +357,7 @@ describe('SNS follower counts', () => {
       });
     });
 
-    it('returns the stored snapshot', () => {
+    it('returns the stored snapshot projected to the public shape', () => {
       const snapshot = {
         collected_at: '2026-11-08T12:00:00.000Z',
         youtube: { subscribers: 8 },
@@ -151,7 +366,66 @@ describe('SNS follower counts', () => {
       };
       store.SNS_COUNTS_SNAPSHOT = JSON.stringify(snapshot);
       Code.doGet({ parameter: { action: 'sns_counts' } });
-      expect(lastJson()).toEqual(Object.assign({ ok: true, action: 'sns_counts' }, snapshot));
+      expect(lastJson()).toEqual({
+        ok: true,
+        action: 'sns_counts',
+        collected_at: '2026-11-08T12:00:00.000Z',
+        youtube: { subscribers: 8 },
+        instagram: {
+          freddiefujiwara: 1988,
+          anemone_cancer: 59,
+          media_count: null,
+          views_30d: null,
+          non_follower_pct: null,
+          insights_error: null,
+        },
+        threads: { followers: 252 },
+      });
+    });
+
+    it('never leaks the admin detail fields into the public response', () => {
+      const snapshot = {
+        collected_at: '2026-11-08T12:00:00.000Z',
+        youtube: {
+          subscribers: 8,
+          total_views: 123456,
+          video_count: 42,
+          recent_videos: [{ id: 'vid1', title: 'secret-ish title' }],
+          youtube_error: null,
+        },
+        instagram: {
+          freddiefujiwara: 1988,
+          anemone_cancer: 59,
+          media_count: 2404,
+          views_30d: 10000,
+          non_follower_pct: 96.3,
+          insights_error: null,
+          reach_30d: 5000,
+          demographics: { age_gender: [{ key: '25-34/F', value: 500 }] },
+          recent_media: [{ id: 'media-1', caption: 'a caption' }],
+        },
+        threads: { followers: 252 },
+      };
+      store.SNS_COUNTS_SNAPSHOT = JSON.stringify(snapshot);
+      Code.doGet({ parameter: { action: 'sns_counts' } });
+      const json = lastJson();
+      expect(Object.keys(json.youtube)).toEqual(['subscribers']);
+      expect(Object.keys(json.instagram).sort()).toEqual(
+        [
+          'anemone_cancer',
+          'freddiefujiwara',
+          'insights_error',
+          'media_count',
+          'non_follower_pct',
+          'views_30d',
+        ].sort()
+      );
+      const text = outputs[outputs.length - 1].text;
+      expect(text).not.toContain('recent_media');
+      expect(text).not.toContain('demographics');
+      expect(text).not.toContain('total_views');
+      expect(text).not.toContain('recent_videos');
+      expect(text).not.toContain('a caption');
     });
 
     it('does not require authentication', () => {
@@ -174,10 +448,26 @@ describe('SNS follower counts', () => {
     it('collects all services and stores the snapshot', () => {
       store.META_ACCESS_TOKEN = 'meta-token';
       mockGraphSuccess();
-      mockYouTube({ items: [{ statistics: { subscriberCount: '8' } }] });
+      mockYouTubeFull();
 
       const snapshot = Code.collectSnsCounts();
-      expect(snapshot.youtube.subscribers).toBe(8);
+      expect(snapshot.youtube).toEqual({
+        subscribers: 8,
+        total_views: 123456,
+        video_count: 42,
+        recent_videos: [
+          {
+            id: 'vid1',
+            title: '川口の歌',
+            published_at: '2026-11-08T00:00:00Z',
+            views: 1000,
+            likes: 50,
+            comments: 4,
+            url: 'https://www.youtube.com/watch?v=vid1',
+          },
+        ],
+        youtube_error: null,
+      });
       expect(snapshot.instagram).toEqual({
         freddiefujiwara: 1988,
         anemone_cancer: 59,
@@ -185,6 +475,60 @@ describe('SNS follower counts', () => {
         views_30d: 10000,
         non_follower_pct: 96.3,
         insights_error: null,
+        reach_30d: 5000,
+        accounts_engaged_30d: 1200,
+        interactions_30d: { total: 3000, likes: 2000, comments: 300, shares: 400, saves: 300 },
+        profile_links_taps_30d: 46,
+        follows_30d: 180,
+        unfollows_30d: 30,
+        demographics: {
+          age_gender: [
+            { key: '25-34/F', value: 500 },
+            { key: '35-44/M', value: 300 },
+          ],
+          top_cities: [
+            { key: 'Kawaguchi', value: 800 },
+            { key: 'Tokyo', value: 100 },
+          ],
+          top_countries: [
+            { key: 'JP', value: 1500 },
+            { key: 'US', value: 20 },
+          ],
+        },
+        detail_error: null,
+        recent_media: [
+          {
+            id: 'media-reel-1',
+            type: 'REELS',
+            posted_at: '2026-11-08T03:00:00+0000',
+            caption: 'リールのキャプション',
+            permalink: 'https://www.instagram.com/reel/ABC/',
+            views: 1000,
+            reach: 900,
+            likes: 50,
+            comments: 5,
+            shares: 3,
+            saves: 7,
+            avg_watch_sec: 8.5,
+            total_watch_sec: 765,
+          },
+          {
+            id: 'media-image-1',
+            type: 'FEED',
+            posted_at: '2026-11-07T03:00:00+0000',
+            caption: '写真のキャプション',
+            permalink: 'https://www.instagram.com/p/DEF/',
+            views: 100,
+            reach: 90,
+            likes: 10,
+            comments: 1,
+            shares: 0,
+            saves: 2,
+            avg_watch_sec: null,
+            total_watch_sec: null,
+          },
+        ],
+        media_error: null,
       });
       expect(snapshot.threads.followers).toBe(252);
       expect(snapshot.collected_at).toBeTruthy();
@@ -205,6 +549,16 @@ describe('SNS follower counts', () => {
         views_30d: null,
         non_follower_pct: null,
         insights_error: null,
+        reach_30d: null,
+        accounts_engaged_30d: null,
+        interactions_30d: { total: null, likes: null, comments: null, shares: null, saves: null },
+        profile_links_taps_30d: null,
+        follows_30d: null,
+        unfollows_30d: null,
+        demographics: { age_gender: null, top_cities: null, top_countries: null },
+        detail_error: null,
+        recent_media: null,
+        media_error: null,
       });
       expect(snapshot.threads.followers).toBeNull();
       expect(store.SNS_COUNTS_SNAPSHOT).toBeTruthy();
@@ -608,6 +962,500 @@ describe('SNS follower counts', () => {
       fetchHandler = () => res(400, { error: { message: 'expired' } });
       expect(Code.refreshThreadsTokenIfNeeded_()).toBe(false);
       expect(store.META_THREADS_ACCESS_TOKEN).toBe('old-threads-token');
+    });
+  });
+
+  describe('doGet action=sns_detail', () => {
+    const detailSnapshot = {
+      collected_at: '2026-11-08T12:00:00.000Z',
+      youtube: {
+        subscribers: 8,
+        total_views: 123456,
+        video_count: 42,
+        recent_videos: [{ id: 'vid1', title: '川口の歌' }],
+        youtube_error: null,
+      },
+      instagram: {
+        freddiefujiwara: 1988,
+        reach_30d: 5000,
+        demographics: { age_gender: [{ key: '25-34/F', value: 500 }] },
+        recent_media: [{ id: 'media-1', views: 1000 }],
+      },
+      threads: { followers: 252 },
+    };
+
+    it('returns the empty detail shape before the first collection', () => {
+      store.GA4_PROPERTY_ID = '561730442';
+      Code.doGet({ parameter: { action: 'sns_detail' } });
+      const json = lastJson();
+      expect(json.ok).toBe(true);
+      expect(json.action).toBe('sns_detail');
+      expect(json.collected_at).toBeNull();
+      expect(json.youtube).toEqual({
+        subscribers: null,
+        total_views: null,
+        video_count: null,
+        recent_videos: null,
+        youtube_error: null,
+      });
+      expect(json.instagram.interactions_30d).toEqual({
+        total: null,
+        likes: null,
+        comments: null,
+        shares: null,
+        saves: null,
+      });
+      expect(json.instagram.demographics).toEqual({
+        age_gender: null,
+        top_cities: null,
+        top_countries: null,
+      });
+      expect(json.instagram.recent_media).toBeNull();
+      expect(json.threads).toEqual({ followers: null });
+    });
+
+    it('returns the full stored snapshot, detail included', () => {
+      store.GA4_PROPERTY_ID = '561730442';
+      store.SNS_COUNTS_SNAPSHOT = JSON.stringify(detailSnapshot);
+      Code.doGet({ parameter: { action: 'sns_detail' } });
+      expect(lastJson()).toEqual(
+        Object.assign({ ok: true, action: 'sns_detail' }, detailSnapshot)
+      );
+    });
+
+    it('rejects anonymous calls while authentication is configured', () => {
+      store.GA4_PROPERTY_ID = '561730442';
+      store.GOOGLE_OAUTH_CLIENT_ID = 'client-id';
+      store.AVAILABLE_GMAILS = 'owner@example.com';
+      store.SNS_COUNTS_SNAPSHOT = JSON.stringify(detailSnapshot);
+      Code.doGet({ parameter: { action: 'sns_detail' } });
+      expect(lastJson().ok).toBe(false);
+      expect(lastJson().status).toBe(401);
+    });
+
+    it('serves with a valid share token while authentication is configured', () => {
+      store.GA4_PROPERTY_ID = '561730442';
+      store.GOOGLE_OAUTH_CLIENT_ID = 'client-id';
+      store.AVAILABLE_GMAILS = 'owner@example.com';
+      store.SNS_COUNTS_SNAPSHOT = JSON.stringify(detailSnapshot);
+      global.Utilities = {
+        computeDigest: vi.fn(() => new Array(32).fill(7)),
+        getUuid: vi.fn(() => '12345678-1234-1234-1234-1234567890ab'),
+        DigestAlgorithm: { SHA_256: 'SHA_256' },
+      };
+      const token = Code.issueShareSession_().share_token;
+      Code.doGet({ parameter: { action: 'sns_detail', share_token: token } });
+      const json = lastJson();
+      expect(json.ok).toBe(true);
+      expect(json.action).toBe('sns_detail');
+      expect(json.instagram.reach_30d).toBe(5000);
+    });
+
+    it('serves with a valid id token while authentication is configured', () => {
+      store.GA4_PROPERTY_ID = '561730442';
+      store.GOOGLE_OAUTH_CLIENT_ID = 'client-id';
+      store.AVAILABLE_GMAILS = 'owner@example.com';
+      store.SNS_COUNTS_SNAPSHOT = JSON.stringify(detailSnapshot);
+      fetchHandler = (url) => {
+        if (String(url).startsWith('https://oauth2.googleapis.com/tokeninfo')) {
+          return res(200, {
+            iss: 'https://accounts.google.com',
+            aud: 'client-id',
+            exp: Math.floor(Date.now() / 1000) + 3600,
+            email_verified: 'true',
+            email: 'owner@example.com',
+            sub: '12345',
+          });
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+      Code.doGet({ parameter: { action: 'sns_detail', id_token: 'token' } });
+      const json = lastJson();
+      expect(json.ok).toBe(true);
+      expect(json.action).toBe('sns_detail');
+      expect(json.youtube.total_views).toBe(123456);
+    });
+  });
+
+  describe('Instagram account detail', () => {
+    const detailHandler = (overrides) => {
+      const totals = Object.assign(
+        {
+          reach: 5000,
+          accounts_engaged: 1200,
+          total_interactions: 3000,
+          likes: 2000,
+          comments: 300,
+          shares: 400,
+          saves: 300,
+          profile_links_taps: 46,
+        },
+        (overrides && overrides.totals) || {}
+      );
+      fetchHandler = (url) => {
+        if (url.includes('metric=follows_and_unfollows')) {
+          return overrides && overrides.follows
+            ? overrides.follows()
+            : res(200, followsBreakdownBody());
+        }
+        if (url.includes('/insights')) {
+          const metric = metricFromUrl(url);
+          if (overrides && overrides.errors && overrides.errors[metric]) {
+            return overrides.errors[metric]();
+          }
+          if (metric in totals && totals[metric] !== null) {
+            return res(200, totalValueBody(metric, totals[metric]));
+          }
+          throw new Error('unexpected insights metric: ' + metric);
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+    };
+
+    it('collects every metric and the follows split', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      detailHandler();
+      const detail = Code.fetchInstagramAccountDetail_();
+      expect(detail).toEqual({
+        reach_30d: 5000,
+        accounts_engaged_30d: 1200,
+        interactions_30d: { total: 3000, likes: 2000, comments: 300, shares: 400, saves: 300 },
+        profile_links_taps_30d: 46,
+        follows_30d: 180,
+        unfollows_30d: 30,
+        detail_error: null,
+      });
+    });
+
+    it('nulls only the failed metric and records its error without the token', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      detailHandler({
+        errors: {
+          reach: () => res(400, { error: { message: 'metric reach unsupported', code: 100 } }),
+        },
+      });
+      const detail = Code.fetchInstagramAccountDetail_();
+      expect(detail.reach_30d).toBeNull();
+      expect(detail.accounts_engaged_30d).toBe(1200);
+      expect(detail.interactions_30d.total).toBe(3000);
+      expect(detail.follows_30d).toBe(180);
+      expect(detail.detail_error).toContain('reach: HTTP 400 code=100');
+      expect(detail.detail_error).toContain('metric reach unsupported');
+      expect(detail.detail_error).not.toContain('meta-token');
+    });
+
+    it('keeps the follows split null when its request fails', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      detailHandler({
+        follows: () => res(500, { error: { message: 'boom', code: 1 } }),
+      });
+      const detail = Code.fetchInstagramAccountDetail_();
+      expect(detail.follows_30d).toBeNull();
+      expect(detail.unfollows_30d).toBeNull();
+      expect(detail.reach_30d).toBe(5000);
+      expect(detail.detail_error).toContain('follows_and_unfollows: HTTP 500');
+    });
+
+    it('returns nulls without a token and never calls the API', () => {
+      const detail = Code.fetchInstagramAccountDetail_();
+      expect(detail.reach_30d).toBeNull();
+      expect(detail.interactions_30d).toEqual({
+        total: null,
+        likes: null,
+        comments: null,
+        shares: null,
+        saves: null,
+      });
+      expect(detail.detail_error).toBeNull();
+      expect(global.UrlFetchApp.fetch).not.toHaveBeenCalled();
+    });
+
+    it('parseFollowsBreakdown_ matches FOLLOWS/UNFOLLOWS tokens only', () => {
+      expect(Code.parseFollowsBreakdown_(followsBreakdownBody())).toEqual({
+        follows: 180,
+        unfollows: 30,
+      });
+      // The views-style follower labels must not be read as a split.
+      expect(
+        Code.parseFollowsBreakdown_(insightsBreakdownBody(370, 9630, 10000))
+      ).toBeNull();
+      expect(Code.parseFollowsBreakdown_(null)).toBeNull();
+      expect(Code.parseFollowsBreakdown_({ data: [] })).toBeNull();
+    });
+  });
+
+  describe('Instagram demographics', () => {
+    it('sorts rows, slices the top 10 and falls back to the age-only breakdown', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      const cities = Array.from({ length: 12 }, (_, i) => ({
+        dimension_values: ['City' + (i + 1)],
+        value: 120 - i * 10,
+      }));
+      fetchHandler = (url) => {
+        if (url.includes('breakdown=age,gender')) {
+          return res(400, { error: { message: 'single breakdown only', code: 100 } });
+        }
+        if (url.includes('breakdown=age')) {
+          return res(
+            200,
+            demographicsBody(
+              ['age'],
+              [
+                { dimension_values: ['18-24'], value: 300 },
+                { dimension_values: ['25-34'], value: 500 },
+              ]
+            )
+          );
+        }
+        if (url.includes('breakdown=city')) {
+          return res(200, demographicsBody(['city'], cities));
+        }
+        if (url.includes('breakdown=country')) {
+          return res(400, { error: { message: 'country unavailable', code: 100 } });
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+      const { demographics, error } = Code.fetchInstagramDemographics_();
+      expect(demographics.age_gender).toEqual([
+        { key: '25-34', value: 500 },
+        { key: '18-24', value: 300 },
+      ]);
+      expect(demographics.top_cities).toHaveLength(10);
+      expect(demographics.top_cities[0]).toEqual({ key: 'City1', value: 120 });
+      expect(demographics.top_cities[9]).toEqual({ key: 'City10', value: 30 });
+      expect(demographics.top_countries).toBeNull();
+      expect(error).toContain('demographics(top_countries)');
+      expect(error).toContain('country unavailable');
+      expect(error).not.toContain('age_gender');
+    });
+
+    it('returns null lists without a token and never calls the API', () => {
+      const { demographics, error } = Code.fetchInstagramDemographics_();
+      expect(demographics).toEqual({
+        age_gender: null,
+        top_cities: null,
+        top_countries: null,
+      });
+      expect(error).toBeNull();
+      expect(global.UrlFetchApp.fetch).not.toHaveBeenCalled();
+    });
+
+    it('parseDemographicsBreakdown_ requires the requested dimensions', () => {
+      const body = demographicsBody(
+        ['age'],
+        [{ dimension_values: ['25-34'], value: 500 }]
+      );
+      expect(Code.parseDemographicsBreakdown_(body, ['age'])).toEqual([
+        { key: '25-34', value: 500 },
+      ]);
+      expect(Code.parseDemographicsBreakdown_(body, ['city'])).toBeNull();
+      expect(Code.parseDemographicsBreakdown_(null, ['age'])).toBeNull();
+    });
+  });
+
+  describe('Instagram recent media', () => {
+    const reel = MEDIA_LIST[0];
+    const image = MEDIA_LIST[1];
+
+    it('builds entries with insights, converts watch time and truncates captions', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      const longCaption = 'あ'.repeat(100);
+      fetchHandler = (url) => {
+        if (url.includes('/media?')) {
+          return res(200, { data: [Object.assign({}, reel, { caption: longCaption })] });
+        }
+        if (url.includes('media-reel-1/insights')) {
+          return res(
+            200,
+            mediaInsightsBody([
+              ['views', 1000],
+              ['reach', 900],
+              ['likes', 50],
+              ['comments', 5],
+              ['shares', 3],
+              ['saved', 7],
+              ['total_interactions', 65],
+              ['ig_reels_avg_watch_time', 8500],
+              ['ig_reels_video_view_total_time', 765432],
+            ])
+          );
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+      const { recent_media, media_error } = Code.fetchInstagramRecentMedia_();
+      expect(media_error).toBeNull();
+      expect(recent_media).toHaveLength(1);
+      expect(recent_media[0].caption).toHaveLength(80);
+      expect(recent_media[0]).toEqual({
+        id: 'media-reel-1',
+        type: 'REELS',
+        posted_at: '2026-11-08T03:00:00+0000',
+        caption: longCaption.slice(0, 80),
+        permalink: 'https://www.instagram.com/reel/ABC/',
+        views: 1000,
+        reach: 900,
+        likes: 50,
+        comments: 5,
+        shares: 3,
+        saves: 7,
+        avg_watch_sec: 8.5,
+        total_watch_sec: 765,
+      });
+    });
+
+    it('retries with fewer metrics when the full set is rejected', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      fetchHandler = (url) => {
+        if (url.includes('/media?')) {
+          return res(200, { data: [image] });
+        }
+        if (url.includes('media-image-1/insights')) {
+          if (url.includes('metric=views')) {
+            return res(400, { error: { message: 'views unsupported', code: 100 } });
+          }
+          return res(
+            200,
+            mediaInsightsBody([
+              ['reach', 90],
+              ['likes', 10],
+              ['comments', 1],
+              ['saved', 2],
+              ['total_interactions', 13],
+            ])
+          );
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+      const { recent_media, media_error } = Code.fetchInstagramRecentMedia_();
+      expect(media_error).toBeNull();
+      expect(recent_media[0].views).toBeNull();
+      expect(recent_media[0].reach).toBe(90);
+      expect(recent_media[0].saves).toBe(2);
+      expect(recent_media[0].likes).toBe(10);
+    });
+
+    it('keeps numbers null and reports when every attempt fails for a post', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      fetchHandler = (url) => {
+        if (url.includes('/media?')) {
+          return res(200, { data: [image] });
+        }
+        if (url.includes('/insights')) {
+          return res(400, { error: { message: 'insights unavailable', code: 100 } });
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+      const { recent_media, media_error } = Code.fetchInstagramRecentMedia_();
+      expect(recent_media).toHaveLength(1);
+      expect(recent_media[0].views).toBeNull();
+      expect(recent_media[0].likes).toBeNull();
+      expect(media_error).toContain('1 of 1 media insights failed');
+      expect(media_error).toContain('HTTP 400');
+      expect(media_error).not.toContain('meta-token');
+    });
+
+    it('returns null when the media list itself fails', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      fetchHandler = () => res(400, { error: { message: 'bad token', code: 190 } });
+      const { recent_media, media_error } = Code.fetchInstagramRecentMedia_();
+      expect(recent_media).toBeNull();
+      expect(media_error).toContain('media list: HTTP 400 code=190');
+    });
+
+    it('returns nulls without a token and never calls the API', () => {
+      expect(Code.fetchInstagramRecentMedia_()).toEqual({
+        recent_media: null,
+        media_error: null,
+      });
+      expect(global.UrlFetchApp.fetch).not.toHaveBeenCalled();
+    });
+
+    it('parseMediaInsights_ maps saved and converts milliseconds to seconds', () => {
+      expect(
+        Code.parseMediaInsights_({
+          data: [
+            { name: 'saved', values: [{ value: 3 }] },
+            { name: 'ig_reels_avg_watch_time', values: [{ value: 12345 }] },
+            { name: 'ig_reels_video_view_total_time', values: [{ value: 999 }] },
+            { name: 'total_interactions', values: [{ value: 10 }] },
+          ],
+        })
+      ).toEqual({ saves: 3, avg_watch_sec: 12.3, total_watch_sec: 1 });
+      expect(Code.parseMediaInsights_(null)).toEqual({});
+    });
+  });
+
+  describe('YouTube detail', () => {
+    it('collects channel totals and the newest videos', () => {
+      mockYouTubeFull();
+      const detail = Code.fetchYouTubeChannelDetail_();
+      expect(detail).toEqual({
+        subscribers: 8,
+        total_views: 123456,
+        video_count: 42,
+        recent_videos: [
+          {
+            id: 'vid1',
+            title: '川口の歌',
+            published_at: '2026-11-08T00:00:00Z',
+            views: 1000,
+            likes: 50,
+            comments: 4,
+            url: 'https://www.youtube.com/watch?v=vid1',
+          },
+        ],
+        youtube_error: null,
+      });
+      expect(global.YouTube.PlaylistItems.list).toHaveBeenCalledWith('snippet', {
+        playlistId: 'UUuploads',
+        maxResults: 10,
+      });
+      expect(global.YouTube.Videos.list).toHaveBeenCalledWith('statistics', {
+        id: 'vid1',
+      });
+    });
+
+    it('records the error and keeps nulls when the API throws', () => {
+      global.YouTube = {
+        Channels: {
+          list: vi.fn(() => {
+            throw new Error('quota exceeded');
+          }),
+        },
+        PlaylistItems: { list: vi.fn(() => ({ items: [] })) },
+        Videos: { list: vi.fn(() => ({ items: [] })) },
+      };
+      const detail = Code.fetchYouTubeChannelDetail_();
+      expect(detail.subscribers).toBeNull();
+      expect(detail.total_views).toBeNull();
+      expect(detail.video_count).toBeNull();
+      expect(detail.recent_videos).toBeNull();
+      expect(detail.youtube_error).toContain('quota exceeded');
+    });
+
+    it('keeps the videos when only the statistics call fails', () => {
+      mockYouTubeFull();
+      const full = global.YouTube.Channels.list.getMockImplementation();
+      global.YouTube.Channels.list = vi.fn((part) => {
+        if (part === 'statistics') {
+          throw new Error('statistics down');
+        }
+        return full(part);
+      });
+      const detail = Code.fetchYouTubeChannelDetail_();
+      expect(detail.subscribers).toBeNull();
+      expect(detail.total_views).toBeNull();
+      expect(detail.recent_videos).toHaveLength(1);
+      expect(detail.youtube_error).toContain('statistics down');
+      expect(detail.youtube_error).not.toContain('recent videos');
+    });
+
+    it('reports the unavailable service and keeps subscribers null', () => {
+      const detail = Code.fetchYouTubeChannelDetail_();
+      expect(detail.subscribers).toBeNull();
+      expect(detail.recent_videos).toBeNull();
+      expect(detail.youtube_error).toBe('YouTube advanced service is unavailable');
+      expect(Code.fetchYouTubeSubscribers_()).toBeNull();
     });
   });
 

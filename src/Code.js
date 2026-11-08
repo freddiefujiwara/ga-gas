@@ -234,8 +234,11 @@ function issueShareToken() {
 // collectSnsCounts() runs on a time-driven trigger (see setupSnsTriggers)
 // and stores a snapshot in the Script Property SNS_COUNTS_SNAPSHOT.
 // The action=sns_counts endpoint is public by design: it only ever
-// returns that snapshot (service names, follower counts, collected_at).
-// It never exposes tokens or any GA4 data.
+// returns the public projection of that snapshot (follower counts,
+// the Instagram KPIs, collected_at). It never exposes tokens, any
+// GA4 data, or the admin-only detail in the snapshot; the full
+// snapshot is served by action=sns_detail behind the usual
+// authentication gate (see buildSnsDetailResponse_).
 //
 // Script Properties used here:
 //   META_ACCESS_TOKEN: Meta long-lived user token (about 60 days) used
@@ -279,6 +282,12 @@ function getSnsCountsSnapshot_() {
   }
 }
 
+// The public sns_counts response is a fixed projection of the
+// snapshot: only the follower/KPI fields the top page consumes. The
+// snapshot itself also carries the admin-only detail collected for
+// action=sns_detail (account insights, demographics, per-post and
+// per-video numbers); those must never leak into the public action,
+// so the snapshot is never returned verbatim here.
 function buildSnsCountsResponse_() {
   const snapshot = getSnsCountsSnapshot_();
   if (!snapshot) {
@@ -298,7 +307,81 @@ function buildSnsCountsResponse_() {
       threads: { followers: null },
     };
   }
-  return Object.assign({ ok: true, action: 'sns_counts' }, snapshot);
+  const youtube = snapshot.youtube || {};
+  const instagram = snapshot.instagram || {};
+  const threads = snapshot.threads || {};
+  return {
+    ok: true,
+    action: 'sns_counts',
+    collected_at: snapshot.collected_at || null,
+    youtube: { subscribers: snsNumberOrNull_(youtube.subscribers) },
+    instagram: {
+      freddiefujiwara: snsNumberOrNull_(instagram.freddiefujiwara),
+      anemone_cancer: snsNumberOrNull_(instagram.anemone_cancer),
+      media_count: snsNumberOrNull_(instagram.media_count),
+      views_30d: snsNumberOrNull_(instagram.views_30d),
+      non_follower_pct: snsNumberOrNull_(instagram.non_follower_pct),
+      insights_error:
+        instagram.insights_error != null ? instagram.insights_error : null,
+    },
+    threads: { followers: snsNumberOrNull_(threads.followers) },
+  };
+}
+
+function snsNumberOrNull_(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+// Default detail payload served by action=sns_detail before the
+// first collection: the full key set with null values, so the /ga
+// frontend can rely on the shape.
+function buildEmptySnsDetail_() {
+  return {
+    collected_at: null,
+    youtube: {
+      subscribers: null,
+      total_views: null,
+      video_count: null,
+      recent_videos: null,
+      youtube_error: null,
+    },
+    instagram: {
+      freddiefujiwara: null,
+      anemone_cancer: null,
+      media_count: null,
+      views_30d: null,
+      non_follower_pct: null,
+      insights_error: null,
+      reach_30d: null,
+      accounts_engaged_30d: null,
+      interactions_30d: {
+        total: null,
+        likes: null,
+        comments: null,
+        shares: null,
+        saves: null,
+      },
+      profile_links_taps_30d: null,
+      follows_30d: null,
+      unfollows_30d: null,
+      demographics: { age_gender: null, top_cities: null, top_countries: null },
+      detail_error: null,
+      recent_media: null,
+      media_error: null,
+    },
+    threads: { followers: null },
+  };
+}
+
+// action=sns_detail (authenticated): the full stored snapshot for
+// the /ga admin screen. Before the first collection it serves the
+// empty shape above.
+function buildSnsDetailResponse_() {
+  const snapshot = getSnsCountsSnapshot_();
+  if (!snapshot) {
+    return Object.assign({ ok: true, action: 'sns_detail' }, buildEmptySnsDetail_());
+  }
+  return Object.assign({ ok: true, action: 'sns_detail' }, snapshot);
 }
 
 function fetchGraphFollowersCount_(url) {
@@ -344,23 +427,9 @@ function fetchThreadsFollowers_() {
 }
 
 function fetchYouTubeSubscribers_() {
-  try {
-    if (typeof YouTube === 'undefined' || !YouTube.Channels) {
-      return null;
-    }
-    const res = YouTube.Channels.list('statistics', { id: SNS_YOUTUBE_CHANNEL_ID });
-    const items = (res && res.items) || [];
-    if (!items.length || !items[0].statistics) {
-      return null;
-    }
-    if (items[0].statistics.hiddenSubscriberCount) {
-      return null;
-    }
-    const count = Number(items[0].statistics.subscriberCount);
-    return Number.isFinite(count) ? count : null;
-  } catch (err) {
-    return null;
-  }
+  // Kept as the narrow accessor; the channel fetch itself lives in
+  // fetchYouTubeChannelDetail_() with the rest of the SNS detail.
+  return fetchYouTubeChannelDetail_().subscribers;
 }
 
 function isTokenRefreshDue_(expiresAtIso) {
@@ -687,6 +756,541 @@ function parseViewsDailyTotal_(data) {
   return seen ? total : null;
 }
 
+// --- SNS detail (for the /ga admin screen, action=sns_detail) ---
+// collectSnsCounts() also gathers the numbers the public snapshot
+// does not need: Instagram account-level insights for the last 30
+// days, follower demographics, per-post insights for the newest
+// media, and YouTube channel totals plus the newest videos. They
+// are stored in the same snapshot and served only through the
+// authenticated action=sns_detail; action=sns_counts keeps returning
+// the small public projection built above.
+//
+// Every fetch below fails independently: an unobtainable value stays
+// null and the rest of the snapshot is unaffected. Failures are
+// summarised per section — instagram.detail_error for the account
+// insights and demographics, instagram.media_error for per-post
+// insights, youtube.youtube_error for YouTube — using the same
+// secret-free style as instagram.insights_error: summaries are built
+// from response status/body or exception names only, never from a
+// request URL (URLs carry the access token).
+
+const SNS_RECENT_MEDIA_LIMIT = 30;
+const SNS_RECENT_VIDEO_LIMIT = 10;
+const SNS_DEMOGRAPHICS_TOP_LIMIT = 10;
+
+function joinSnsErrors_(parts) {
+  const list = (parts || []).filter(Boolean);
+  return list.length ? list.join('; ') : null;
+}
+
+function snsInsightsWindow_() {
+  const until = Math.floor(Date.now() / 1000);
+  return { since: until - 30 * 24 * 60 * 60, until };
+}
+
+// Fetches one account-level insights metric as a 30-day total_value.
+// Returns { value, error, data } and never throws; the total is read
+// with parseViewsDailyTotal_, which accepts both the total_value
+// form and a per-day values[] list to sum (the logic is
+// metric-agnostic). data carries the raw body for callers that need
+// the breakdown form (follows_and_unfollows).
+function fetchAccountInsightTotal_(metric, extra) {
+  const token = getScriptProperty_('META_ACCESS_TOKEN');
+  const window = snsInsightsWindow_();
+  const url =
+    META_GRAPH_BASE +
+    SNS_INSTAGRAM_MAIN_ID +
+    '/insights?metric=' +
+    metric +
+    '&period=day&metric_type=total_value&since=' +
+    window.since +
+    '&until=' +
+    window.until +
+    (extra || '') +
+    '&access_token=' +
+    encodeURIComponent(token);
+  const res = fetchInsightsJson_(url);
+  if (res.error) {
+    return { value: null, error: metric + ': ' + res.error, data: null };
+  }
+  return { value: parseViewsDailyTotal_(res.data), error: null, data: res.data };
+}
+
+// Account-level detail for the main Instagram account (last 30
+// days): reach, engaged accounts, the interaction totals, profile
+// link taps, and the follows/unfollows split. Each metric is a
+// separate request, so one rejected metric nulls only itself.
+function fetchInstagramAccountDetail_() {
+  const result = {
+    reach_30d: null,
+    accounts_engaged_30d: null,
+    interactions_30d: {
+      total: null,
+      likes: null,
+      comments: null,
+      shares: null,
+      saves: null,
+    },
+    profile_links_taps_30d: null,
+    follows_30d: null,
+    unfollows_30d: null,
+    detail_error: null,
+  };
+  if (!getScriptProperty_('META_ACCESS_TOKEN')) {
+    return result;
+  }
+  const errors = [];
+  const grab = (metric) => {
+    const fetched = fetchAccountInsightTotal_(metric);
+    if (fetched.error) {
+      errors.push(fetched.error);
+    }
+    return fetched.value;
+  };
+  result.reach_30d = grab('reach');
+  result.accounts_engaged_30d = grab('accounts_engaged');
+  result.interactions_30d = {
+    total: grab('total_interactions'),
+    likes: grab('likes'),
+    comments: grab('comments'),
+    shares: grab('shares'),
+    saves: grab('saves'),
+  };
+  result.profile_links_taps_30d = grab('profile_links_taps');
+  const follows = fetchAccountInsightTotal_(
+    'follows_and_unfollows',
+    '&breakdown=follow_type'
+  );
+  if (follows.error) {
+    errors.push(follows.error);
+  } else {
+    const parsed = parseFollowsBreakdown_(follows.data);
+    if (parsed) {
+      result.follows_30d = parsed.follows;
+      result.unfollows_30d = parsed.unfollows;
+    }
+  }
+  result.detail_error = joinSnsErrors_(errors);
+  return result;
+}
+
+// Reads the follows/unfollows split out of a follows_and_unfollows
+// total_value response. Dimension values are matched as whole tokens
+// (FOLLOWS / UNFOLLOWS): the follower/non-follower labels used by
+// the views breakdown deliberately do not match, so an unexpected
+// labelling yields null instead of a wrong split.
+function parseFollowsBreakdown_(data) {
+  const entry = data && Array.isArray(data.data) ? data.data[0] : null;
+  const totalValue = entry && entry.total_value;
+  if (!totalValue || !Array.isArray(totalValue.breakdowns)) {
+    return null;
+  }
+  let follows = null;
+  let unfollows = null;
+  totalValue.breakdowns.forEach((breakdown) => {
+    const keys = (breakdown && breakdown.dimension_keys) || [];
+    if (!keys.includes('follow_type')) {
+      return;
+    }
+    ((breakdown && breakdown.results) || []).forEach((row) => {
+      const value = Number(row && row.value);
+      if (!Number.isFinite(value)) {
+        return;
+      }
+      const dims = ((row && row.dimension_values) || []).map((dim) =>
+        String(dim).toUpperCase()
+      );
+      if (dims.includes('UNFOLLOWS') || dims.includes('UNFOLLOW')) {
+        unfollows = value;
+      } else if (dims.includes('FOLLOWS') || dims.includes('FOLLOW')) {
+        follows = value;
+      }
+    });
+  });
+  if (follows === null && unfollows === null) {
+    return null;
+  }
+  return { follows, unfollows };
+}
+
+// Follower demographics (period=lifetime): age/gender pairs, top
+// cities and top countries. Returns { demographics, error }; each of
+// the three lists fails independently to null.
+function fetchInstagramDemographics_() {
+  const demographics = { age_gender: null, top_cities: null, top_countries: null };
+  const token = getScriptProperty_('META_ACCESS_TOKEN');
+  if (!token) {
+    return { demographics, error: null };
+  }
+  const base =
+    META_GRAPH_BASE +
+    SNS_INSTAGRAM_MAIN_ID +
+    '/insights?metric=follower_demographics&period=lifetime' +
+    '&metric_type=total_value&access_token=' +
+    encodeURIComponent(token);
+  const errors = [];
+  let ageGender = fetchDemographicBreakdown_(
+    base + '&breakdown=age,gender',
+    ['age', 'gender']
+  );
+  if (ageGender.error) {
+    // Some API versions accept only one breakdown dimension at a
+    // time; fall back to the age-only split before giving up.
+    const retry = fetchDemographicBreakdown_(base + '&breakdown=age', ['age']);
+    if (retry.error) {
+      errors.push('demographics(age_gender): ' + ageGender.error);
+    } else {
+      ageGender = retry;
+    }
+  }
+  demographics.age_gender = ageGender.rows;
+  const cities = fetchDemographicBreakdown_(base + '&breakdown=city', ['city']);
+  if (cities.error) {
+    errors.push('demographics(top_cities): ' + cities.error);
+  } else {
+    demographics.top_cities = cities.rows
+      ? cities.rows.slice(0, SNS_DEMOGRAPHICS_TOP_LIMIT)
+      : null;
+  }
+  const countries = fetchDemographicBreakdown_(
+    base + '&breakdown=country',
+    ['country']
+  );
+  if (countries.error) {
+    errors.push('demographics(top_countries): ' + countries.error);
+  } else {
+    demographics.top_countries = countries.rows
+      ? countries.rows.slice(0, SNS_DEMOGRAPHICS_TOP_LIMIT)
+      : null;
+  }
+  return { demographics, error: joinSnsErrors_(errors) };
+}
+
+function fetchDemographicBreakdown_(url, dims) {
+  const res = fetchInsightsJson_(url);
+  if (res.error) {
+    return { rows: null, error: res.error };
+  }
+  return { rows: parseDemographicsBreakdown_(res.data, dims), error: null };
+}
+
+// Reads one breakdown of a follower_demographics total_value
+// response as [{ key, value }] sorted by value descending, where key
+// is the dimension values joined with "/" (e.g. "25-34/F"). Returns
+// null when the requested breakdown is not in the response.
+function parseDemographicsBreakdown_(data, dims) {
+  const entry = data && Array.isArray(data.data) ? data.data[0] : null;
+  const totalValue = entry && entry.total_value;
+  if (!totalValue || !Array.isArray(totalValue.breakdowns)) {
+    return null;
+  }
+  let rows = null;
+  totalValue.breakdowns.forEach((breakdown) => {
+    const keys = (breakdown && breakdown.dimension_keys) || [];
+    if (!dims.every((dim) => keys.includes(dim))) {
+      return;
+    }
+    rows = ((breakdown && breakdown.results) || [])
+      .map((row) => ({
+        key: ((row && row.dimension_values) || []).join('/'),
+        value: Number(row && row.value),
+      }))
+      .filter((row) => Number.isFinite(row.value));
+  });
+  if (!rows) {
+    return null;
+  }
+  rows.sort((a, b) => b.value - a.value);
+  return rows;
+}
+
+// Metric sets tried in order for one media's insights. Reels accept
+// the watch-time metrics; other media types reject them, and some
+// reject views/shares too, so a failure retries with a smaller set
+// and keeps whatever could be read.
+const MEDIA_INSIGHTS_ATTEMPTS_REEL = [
+  'views,reach,likes,comments,shares,saved,total_interactions,ig_reels_avg_watch_time,ig_reels_video_view_total_time',
+  'reach,likes,comments,saved,total_interactions',
+  'likes,comments',
+];
+const MEDIA_INSIGHTS_ATTEMPTS_FEED = [
+  'views,reach,likes,comments,shares,saved,total_interactions',
+  'reach,likes,comments,saved,total_interactions',
+  'likes,comments',
+];
+
+// Newest Instagram media (up to SNS_RECENT_MEDIA_LIMIT) with their
+// per-post insights. Returns { recent_media, media_error }:
+// recent_media is null only when the media list itself could not be
+// read; a post whose insights all failed keeps null metrics and is
+// counted in media_error.
+function fetchInstagramRecentMedia_() {
+  const token = getScriptProperty_('META_ACCESS_TOKEN');
+  if (!token) {
+    return { recent_media: null, media_error: null };
+  }
+  const listRes = fetchInsightsJson_(
+    META_GRAPH_BASE +
+      SNS_INSTAGRAM_MAIN_ID +
+      '/media?fields=id,media_type,media_product_type,caption,timestamp,permalink,thumbnail_url&limit=' +
+      SNS_RECENT_MEDIA_LIMIT +
+      '&access_token=' +
+      encodeURIComponent(token)
+  );
+  if (listRes.error) {
+    return { recent_media: null, media_error: 'media list: ' + listRes.error };
+  }
+  const items =
+    listRes.data && Array.isArray(listRes.data.data) ? listRes.data.data : null;
+  if (!items) {
+    return {
+      recent_media: null,
+      media_error: 'media list: response had no media array',
+    };
+  }
+  const failures = [];
+  const recentMedia = items.slice(0, SNS_RECENT_MEDIA_LIMIT).map((media) => {
+    const entry = buildRecentMediaEntry_(media);
+    const insights = fetchMediaInsights_(media, token);
+    if (insights.error) {
+      failures.push(insights.error);
+    }
+    Object.assign(entry, insights.values);
+    return entry;
+  });
+  return {
+    recent_media: recentMedia,
+    media_error: failures.length
+      ? failures.length +
+        ' of ' +
+        recentMedia.length +
+        ' media insights failed (' +
+        failures[0] +
+        ')'
+      : null,
+  };
+}
+
+function buildRecentMediaEntry_(media) {
+  const caption =
+    media && media.caption != null ? String(media.caption) : '';
+  return {
+    id: media && media.id != null ? String(media.id) : null,
+    type: (media && (media.media_product_type || media.media_type)) || null,
+    posted_at: (media && media.timestamp) || null,
+    caption: caption.slice(0, 80),
+    permalink: (media && media.permalink) || null,
+    views: null,
+    reach: null,
+    likes: null,
+    comments: null,
+    shares: null,
+    saves: null,
+    avg_watch_sec: null,
+    total_watch_sec: null,
+  };
+}
+
+// Per-post insights with shrinking metric sets (see the attempts
+// above). Returns { values, error }: error is set only when every
+// attempt failed. Watch times arrive in milliseconds and are stored
+// as seconds (avg to 0.1s, total to whole seconds).
+function fetchMediaInsights_(media, token) {
+  const empty = {
+    views: null,
+    reach: null,
+    likes: null,
+    comments: null,
+    shares: null,
+    saves: null,
+    avg_watch_sec: null,
+    total_watch_sec: null,
+  };
+  if (!media || media.id == null) {
+    return { values: empty, error: null };
+  }
+  const isReel =
+    media.media_product_type === 'REELS' || media.media_type === 'VIDEO';
+  const attempts = isReel
+    ? MEDIA_INSIGHTS_ATTEMPTS_REEL
+    : MEDIA_INSIGHTS_ATTEMPTS_FEED;
+  let lastError = null;
+  for (let i = 0; i < attempts.length; i++) {
+    const res = fetchInsightsJson_(
+      META_GRAPH_BASE +
+        media.id +
+        '/insights?metric=' +
+        attempts[i] +
+        '&access_token=' +
+        encodeURIComponent(token)
+    );
+    if (!res.error) {
+      return { values: Object.assign({}, empty, parseMediaInsights_(res.data)), error: null };
+    }
+    lastError = res.error;
+  }
+  return { values: empty, error: String(media.id) + ': ' + lastError };
+}
+
+// Maps one media insights response to the snapshot's key names
+// (saved -> saves) with watch-time conversion to seconds. Metrics
+// absent from the response stay out of the map, so the caller's
+// nulls remain for them.
+function parseMediaInsights_(data) {
+  const values = {};
+  const entries = data && Array.isArray(data.data) ? data.data : [];
+  entries.forEach((entry) => {
+    if (!entry || !entry.name) {
+      return;
+    }
+    let raw = null;
+    if (Array.isArray(entry.values) && entry.values.length) {
+      raw = entry.values[0] && entry.values[0].value;
+    }
+    if (raw == null && entry.total_value) {
+      raw = entry.total_value.value;
+    }
+    const num = Number(raw);
+    if (!Number.isFinite(num)) {
+      return;
+    }
+    switch (entry.name) {
+      case 'views':
+        values.views = num;
+        break;
+      case 'reach':
+        values.reach = num;
+        break;
+      case 'likes':
+        values.likes = num;
+        break;
+      case 'comments':
+        values.comments = num;
+        break;
+      case 'shares':
+        values.shares = num;
+        break;
+      case 'saved':
+        values.saves = num;
+        break;
+      case 'ig_reels_avg_watch_time':
+        values.avg_watch_sec = Math.round(num / 100) / 10;
+        break;
+      case 'ig_reels_video_view_total_time':
+        values.total_watch_sec = Math.round(num / 1000);
+        break;
+      default:
+        break;
+    }
+  });
+  return values;
+}
+
+// YouTube advanced-service errors carry API messages (no secrets),
+// so a truncated message is safe to keep for diagnosis.
+function summarizeYouTubeError_(err) {
+  return String((err && err.message) || err || 'unknown error').slice(0, 200);
+}
+
+// Channel totals (subscribers, total views, video count) plus the
+// newest uploaded videos. Each half fails independently.
+function fetchYouTubeChannelDetail_() {
+  const result = {
+    subscribers: null,
+    total_views: null,
+    video_count: null,
+    recent_videos: null,
+    youtube_error: null,
+  };
+  if (typeof YouTube === 'undefined' || !YouTube.Channels) {
+    result.youtube_error = 'YouTube advanced service is unavailable';
+    return result;
+  }
+  const errors = [];
+  try {
+    const res = YouTube.Channels.list('statistics', { id: SNS_YOUTUBE_CHANNEL_ID });
+    const items = (res && res.items) || [];
+    const stats = items.length ? items[0].statistics : null;
+    if (stats) {
+      if (!stats.hiddenSubscriberCount) {
+        result.subscribers = snsNumberOrNull_(Number(stats.subscriberCount));
+      }
+      result.total_views = snsNumberOrNull_(Number(stats.viewCount));
+      result.video_count = snsNumberOrNull_(Number(stats.videoCount));
+    }
+  } catch (err) {
+    errors.push('channel statistics: ' + summarizeYouTubeError_(err));
+  }
+  const videos = fetchYouTubeRecentVideos_();
+  result.recent_videos = videos.videos;
+  if (videos.error) {
+    errors.push(videos.error);
+  }
+  result.youtube_error = joinSnsErrors_(errors);
+  return result;
+}
+
+// Newest uploads (up to SNS_RECENT_VIDEO_LIMIT) via the channel's
+// uploads playlist, with per-video view/like/comment counts.
+function fetchYouTubeRecentVideos_() {
+  try {
+    const details = YouTube.Channels.list('contentDetails', {
+      id: SNS_YOUTUBE_CHANNEL_ID,
+    });
+    const channelItems = (details && details.items) || [];
+    const related =
+      (channelItems.length &&
+        channelItems[0].contentDetails &&
+        channelItems[0].contentDetails.relatedPlaylists) ||
+      {};
+    if (!related.uploads) {
+      return { videos: [], error: null };
+    }
+    const playlist = YouTube.PlaylistItems.list('snippet', {
+      playlistId: related.uploads,
+      maxResults: SNS_RECENT_VIDEO_LIMIT,
+    });
+    const metas = ((playlist && playlist.items) || [])
+      .map((item) => {
+        const snippet = (item && item.snippet) || {};
+        const resource = snippet.resourceId || {};
+        return {
+          id: resource.videoId || null,
+          title: snippet.title || null,
+          published_at: snippet.publishedAt || null,
+        };
+      })
+      .filter((meta) => meta.id);
+    if (!metas.length) {
+      return { videos: [], error: null };
+    }
+    const statsRes = YouTube.Videos.list('statistics', {
+      id: metas.map((meta) => meta.id).join(','),
+    });
+    const statsById = {};
+    ((statsRes && statsRes.items) || []).forEach((item) => {
+      if (item && item.id) {
+        statsById[item.id] = item.statistics || {};
+      }
+    });
+    const videos = metas.map((meta) => {
+      const stats = statsById[meta.id] || {};
+      return {
+        id: meta.id,
+        title: meta.title,
+        published_at: meta.published_at,
+        views: snsNumberOrNull_(Number(stats.viewCount)),
+        likes: snsNumberOrNull_(Number(stats.likeCount)),
+        comments: snsNumberOrNull_(Number(stats.commentCount)),
+        url: 'https://www.youtube.com/watch?v=' + meta.id,
+      };
+    });
+    return { videos, error: null };
+  } catch (err) {
+    return { videos: null, error: 'recent videos: ' + summarizeYouTubeError_(err) };
+  }
+}
+
 // Trigger target: collects the latest follower counts and stores the
 // snapshot. Each service fails independently (null), so one broken or
 // unconfigured service never blocks the others.
@@ -694,9 +1298,19 @@ function collectSnsCounts() {
   refreshMetaTokenIfNeeded_();
   refreshThreadsTokenIfNeeded_();
   const igViews = fetchInstagramViewsInsights_();
+  const igDetail = fetchInstagramAccountDetail_();
+  const igDemographics = fetchInstagramDemographics_();
+  const igMedia = fetchInstagramRecentMedia_();
+  const yt = fetchYouTubeChannelDetail_();
   const snapshot = {
     collected_at: new Date().toISOString(),
-    youtube: { subscribers: fetchYouTubeSubscribers_() },
+    youtube: {
+      subscribers: yt.subscribers,
+      total_views: yt.total_views,
+      video_count: yt.video_count,
+      recent_videos: yt.recent_videos,
+      youtube_error: yt.youtube_error,
+    },
     instagram: {
       freddiefujiwara: fetchInstagramFollowers_(SNS_INSTAGRAM_MAIN_ID),
       anemone_cancer: fetchInstagramFollowers_(SNS_INSTAGRAM_SUB_ID),
@@ -704,11 +1318,30 @@ function collectSnsCounts() {
       views_30d: igViews.views_30d,
       non_follower_pct: igViews.non_follower_pct,
       insights_error: igViews.insights_error,
+      reach_30d: igDetail.reach_30d,
+      accounts_engaged_30d: igDetail.accounts_engaged_30d,
+      interactions_30d: igDetail.interactions_30d,
+      profile_links_taps_30d: igDetail.profile_links_taps_30d,
+      follows_30d: igDetail.follows_30d,
+      unfollows_30d: igDetail.unfollows_30d,
+      demographics: igDemographics.demographics,
+      detail_error: joinSnsErrors_([igDetail.detail_error, igDemographics.error]),
+      recent_media: igMedia.recent_media,
+      media_error: igMedia.media_error,
     },
     threads: { followers: fetchThreadsFollowers_() },
   };
   if (igViews.insights_error) {
     console.log('Instagram insights error: ' + igViews.insights_error);
+  }
+  if (snapshot.instagram.detail_error) {
+    console.log('Instagram detail error: ' + snapshot.instagram.detail_error);
+  }
+  if (snapshot.instagram.media_error) {
+    console.log('Instagram media error: ' + snapshot.instagram.media_error);
+  }
+  if (snapshot.youtube.youtube_error) {
+    console.log('YouTube detail error: ' + snapshot.youtube.youtube_error);
   }
   PropertiesService.getScriptProperties().setProperty(
     SNS_SNAPSHOT_PROPERTY,
@@ -909,6 +1542,13 @@ function doGet(e) {
         }
       }
     }
+    // The SNS detail snapshot sits behind the same gate as the GA4
+    // report (ID token or share token): it carries per-post numbers
+    // and follower demographics that the public sns_counts action
+    // deliberately never returns.
+    if (parameter.action === 'sns_detail') {
+      return jsonOut_(buildSnsDetailResponse_());
+    }
     const params = parseRunParams_(parameter);
     const body = buildReportRequest_(params);
     const result = fetchReport_(propertyId, body);
@@ -964,6 +1604,21 @@ if (typeof exports !== 'undefined') {
   exports.parseViewsDailyTotal_ = parseViewsDailyTotal_;
   exports.fetchThreadsFollowers_ = fetchThreadsFollowers_;
   exports.fetchYouTubeSubscribers_ = fetchYouTubeSubscribers_;
+  exports.buildSnsDetailResponse_ = buildSnsDetailResponse_;
+  exports.buildEmptySnsDetail_ = buildEmptySnsDetail_;
+  exports.snsNumberOrNull_ = snsNumberOrNull_;
+  exports.joinSnsErrors_ = joinSnsErrors_;
+  exports.fetchAccountInsightTotal_ = fetchAccountInsightTotal_;
+  exports.fetchInstagramAccountDetail_ = fetchInstagramAccountDetail_;
+  exports.parseFollowsBreakdown_ = parseFollowsBreakdown_;
+  exports.fetchInstagramDemographics_ = fetchInstagramDemographics_;
+  exports.parseDemographicsBreakdown_ = parseDemographicsBreakdown_;
+  exports.fetchInstagramRecentMedia_ = fetchInstagramRecentMedia_;
+  exports.fetchMediaInsights_ = fetchMediaInsights_;
+  exports.parseMediaInsights_ = parseMediaInsights_;
+  exports.fetchYouTubeChannelDetail_ = fetchYouTubeChannelDetail_;
+  exports.fetchYouTubeRecentVideos_ = fetchYouTubeRecentVideos_;
+  exports.summarizeYouTubeError_ = summarizeYouTubeError_;
   exports.isTokenRefreshDue_ = isTokenRefreshDue_;
   exports.refreshMetaTokenIfNeeded_ = refreshMetaTokenIfNeeded_;
   exports.refreshThreadsTokenIfNeeded_ = refreshThreadsTokenIfNeeded_;
