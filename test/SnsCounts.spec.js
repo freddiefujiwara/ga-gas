@@ -136,6 +136,7 @@ describe('SNS follower counts', () => {
           media_count: null,
           views_30d: null,
           non_follower_pct: null,
+          insights_error: null,
         },
         threads: { followers: null },
       });
@@ -183,6 +184,7 @@ describe('SNS follower counts', () => {
         media_count: 2404,
         views_30d: 10000,
         non_follower_pct: 96.3,
+        insights_error: null,
       });
       expect(snapshot.threads.followers).toBe(252);
       expect(snapshot.collected_at).toBeTruthy();
@@ -202,6 +204,7 @@ describe('SNS follower counts', () => {
         media_count: null,
         views_30d: null,
         non_follower_pct: null,
+        insights_error: null,
       });
       expect(snapshot.threads.followers).toBeNull();
       expect(store.SNS_COUNTS_SNAPSHOT).toBeTruthy();
@@ -302,6 +305,77 @@ describe('SNS follower counts', () => {
       expect(snapshot.threads.followers).toBe(252);
     });
 
+    it('records the API error summary in insights_error and logs it', () => {
+      store.META_ACCESS_TOKEN = 'basic-only-token';
+      graphWithInsights(() =>
+        res(400, {
+          error: {
+            message: '(#10) Application does not have permission for this action',
+            code: 10,
+            error_subcode: 1234567,
+          },
+        })
+      );
+      mockYouTube({ items: [{ statistics: { subscriberCount: '8' } }] });
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        const snapshot = Code.collectSnsCounts();
+        expect(snapshot.instagram.views_30d).toBeNull();
+        expect(snapshot.instagram.non_follower_pct).toBeNull();
+        expect(snapshot.instagram.insights_error).toContain('HTTP 400');
+        expect(snapshot.instagram.insights_error).toContain('code=10');
+        expect(snapshot.instagram.insights_error).toContain('subcode=1234567');
+        expect(snapshot.instagram.insights_error).toContain(
+          'Application does not have permission'
+        );
+        // The token must never leak into the summary or the log.
+        expect(snapshot.instagram.insights_error).not.toContain('basic-only-token');
+        const logged = logSpy.mock.calls.map((args) => args.join(' ')).join('\n');
+        expect(logged).toContain('Instagram insights error:');
+        expect(logged).toContain('HTTP 400');
+        expect(logged).not.toContain('access_token=');
+        expect(JSON.parse(store.SNS_COUNTS_SNAPSHOT).instagram.insights_error).toBe(
+          snapshot.instagram.insights_error
+        );
+      } finally {
+        logSpy.mockRestore();
+      }
+    });
+
+    it('records both errors when the breakdown and daily requests fail differently', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      graphWithInsights((url) => {
+        if (url.includes('breakdown=follower_type')) {
+          return res(400, { error: { message: 'breakdown unsupported', code: 100 } });
+        }
+        return res(500, { error: { message: 'internal boom', code: 1 } });
+      });
+      mockYouTube({ items: [] });
+      const kpi = Code.fetchInstagramViewsInsights_();
+      expect(kpi.views_30d).toBeNull();
+      expect(kpi.non_follower_pct).toBeNull();
+      expect(kpi.insights_error).toContain('breakdown: HTTP 400 code=100');
+      expect(kpi.insights_error).toContain('breakdown unsupported');
+      expect(kpi.insights_error).toContain('daily: HTTP 500 code=1');
+      expect(kpi.insights_error).toContain('internal boom');
+    });
+
+    it('records a fetch exception without leaking the request URL', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      graphWithInsights(() => {
+        throw new Error(
+          'Request failed for https://graph.facebook.com/v25.0/x?access_token=meta-token'
+        );
+      });
+      mockYouTube({ items: [] });
+      const kpi = Code.fetchInstagramViewsInsights_();
+      expect(kpi.views_30d).toBeNull();
+      expect(kpi.non_follower_pct).toBeNull();
+      expect(kpi.insights_error).toContain('fetch exception');
+      expect(kpi.insights_error).not.toContain('access_token');
+      expect(kpi.insights_error).not.toContain('meta-token');
+    });
+
     it('falls back to summed daily values when the breakdown is unavailable', () => {
       store.META_ACCESS_TOKEN = 'meta-token';
       graphWithInsights((url) => {
@@ -322,6 +396,33 @@ describe('SNS follower counts', () => {
       const kpi = Code.fetchInstagramViewsInsights_();
       expect(kpi.views_30d).toBe(400);
       expect(kpi.non_follower_pct).toBeNull();
+      expect(kpi.insights_error).toContain('used daily totals fallback');
+      expect(kpi.insights_error).toContain('breakdown unsupported');
+    });
+
+    it('notes the fallback even when the breakdown response is just unusable', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      graphWithInsights((url) => {
+        if (url.includes('breakdown=follower_type')) {
+          return res(200, { data: [{ name: 'views', period: 'day' }] });
+        }
+        return res(200, {
+          data: [
+            {
+              name: 'views',
+              period: 'day',
+              values: [{ value: 10 }, { value: 20 }],
+            },
+          ],
+        });
+      });
+      mockYouTube({ items: [] });
+      const kpi = Code.fetchInstagramViewsInsights_();
+      expect(kpi.views_30d).toBe(30);
+      expect(kpi.non_follower_pct).toBeNull();
+      expect(kpi.insights_error).toBe(
+        'follower_type breakdown unavailable; used daily totals fallback'
+      );
     });
 
     it('keeps media_count null when only that request fails', () => {
@@ -365,8 +466,24 @@ describe('SNS follower counts', () => {
       expect(Code.fetchInstagramViewsInsights_()).toEqual({
         views_30d: null,
         non_follower_pct: null,
+        insights_error: null,
       });
       expect(global.UrlFetchApp.fetch).not.toHaveBeenCalled();
+    });
+
+    it('summarizeInsightsError_ formats status, code, subcode and message', () => {
+      expect(
+        Code.summarizeInsightsError_(
+          400,
+          JSON.stringify({
+            error: { message: 'oops', code: 10, error_subcode: 42 },
+          })
+        )
+      ).toBe('HTTP 400 code=10 subcode=42: oops');
+      expect(Code.summarizeInsightsError_(500, 'not json')).toBe('HTTP 500');
+      expect(
+        Code.summarizeInsightsError_(403, JSON.stringify({ error: {} }))
+      ).toBe('HTTP 403');
     });
   });
 
