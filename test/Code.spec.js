@@ -677,4 +677,101 @@ describe('Code.js', () => {
       expect(lastJson().status).toBe(401);
     });
   });
+
+  describe('doGet action=top_articles', () => {
+    const mockCache = () => {
+      const entries = {};
+      global.CacheService = {
+        getScriptCache: () => ({
+          get: (key) => (key in entries ? entries[key] : null),
+          put: (key, value) => {
+            entries[key] = value;
+          },
+        }),
+      };
+      return entries;
+    };
+
+    const row = (path, views) => ({
+      dimensionValues: [{ value: path }],
+      metricValues: [{ value: String(views) }],
+    });
+
+    const ID_A = '1zNCqYU6xAzU3hft36Eh9oemWf6rA0yl2Hu2gPf2KI_Q';
+    const ID_B = '1ORcobKE3DfRrSUV6yMUodfVQgiL1ouKaCTWKTEFUR6A';
+
+    it('merges the split article paths and ranks by views', () => {
+      setProperty(PROPERTY_ID);
+      mockCache();
+      mockFetch(200, {
+        rows: [
+          row('/blog/' + ID_A, 100),
+          row('/' + ID_A, 50),
+          row('/blog/' + ID_B, 120),
+          row('/list-of-stuff/', 999),
+          row('/', 500),
+        ],
+        rowCount: 5,
+      });
+      Code.doGet({ parameter: { action: 'top_articles' } });
+      const json = lastJson();
+      expect(json.ok).toBe(true);
+      expect(json.action).toBe('top_articles');
+      expect(json.days).toBe(28);
+      expect(json.articles).toEqual([
+        { id: ID_A, views: 150 },
+        { id: ID_B, views: 120 },
+      ]);
+      expect(typeof json.updated_at).toBe('string');
+
+      const [url, options] = global.UrlFetchApp.fetch.mock.calls[0];
+      expect(url).toBe(
+        'https://analyticsdata.googleapis.com/v1beta/properties/' +
+          PROPERTY_ID +
+          ':runReport'
+      );
+      const body = JSON.parse(options.payload);
+      expect(body.dateRanges).toEqual([
+        { startDate: '28daysAgo', endDate: 'today' },
+      ]);
+      expect(body.metrics).toEqual([{ name: 'screenPageViews' }]);
+      expect(body.dimensions).toEqual([{ name: 'pagePath' }]);
+    });
+
+    it('stays public while authentication is configured', () => {
+      setProperty(PROPERTY_ID);
+      store.GOOGLE_OAUTH_CLIENT_ID = 'client-id';
+      store.AVAILABLE_GMAILS = 'owner@example.com';
+      mockCache();
+      mockFetch(200, { rows: [row('/blog/' + ID_B, 7)], rowCount: 1 });
+      Code.doGet({ parameter: { action: 'top_articles' } });
+      const json = lastJson();
+      expect(json.ok).toBe(true);
+      expect(json.articles).toEqual([{ id: ID_B, views: 7 }]);
+      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('serves the second call from CacheService without refetching', () => {
+      setProperty(PROPERTY_ID);
+      mockCache();
+      mockFetch(200, { rows: [row('/blog/' + ID_A, 30)], rowCount: 1 });
+      Code.doGet({ parameter: { action: 'top_articles' } });
+      const first = lastJson();
+      Code.doGet({ parameter: { action: 'top_articles' } });
+      const second = lastJson();
+      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(1);
+      expect(second.articles).toEqual(first.articles);
+      expect(second.updated_at).toBe(first.updated_at);
+    });
+
+    it('returns an error when the GA4 request fails', () => {
+      setProperty(PROPERTY_ID);
+      mockCache();
+      mockFetch(500, { error: { message: 'boom' } });
+      Code.doGet({ parameter: { action: 'top_articles' } });
+      const json = lastJson();
+      expect(json.ok).toBe(false);
+      expect(json.status).toBe(502);
+    });
+  });
 });

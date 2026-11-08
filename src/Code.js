@@ -18,11 +18,15 @@
  *                filter=pagePath:contains:/blog/;sessionDefaultChannelGroup:exact:Organic Search
  *
  * Actions:
- *   action=music_count - the one public action: returns only the
+ *   action=music_count - a public action: returns only the
  *                cumulative music_play event count and its timestamp
- *                (cached for about an hour). Every other request,
- *                including the default report, requires authentication
- *                once it is configured (see below).
+ *                (cached for about an hour).
+ *   action=top_articles - a public action: returns only the top
+ *                few blog articles of the last 28 days (article id
+ *                and view count, cached for about an hour). Every
+ *                other request, including the default report,
+ *                requires authentication once it is configured
+ *                (see below).
  *
  * The GA4 property ID comes from the Script Property GA4_PROPERTY_ID,
  * so it is never written in the source (see README "Setup").
@@ -87,6 +91,105 @@ function fetchMusicCount_(propertyId) {
       MUSIC_COUNT_CACHE_KEY,
       JSON.stringify(payload),
       MUSIC_COUNT_CACHE_SECONDS
+    );
+  }
+  return payload;
+}
+
+// --- Public top articles (action=top_articles) ---
+// The second deliberately unauthenticated action: the top page's
+// "よく読まれている記事" section is baked at build time from this
+// ranking, and a public page cannot hold a credential. It returns
+// exactly the top few blog articles of the last 28 days — article
+// id and view count, nothing else. Results are cached in
+// CacheService so the GA4 Data API is hit at most about once an
+// hour no matter how often the action is called.
+//
+// Article paths are recorded both as /<id> (the SPA's
+// base-relative route) and as /blog/<id> (the real URL); the two
+// forms are merged before ranking, the same rule the /ga screen
+// applies in its page ranking.
+const TOP_ARTICLES_CACHE_KEY = 'top_articles_v1';
+const TOP_ARTICLES_CACHE_SECONDS = 60 * 60;
+const TOP_ARTICLES_DAYS = 28;
+const TOP_ARTICLES_LIMIT = 10;
+const TOP_ARTICLES_FETCH_LIMIT = 1000;
+const ARTICLE_ID_PATTERN = /^[0-9][A-Za-z0-9_-]{24,}$/;
+
+// The blog article id a pagePath belongs to, or '' when the path
+// is not a blog article. Article ids are the long URL-safe
+// document tokens (they start with a digit); app pages such as
+// /list-of-stuff/ are not articles.
+function articleIdFromPath_(path) {
+  const id = String(path || '')
+    .replace(/^\/(blog\/)?/, '')
+    .replace(/\/$/, '');
+  return ARTICLE_ID_PATTERN.test(id) ? id : '';
+}
+
+// Merge GA report rows (pagePath x screenPageViews) into the
+// article ranking: split paths summed per article, sorted by
+// views descending, cut to the top `limit`.
+function rankTopArticles_(rows, limit) {
+  const merged = new Map();
+  (rows || []).forEach((row) => {
+    const dimensionValues = row.dimensionValues || [];
+    const metricValues = row.metricValues || [];
+    const id = articleIdFromPath_(
+      dimensionValues[0] && dimensionValues[0].value
+    );
+    if (!id) return;
+    const views = Number(metricValues[0] && metricValues[0].value) || 0;
+    merged.set(id, (merged.get(id) || 0) + views);
+  });
+  return Array.from(merged.entries())
+    .map(([id, views]) => ({ id, views }))
+    .sort((a, b) => b.views - a.views)
+    .slice(0, limit);
+}
+
+function fetchTopArticles_(propertyId) {
+  const cache =
+    typeof CacheService !== 'undefined' ? CacheService.getScriptCache() : null;
+  if (cache) {
+    const cached = cache.get(TOP_ARTICLES_CACHE_KEY);
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached);
+        if (parsed && Array.isArray(parsed.articles) && parsed.updated_at) {
+          return parsed;
+        }
+      } catch (error) {
+        // A corrupt cache entry is ignored; a fresh value is fetched.
+      }
+    }
+  }
+  const body = buildReportRequest_({
+    startDate: '28daysAgo',
+    endDate: 'today',
+    metrics: ['screenPageViews'],
+    dimensions: ['pagePath'],
+    limit: TOP_ARTICLES_FETCH_LIMIT,
+    offset: 0,
+    filters: [],
+  });
+  const result = fetchReport_(propertyId, body);
+  if (result.status !== 200) {
+    throw new Error('GA4 API request failed with status ' + result.status);
+  }
+  const payload = {
+    days: TOP_ARTICLES_DAYS,
+    articles: rankTopArticles_(
+      (result.data && result.data.rows) || [],
+      TOP_ARTICLES_LIMIT
+    ),
+    updated_at: new Date().toISOString(),
+  };
+  if (cache) {
+    cache.put(
+      TOP_ARTICLES_CACHE_KEY,
+      JSON.stringify(payload),
+      TOP_ARTICLES_CACHE_SECONDS
     );
   }
   return payload;
@@ -2079,6 +2182,23 @@ function doGet(e) {
         });
       }
     }
+    // The public top-articles ranking is served before any
+    // authentication, like the music count: it exposes only the
+    // top few article ids and their view counts.
+    if (parameter.action === 'top_articles') {
+      try {
+        const payload = fetchTopArticles_(propertyId);
+        return jsonOut_(
+          Object.assign({ ok: true, action: 'top_articles' }, payload)
+        );
+      } catch (error) {
+        return jsonOut_({
+          ok: false,
+          status: 502,
+          error: String((error && error.message) || error),
+        });
+      }
+    }
     let shareSession = null;
     if (parameter.action === 'issue_share' || parameter.action === 'revoke_share') {
       try {
@@ -2166,6 +2286,9 @@ if (typeof exports !== 'undefined') {
   exports.buildReportRequest_ = buildReportRequest_;
   exports.fetchReport_ = fetchReport_;
   exports.fetchMusicCount_ = fetchMusicCount_;
+  exports.fetchTopArticles_ = fetchTopArticles_;
+  exports.articleIdFromPath_ = articleIdFromPath_;
+  exports.rankTopArticles_ = rankTopArticles_;
   exports.jsonOut_ = jsonOut_;
   exports.collectSnsCounts = collectSnsCounts;
   exports.setupSnsTriggers = setupSnsTriggers;
