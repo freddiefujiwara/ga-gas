@@ -63,6 +63,7 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - `media` シート：`recent_media` の投稿ごとに1行。列は collected_at、media_id、posted_at、type、caption、permalink、views、reach、likes、comments、shares、saves、avg_watch_sec、total_watch_sec
 - 両シートとも無ければ自動作成し、1行目が空（シートが空）のときだけヘッダー行を書く
 - 追記に失敗しても取得自体は成功として扱い、実行ログに `SNS history append failed: <要約>` が1行出る（要約に秘密値・URL は含めない）
+- 読み取りは `?action=sns_history`（認証必須、sns_detail と同じゲート）で、/ga の推移グラフ用。`account` シートの行を collected_at 昇順で最大直近400行返し、項目は collected_at、ig_followers、threads_followers、youtube_subscribers、total_followers、media_count、views_30d、non_follower_pct、reach_30d、interactions_total、follows_30d、unfollows_30d、yt_total_views の13項目に絞る（空欄は null）。プロパティ未設定・シートが無い／空の場合はエラーにせず `rows: []` を返す
 
 ## 診断関数 `debugSnsInsights`（手動実行専用）
 

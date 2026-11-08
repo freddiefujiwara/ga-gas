@@ -1770,6 +1770,96 @@ function appendSnsHistory_(snapshot) {
   }
 }
 
+// --- SNS snapshot history, read side (action=sns_history) ---
+// The authenticated counterpart of the append above: the /ga
+// trend charts read the "account" sheet back through this action.
+// Only the columns the charts need are served, and the response is
+// capped at the newest 400 rows (about 100 days at four collections
+// a day). An unset property or a missing/empty sheet is not an
+// error: the history simply has not started yet, so rows is [].
+
+const SNS_HISTORY_RESPONSE_COLUMNS = [
+  'collected_at',
+  'ig_followers',
+  'threads_followers',
+  'youtube_subscribers',
+  'total_followers',
+  'media_count',
+  'views_30d',
+  'non_follower_pct',
+  'reach_30d',
+  'interactions_total',
+  'follows_30d',
+  'unfollows_30d',
+  'yt_total_views',
+];
+const SNS_HISTORY_MAX_ROWS = 400;
+
+// Sheets hands date cells back as Date objects and numbers as
+// numbers, while untouched cells come back as ''. Normalize to the
+// JSON shape the admin screen expects: an ISO string for
+// collected_at (null when the cell holds no timestamp at all) and
+// numbers-or-null for everything else.
+function snsHistoryTimestampCell_(value) {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
+function snsHistoryNumberCell_(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function buildSnsHistoryResponse_() {
+  const empty = { ok: true, action: 'sns_history', rows: [] };
+  const sheetId = getScriptProperty_(SNS_HISTORY_SHEET_ID_PROPERTY);
+  if (!sheetId) {
+    return empty;
+  }
+  const sheet = SpreadsheetApp.openById(sheetId).getSheetByName('account');
+  if (!sheet || sheet.getLastRow() < 2) {
+    return empty;
+  }
+  const values = sheet
+    .getRange(1, 1, sheet.getLastRow(), SNS_HISTORY_ACCOUNT_COLUMNS.length)
+    .getValues();
+  const header = values[0].map((cell) => String(cell));
+  const columnIndex = {};
+  SNS_HISTORY_RESPONSE_COLUMNS.forEach((column) => {
+    columnIndex[column] = header.indexOf(column);
+  });
+  const rows = values
+    .slice(1)
+    .map((cells) => {
+      const row = {};
+      SNS_HISTORY_RESPONSE_COLUMNS.forEach((column) => {
+        const index = columnIndex[column];
+        const cell = index >= 0 ? cells[index] : '';
+        row[column] =
+          column === 'collected_at'
+            ? snsHistoryTimestampCell_(cell)
+            : snsHistoryNumberCell_(cell);
+      });
+      return row;
+    })
+    // Rows without a timestamp (leftovers of a partial write, say)
+    // cannot be placed on a time axis; drop them.
+    .filter((row) => row.collected_at !== null)
+    .sort((a, b) =>
+      a.collected_at < b.collected_at ? -1 : a.collected_at > b.collected_at ? 1 : 0
+    );
+  return {
+    ok: true,
+    action: 'sns_history',
+    rows: rows.slice(-SNS_HISTORY_MAX_ROWS),
+  };
+}
+
 // Trigger target: collects the latest follower counts and stores the
 // snapshot. Each service fails independently (null), so one broken or
 // unconfigured service never blocks the others.
@@ -2030,6 +2120,11 @@ function doGet(e) {
     if (parameter.action === 'sns_detail') {
       return jsonOut_(buildSnsDetailResponse_());
     }
+    // The history rows behind the trend charts sit behind the same
+    // gate: they are the same numbers as sns_detail, only older.
+    if (parameter.action === 'sns_history') {
+      return jsonOut_(buildSnsHistoryResponse_());
+    }
     const params = parseRunParams_(parameter);
     const body = buildReportRequest_(params);
     const result = fetchReport_(propertyId, body);
@@ -2108,6 +2203,8 @@ if (typeof exports !== 'undefined') {
   exports.refreshMetaTokenIfNeeded_ = refreshMetaTokenIfNeeded_;
   exports.refreshThreadsTokenIfNeeded_ = refreshThreadsTokenIfNeeded_;
   exports.appendSnsHistory_ = appendSnsHistory_;
+  exports.buildSnsHistoryResponse_ = buildSnsHistoryResponse_;
+  exports.SNS_HISTORY_RESPONSE_COLUMNS = SNS_HISTORY_RESPONSE_COLUMNS;
   exports.buildSnsHistoryAccountRow_ = buildSnsHistoryAccountRow_;
   exports.buildSnsHistoryMediaRows_ = buildSnsHistoryMediaRows_;
   exports.ensureSnsHistorySheet_ = ensureSnsHistorySheet_;
