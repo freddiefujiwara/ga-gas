@@ -64,6 +64,10 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - 両シートとも無ければ自動作成し、1行目が空（シートが空）のときだけヘッダー行を書く
 - 追記に失敗しても取得自体は成功として扱い、実行ログに `SNS history append failed: <要約>` が1行出る（要約に秘密値・URL は含めない）
 
+## 診断関数 `debugSnsInsights`（手動実行専用）
+
+詳細の数値が実態と食い違うときの切り分け用。エディタから手動実行すると、`follows_and_unfollows` と `profile_links_taps` について6つのリクエスト形（A：現行の breakdown=follow_type 形、B：breakdown なし、C：metric_type なし、D：現行の total_value 形、E：metric_type なし＋values の件数・合計、F：period=lifetime）の生応答を実行ログに出す（各応答は先頭3000文字まで、トークンは伏せる）。トリガーや doGet からは呼ばれず、スナップショットにも影響しない。2026-11-09 の本番切り分けで、breakdown=follow_type のラベルはフォロワーかどうかの内訳（FOLLOWER / NON_FOLLOWER）であり、profile_links_taps は現行の両形とも 0 だったことが判明済みで、その原因確定のために使う。
+
 ## Setup
 
 - GCP プロジェクト：ga-gas-513811（番号 151603615892）。Google Analytics Data API 有効化済み。OAuth 同意画面は External / テストモード（テストユーザー zegenvs@gmail.com）。Apps Script プロジェクト（本番・ステージングとも）にリンクする。

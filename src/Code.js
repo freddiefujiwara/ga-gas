@@ -994,6 +994,129 @@ function fetchInstagramAccountDetail_() {
   return result;
 }
 
+// --- Manual diagnostics: debugSnsInsights -------------------------
+// Run by hand from the Apps Script editor when the account-detail
+// numbers look wrong (as on 2026-11-09, when follows_and_unfollows
+// with breakdown=follow_type turned out to be a follower /
+// non-follower split rather than a follows / unfollows one, and
+// profile_links_taps came back 0 in both the total_value form and
+// the daily-sum fallback while the Instagram app showed real bio
+// link taps). It logs the raw Graph API responses for six request
+// shapes (A–F) so the next fix starts from what the API actually
+// returns instead of a guess. It is never called from a trigger or
+// from doGet, and it does not touch the snapshot. Access tokens are
+// never logged: request URLs are printed with
+// access_token=<redacted>, and any token string is scrubbed from
+// response bodies before logging.
+const SNS_DEBUG_LOG_LIMIT = 3000;
+
+function debugSnsInsights() {
+  const token = getScriptProperty_('META_ACCESS_TOKEN');
+  if (!token) {
+    Logger.log('META_ACCESS_TOKEN is not set; nothing to diagnose.');
+    return;
+  }
+  const window = snsInsightsWindow_();
+  const range = '&since=' + window.since + '&until=' + window.until;
+  debugLogInsightsShape_(
+    'A follows_and_unfollows breakdown=follow_type',
+    'metric=follows_and_unfollows&period=day&metric_type=total_value' +
+      range +
+      '&breakdown=follow_type',
+    token,
+    {}
+  );
+  debugLogInsightsShape_(
+    'B follows_and_unfollows metric_type=total_value (no breakdown)',
+    'metric=follows_and_unfollows&period=day&metric_type=total_value' + range,
+    token,
+    {}
+  );
+  debugLogInsightsShape_(
+    'C follows_and_unfollows plain (no metric_type, no breakdown)',
+    'metric=follows_and_unfollows&period=day' + range,
+    token,
+    {}
+  );
+  debugLogInsightsShape_(
+    'D profile_links_taps metric_type=total_value',
+    'metric=profile_links_taps&period=day&metric_type=total_value' + range,
+    token,
+    {}
+  );
+  debugLogInsightsShape_(
+    'E profile_links_taps plain (no metric_type)',
+    'metric=profile_links_taps&period=day' + range,
+    token,
+    { summarizeValues: true }
+  );
+  debugLogInsightsShape_(
+    'F profile_links_taps period=lifetime metric_type=total_value',
+    'metric=profile_links_taps&period=lifetime&metric_type=total_value',
+    token,
+    { errorsOnly: true }
+  );
+}
+
+// Fetches one insights shape for debugSnsInsights and logs the
+// request URL (token redacted), the HTTP status and the raw body,
+// truncated to SNS_DEBUG_LOG_LIMIT characters. With errorsOnly, an
+// error response is reduced to the summarizeInsightsError_ summary
+// (shape F). With summarizeValues, a values[] list in the body also
+// gets a count/sum line (shape E). Never throws.
+function debugLogInsightsShape_(label, query, token, options) {
+  const opts = options || {};
+  const base = META_GRAPH_BASE + SNS_INSTAGRAM_MAIN_ID + '/insights?' + query;
+  Logger.log('=== ' + label + ' ===');
+  Logger.log('GET ' + base + '&access_token=<redacted>');
+  let res;
+  try {
+    res = UrlFetchApp.fetch(
+      base + '&access_token=' + encodeURIComponent(token),
+      { muteHttpExceptions: true }
+    );
+  } catch (err) {
+    Logger.log('fetch exception (' + ((err && err.name) || 'Error') + ')');
+    return;
+  }
+  const status = res.getResponseCode();
+  const bodyText = res.getContentText();
+  Logger.log('HTTP ' + status);
+  if (status !== 200 && opts.errorsOnly) {
+    Logger.log(summarizeInsightsError_(status, bodyText));
+    return;
+  }
+  Logger.log(debugScrubToken_(bodyText, token).slice(0, SNS_DEBUG_LOG_LIMIT));
+  if (opts.summarizeValues && status === 200) {
+    let data = null;
+    try {
+      data = JSON.parse(bodyText);
+    } catch (err) {
+      data = null;
+    }
+    const entry = data && Array.isArray(data.data) ? data.data[0] : null;
+    const count = entry && Array.isArray(entry.values) ? entry.values.length : 0;
+    const sum = parseInsightsDailySum_(data);
+    Logger.log(
+      'values: ' +
+        count +
+        ' entries, sum = ' +
+        (sum === null ? '(no numeric values)' : sum)
+    );
+  }
+}
+
+// Removes any occurrence of the access token from text about to be
+// logged. Graph API bodies should never contain it; this is a
+// belt-and-braces scrub so debugSnsInsights can never leak it.
+function debugScrubToken_(text, token) {
+  const value = String(text == null ? '' : text);
+  if (!token) {
+    return value;
+  }
+  return value.split(token).join('<redacted>');
+}
+
 // Reads the follows/unfollows split out of a follows_and_unfollows
 // total_value response. Matching is substring-based and
 // case-insensitive — a value containing UNFOLLOW is the unfollows
