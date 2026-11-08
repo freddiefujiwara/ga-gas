@@ -250,6 +250,10 @@ function issueShareToken() {
 //     Falls back to META_ACCESS_TOKEN when unset. When its expiry is
 //     recorded in META_THREADS_TOKEN_EXPIRES_AT, it is refreshed with
 //     th_refresh_token in the same way.
+// The Instagram snapshot also carries account KPIs for the main
+// account: media_count (post count, available with instagram_basic)
+// plus views_30d / non_follower_pct from the account insights, which
+// stay null until the token also has instagram_manage_insights.
 
 const SNS_SNAPSHOT_PROPERTY = 'SNS_COUNTS_SNAPSHOT';
 const SNS_YOUTUBE_CHANNEL_ID = 'UCbiDZXbr391oT_vsRiqwPFg';
@@ -280,7 +284,13 @@ function buildSnsCountsResponse_() {
       action: 'sns_counts',
       collected_at: null,
       youtube: { subscribers: null },
-      instagram: { freddiefujiwara: null, anemone_cancer: null },
+      instagram: {
+        freddiefujiwara: null,
+        anemone_cancer: null,
+        media_count: null,
+        views_30d: null,
+        non_follower_pct: null,
+      },
       threads: { followers: null },
     };
   }
@@ -440,18 +450,169 @@ function refreshThreadsTokenIfNeeded_() {
   }
 }
 
+function fetchInstagramMediaCount_() {
+  const token = getScriptProperty_('META_ACCESS_TOKEN');
+  if (!token) {
+    return null;
+  }
+  try {
+    const res = UrlFetchApp.fetch(
+      META_GRAPH_BASE +
+        SNS_INSTAGRAM_MAIN_ID +
+        '?fields=media_count&access_token=' +
+        encodeURIComponent(token),
+      { muteHttpExceptions: true }
+    );
+    if (res.getResponseCode() !== 200) {
+      return null;
+    }
+    const data = JSON.parse(res.getContentText());
+    const count = Number(data && data.media_count);
+    return Number.isFinite(count) ? count : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// Instagram KPI from the account insights (last 30 days):
+//   views_30d: total Views across the whole account
+//   non_follower_pct: share of those Views from non-followers (%), 1 decimal
+// Insights require the instagram_manage_insights permission. Until the
+// token carries it, the insights calls error out and both values stay
+// null while every other fetch keeps working; once the permission is
+// added they fill in automatically.
+//
+// Request shape (Meta Graph API, on the IG user node):
+//   GET /{ig-id}/insights?metric=views&period=day
+//       &metric_type=total_value&breakdown=follower_type
+//       &since=<unix>&until=<unix>&access_token=...
+// The total_value response carries the breakdown as
+// total_value.breakdowns[].results[] with dimension_values like
+// ["FOLLOWER"] / ["NON_FOLLOWER"]. If that shape is unavailable, a
+// plain per-day request (values[].value summed) fills views_30d only.
+function fetchInstagramViewsInsights_() {
+  const result = { views_30d: null, non_follower_pct: null };
+  const token = getScriptProperty_('META_ACCESS_TOKEN');
+  if (!token) {
+    return result;
+  }
+  const until = Math.floor(Date.now() / 1000);
+  const since = until - 30 * 24 * 60 * 60;
+  const base =
+    META_GRAPH_BASE +
+    SNS_INSTAGRAM_MAIN_ID +
+    '/insights?metric=views&period=day&since=' +
+    since +
+    '&until=' +
+    until +
+    '&access_token=' +
+    encodeURIComponent(token);
+  const breakdown = parseViewsBreakdown_(fetchInsightsJson_(base + '&metric_type=total_value&breakdown=follower_type'));
+  if (breakdown) {
+    result.views_30d = breakdown.total;
+    if (breakdown.total > 0) {
+      result.non_follower_pct =
+        Math.round((breakdown.nonFollower / breakdown.total) * 1000) / 10;
+    }
+    return result;
+  }
+  const total = parseViewsDailyTotal_(fetchInsightsJson_(base));
+  if (total !== null) {
+    result.views_30d = total;
+  }
+  return result;
+}
+
+function fetchInsightsJson_(url) {
+  try {
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) {
+      return null;
+    }
+    return JSON.parse(res.getContentText());
+  } catch (err) {
+    return null;
+  }
+}
+
+// Returns { total, follower, nonFollower } in views, or null when the
+// total_value + follower_type breakdown shape is not present.
+function parseViewsBreakdown_(data) {
+  const entry = data && Array.isArray(data.data) ? data.data[0] : null;
+  const totalValue = entry && entry.total_value;
+  if (!totalValue) {
+    return null;
+  }
+  const breakdowns = Array.isArray(totalValue.breakdowns)
+    ? totalValue.breakdowns
+    : [];
+  let follower = null;
+  let nonFollower = null;
+  breakdowns.forEach((breakdown) => {
+    const keys = (breakdown && breakdown.dimension_keys) || [];
+    if (!keys.includes('follower_type')) {
+      return;
+    }
+    ((breakdown && breakdown.results) || []).forEach((row) => {
+      const dims = (row && row.dimension_values) || [];
+      const value = Number(row && row.value);
+      if (!Number.isFinite(value)) {
+        return;
+      }
+      if (dims.includes('NON_FOLLOWER')) {
+        nonFollower = value;
+      } else if (dims.includes('FOLLOWER')) {
+        follower = value;
+      }
+    });
+  });
+  if (follower === null && nonFollower === null) {
+    return null;
+  }
+  const partsTotal = (follower || 0) + (nonFollower || 0);
+  const reported = Number(totalValue.value);
+  return {
+    total: Number.isFinite(reported) ? reported : partsTotal,
+    follower: follower || 0,
+    nonFollower: nonFollower || 0,
+  };
+}
+
+// Sums the per-day values[] of a plain insights response, or null.
+function parseViewsDailyTotal_(data) {
+  const entry = data && Array.isArray(data.data) ? data.data[0] : null;
+  const values = entry && Array.isArray(entry.values) ? entry.values : null;
+  if (!values) {
+    return null;
+  }
+  let total = 0;
+  let seen = false;
+  values.forEach((row) => {
+    const value = Number(row && row.value);
+    if (Number.isFinite(value)) {
+      total += value;
+      seen = true;
+    }
+  });
+  return seen ? total : null;
+}
+
 // Trigger target: collects the latest follower counts and stores the
 // snapshot. Each service fails independently (null), so one broken or
 // unconfigured service never blocks the others.
 function collectSnsCounts() {
   refreshMetaTokenIfNeeded_();
   refreshThreadsTokenIfNeeded_();
+  const igViews = fetchInstagramViewsInsights_();
   const snapshot = {
     collected_at: new Date().toISOString(),
     youtube: { subscribers: fetchYouTubeSubscribers_() },
     instagram: {
       freddiefujiwara: fetchInstagramFollowers_(SNS_INSTAGRAM_MAIN_ID),
       anemone_cancer: fetchInstagramFollowers_(SNS_INSTAGRAM_SUB_ID),
+      media_count: fetchInstagramMediaCount_(),
+      views_30d: igViews.views_30d,
+      non_follower_pct: igViews.non_follower_pct,
     },
     threads: { followers: fetchThreadsFollowers_() },
   };
@@ -702,6 +863,10 @@ if (typeof exports !== 'undefined') {
   exports.buildSnsCountsResponse_ = buildSnsCountsResponse_;
   exports.fetchGraphFollowersCount_ = fetchGraphFollowersCount_;
   exports.fetchInstagramFollowers_ = fetchInstagramFollowers_;
+  exports.fetchInstagramMediaCount_ = fetchInstagramMediaCount_;
+  exports.fetchInstagramViewsInsights_ = fetchInstagramViewsInsights_;
+  exports.parseViewsBreakdown_ = parseViewsBreakdown_;
+  exports.parseViewsDailyTotal_ = parseViewsDailyTotal_;
   exports.fetchThreadsFollowers_ = fetchThreadsFollowers_;
   exports.fetchYouTubeSubscribers_ = fetchYouTubeSubscribers_;
   exports.isTokenRefreshDue_ = isTokenRefreshDue_;

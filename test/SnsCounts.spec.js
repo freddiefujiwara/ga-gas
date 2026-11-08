@@ -80,8 +80,35 @@ describe('SNS follower counts', () => {
     global.YouTube = { Channels: { list: vi.fn(() => result) } };
   };
 
+  const insightsBreakdownBody = (follower, nonFollower, total) => ({
+    data: [
+      {
+        name: 'views',
+        period: 'day',
+        total_value: {
+          value: total,
+          breakdowns: [
+            {
+              dimension_keys: ['follower_type'],
+              results: [
+                { dimension_values: ['FOLLOWER'], value: follower },
+                { dimension_values: ['NON_FOLLOWER'], value: nonFollower },
+              ],
+            },
+          ],
+        },
+      },
+    ],
+  });
+
   const mockGraphSuccess = () => {
     fetchHandler = (url) => {
+      if (url.includes('/insights') && url.includes('breakdown=follower_type')) {
+        return res(200, insightsBreakdownBody(370, 9630, 10000));
+      }
+      if (url.includes('graph.facebook.com') && url.includes('fields=media_count')) {
+        return res(200, { media_count: 2404 });
+      }
       if (url.includes('graph.facebook.com') && url.includes(MAIN_IG_ID)) {
         return res(200, { followers_count: 1988 });
       }
@@ -103,7 +130,13 @@ describe('SNS follower counts', () => {
         action: 'sns_counts',
         collected_at: null,
         youtube: { subscribers: null },
-        instagram: { freddiefujiwara: null, anemone_cancer: null },
+        instagram: {
+          freddiefujiwara: null,
+          anemone_cancer: null,
+          media_count: null,
+          views_30d: null,
+          non_follower_pct: null,
+        },
         threads: { followers: null },
       });
     });
@@ -144,7 +177,13 @@ describe('SNS follower counts', () => {
 
       const snapshot = Code.collectSnsCounts();
       expect(snapshot.youtube.subscribers).toBe(8);
-      expect(snapshot.instagram).toEqual({ freddiefujiwara: 1988, anemone_cancer: 59 });
+      expect(snapshot.instagram).toEqual({
+        freddiefujiwara: 1988,
+        anemone_cancer: 59,
+        media_count: 2404,
+        views_30d: 10000,
+        non_follower_pct: 96.3,
+      });
       expect(snapshot.threads.followers).toBe(252);
       expect(snapshot.collected_at).toBeTruthy();
       expect(JSON.parse(store.SNS_COUNTS_SNAPSHOT)).toEqual(snapshot);
@@ -157,7 +196,13 @@ describe('SNS follower counts', () => {
       mockYouTube({ items: [{ statistics: { subscriberCount: '8' } }] });
       const snapshot = Code.collectSnsCounts();
       expect(snapshot.youtube.subscribers).toBe(8);
-      expect(snapshot.instagram).toEqual({ freddiefujiwara: null, anemone_cancer: null });
+      expect(snapshot.instagram).toEqual({
+        freddiefujiwara: null,
+        anemone_cancer: null,
+        media_count: null,
+        views_30d: null,
+        non_follower_pct: null,
+      });
       expect(snapshot.threads.followers).toBeNull();
       expect(store.SNS_COUNTS_SNAPSHOT).toBeTruthy();
     });
@@ -215,6 +260,113 @@ describe('SNS follower counts', () => {
       mockYouTube({ items: [] });
       Code.collectSnsCounts();
       expect(threadsUrl).toContain('access_token=threads-token');
+    });
+  });
+
+  describe('Instagram KPIs', () => {
+    const graphWithInsights = (insightsHandler) => {
+      fetchHandler = (url) => {
+        if (url.includes('/insights')) {
+          return insightsHandler(url);
+        }
+        if (url.includes('fields=media_count')) {
+          return res(200, { media_count: 2404 });
+        }
+        if (url.includes('graph.facebook.com')) {
+          return res(200, { followers_count: 1988 });
+        }
+        if (url.includes('graph.threads.net')) {
+          return res(200, { followers_count: 252 });
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+    };
+
+    it('keeps views KPIs null when insights permission is missing', () => {
+      store.META_ACCESS_TOKEN = 'basic-only-token';
+      graphWithInsights(() =>
+        res(400, {
+          error: {
+            message: '(#10) Application does not have permission for this action',
+            code: 10,
+          },
+        })
+      );
+      mockYouTube({ items: [{ statistics: { subscriberCount: '8' } }] });
+      const snapshot = Code.collectSnsCounts();
+      expect(snapshot.instagram.freddiefujiwara).toBe(1988);
+      expect(snapshot.instagram.media_count).toBe(2404);
+      expect(snapshot.instagram.views_30d).toBeNull();
+      expect(snapshot.instagram.non_follower_pct).toBeNull();
+      expect(snapshot.youtube.subscribers).toBe(8);
+      expect(snapshot.threads.followers).toBe(252);
+    });
+
+    it('falls back to summed daily values when the breakdown is unavailable', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      graphWithInsights((url) => {
+        if (url.includes('breakdown=follower_type')) {
+          return res(400, { error: { message: 'breakdown unsupported' } });
+        }
+        return res(200, {
+          data: [
+            {
+              name: 'views',
+              period: 'day',
+              values: [{ value: 100 }, { value: 250 }, { value: 50 }],
+            },
+          ],
+        });
+      });
+      mockYouTube({ items: [] });
+      const kpi = Code.fetchInstagramViewsInsights_();
+      expect(kpi.views_30d).toBe(400);
+      expect(kpi.non_follower_pct).toBeNull();
+    });
+
+    it('keeps media_count null when only that request fails', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      fetchHandler = (url) => {
+        if (url.includes('fields=media_count')) {
+          return res(500, { error: { message: 'boom' } });
+        }
+        if (url.includes('/insights') && url.includes('breakdown=follower_type')) {
+          return res(200, insightsBreakdownBody(370, 9630, 10000));
+        }
+        if (url.includes('graph.facebook.com')) {
+          return res(200, { followers_count: 1988 });
+        }
+        if (url.includes('graph.threads.net')) {
+          return res(200, { followers_count: 252 });
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+      mockYouTube({ items: [] });
+      const snapshot = Code.collectSnsCounts();
+      expect(snapshot.instagram.media_count).toBeNull();
+      expect(snapshot.instagram.freddiefujiwara).toBe(1988);
+      expect(snapshot.instagram.views_30d).toBe(10000);
+      expect(snapshot.instagram.non_follower_pct).toBe(96.3);
+    });
+
+    it('rounds the non-follower percentage to one decimal', () => {
+      expect(
+        Code.parseViewsBreakdown_(insightsBreakdownBody(1, 2, 3))
+      ).toEqual({ total: 3, follower: 1, nonFollower: 2 });
+      store.META_ACCESS_TOKEN = 'meta-token';
+      graphWithInsights(() => res(200, insightsBreakdownBody(1, 2, 3)));
+      const kpi = Code.fetchInstagramViewsInsights_();
+      expect(kpi.views_30d).toBe(3);
+      expect(kpi.non_follower_pct).toBe(66.7);
+    });
+
+    it('returns null KPIs without a token and never calls the API', () => {
+      expect(Code.fetchInstagramMediaCount_()).toBeNull();
+      expect(Code.fetchInstagramViewsInsights_()).toEqual({
+        views_30d: null,
+        non_follower_pct: null,
+      });
+      expect(global.UrlFetchApp.fetch).not.toHaveBeenCalled();
     });
   });
 
