@@ -1409,7 +1409,7 @@ describe('SNS follower counts', () => {
         top_countries: null,
       });
       expect(json.instagram.recent_media).toBeNull();
-      expect(json.threads).toEqual({ followers: null });
+      expect(json.threads).toEqual({ followers: null, threads_error: null });
     });
 
     it('returns the full stored snapshot, detail included', () => {
