@@ -149,16 +149,30 @@ describe('SNS follower counts', () => {
     ],
   });
 
-  const followsBreakdownBody = () =>
-    totalValueBody('follows_and_unfollows', 150, [
+  // The shape production actually returns for follows_and_unfollows
+  // (confirmed by debugSnsInsights on 2026-11-09): total_value has
+  // no plain number, only the follow_type breakdown, labelled by the
+  // resulting state — FOLLOWER = new follows, NON_FOLLOWER =
+  // unfollows.
+  const followsBreakdownBody = () => ({
+    data: [
       {
-        dimension_keys: ['follow_type'],
-        results: [
-          { dimension_values: ['FOLLOWS'], value: 180 },
-          { dimension_values: ['UNFOLLOWS'], value: 30 },
-        ],
+        name: 'follows_and_unfollows',
+        period: 'day',
+        total_value: {
+          breakdowns: [
+            {
+              dimension_keys: ['follow_type'],
+              results: [
+                { dimension_values: ['FOLLOWER'], value: 498 },
+                { dimension_values: ['NON_FOLLOWER'], value: 58 },
+              ],
+            },
+          ],
+        },
       },
-    ]);
+    ],
+  });
 
   const demographicsBody = (dims, results) => ({
     data: [
@@ -483,8 +497,8 @@ describe('SNS follower counts', () => {
         interactions_30d: { total: 3000, likes: 2000, comments: 300, shares: 400, saves: 300 },
         profile_links_taps_30d: 46,
         profile_links_taps_source: 'total_value',
-        follows_30d: 180,
-        unfollows_30d: 30,
+        follows_30d: 498,
+        unfollows_30d: 58,
         demographics: {
           age_gender: [
             { key: '25-34/F', value: 500 },
@@ -673,8 +687,8 @@ describe('SNS follower counts', () => {
         interactions_30d: { total: 3000, likes: 2000, comments: 300, shares: 400, saves: 300 },
         profile_links_taps_30d: 46,
         profile_links_taps_source: 'total_value',
-        follows_30d: 180,
-        unfollows_30d: 30,
+        follows_30d: 498,
+        unfollows_30d: 58,
         demographics: { age_gender: [], top_cities: [], top_countries: [] },
         detail_error: null,
         recent_media: [
@@ -716,7 +730,7 @@ describe('SNS follower counts', () => {
 
     const expectedAccountValues = [
       1988, 59, 252, 8, 2248, 2404, 10000, 96.3, 5000, 1200, 3000, 2000, 300,
-      400, 300, 46, 'total_value', 180, 30, 123456, 42,
+      400, 300, 46, 'total_value', 498, 58, 123456, 42,
     ];
 
     beforeEach(() => {
@@ -1368,8 +1382,8 @@ describe('SNS follower counts', () => {
         interactions_30d: { total: 3000, likes: 2000, comments: 300, shares: 400, saves: 300 },
         profile_links_taps_30d: 46,
         profile_links_taps_source: 'total_value',
-        follows_30d: 180,
-        unfollows_30d: 30,
+        follows_30d: 498,
+        unfollows_30d: 58,
         detail_error: null,
       });
     });
@@ -1385,7 +1399,7 @@ describe('SNS follower counts', () => {
       expect(detail.reach_30d).toBeNull();
       expect(detail.accounts_engaged_30d).toBe(1200);
       expect(detail.interactions_30d.total).toBe(3000);
-      expect(detail.follows_30d).toBe(180);
+      expect(detail.follows_30d).toBe(498);
       expect(detail.detail_error).toContain('reach: HTTP 400 code=100');
       expect(detail.detail_error).toContain('metric reach unsupported');
       expect(detail.detail_error).not.toContain('meta-token');
@@ -1417,20 +1431,17 @@ describe('SNS follower counts', () => {
       expect(global.UrlFetchApp.fetch).not.toHaveBeenCalled();
     });
 
-    it('parseFollowsBreakdown_ matches FOLLOWS/UNFOLLOWS tokens only', () => {
+    it('parseFollowsBreakdown_ reads FOLLOWER as follows and NON_FOLLOWER as unfollows', () => {
+      // The confirmed production shape: FOLLOWER=498, NON_FOLLOWER=58.
       expect(Code.parseFollowsBreakdown_(followsBreakdownBody())).toEqual({
-        follows: 180,
-        unfollows: 30,
+        follows: 498,
+        unfollows: 58,
       });
-      // The views-style follower labels must not be read as a split.
-      expect(
-        Code.parseFollowsBreakdown_(insightsBreakdownBody(370, 9630, 10000))
-      ).toBeNull();
       expect(Code.parseFollowsBreakdown_(null)).toBeNull();
       expect(Code.parseFollowsBreakdown_({ data: [] })).toBeNull();
     });
 
-    it('parseFollowsBreakdown_ tolerates label drift but never the views labels', () => {
+    it('parseFollowsBreakdown_ matches the two labels exactly, ignoring case only', () => {
       const bodyWith = (pairs) =>
         totalValueBody('follows_and_unfollows', 0, [
           {
@@ -1442,14 +1453,19 @@ describe('SNS follower counts', () => {
           },
         ]);
       expect(
-        Code.parseFollowsBreakdown_(bodyWith([['follow', 10], ['unfollow', 2]]))
+        Code.parseFollowsBreakdown_(bodyWith([['follower', 10], ['non_follower', 2]]))
       ).toEqual({ follows: 10, unfollows: 2 });
+      // Looser readings from before the production diagnosis are gone:
+      // only the two confirmed labels count as a split.
+      expect(
+        Code.parseFollowsBreakdown_(bodyWith([['FOLLOWS', 10], ['UNFOLLOWS', 2]]))
+      ).toBeNull();
       expect(
         Code.parseFollowsBreakdown_(bodyWith([['FOLLOW', 10], ['UNFOLLOW', 2]]))
-      ).toEqual({ follows: 10, unfollows: 2 });
+      ).toBeNull();
       expect(
         Code.parseFollowsBreakdown_(bodyWith([['FOLLOWER_FOLLOWS', 7]]))
-      ).toEqual({ follows: 7, unfollows: null });
+      ).toBeNull();
       expect(
         Code.parseFollowsBreakdown_(bodyWith([['GAINED', 7], ['LOST', 1]]))
       ).toBeNull();
