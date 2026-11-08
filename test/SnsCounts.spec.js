@@ -1833,7 +1833,7 @@ describe('SNS follower counts', () => {
     const reel = MEDIA_LIST[0];
     const image = MEDIA_LIST[1];
 
-    it('builds entries with insights, converts watch time and truncates captions', () => {
+    it('builds entries with insights, converts watch time and keeps the full caption', () => {
       store.META_ACCESS_TOKEN = 'meta-token';
       const longCaption = 'あ'.repeat(100);
       fetchHandler = (url) => {
@@ -1861,12 +1861,12 @@ describe('SNS follower counts', () => {
       const { recent_media, media_error } = Code.fetchInstagramRecentMedia_();
       expect(media_error).toBeNull();
       expect(recent_media).toHaveLength(1);
-      expect(recent_media[0].caption).toHaveLength(80);
+      expect(recent_media[0].caption).toHaveLength(100);
       expect(recent_media[0]).toEqual({
         id: 'media-reel-1',
         type: 'REELS',
         posted_at: '2026-11-08T03:00:00+0000',
-        caption: longCaption.slice(0, 80),
+        caption: longCaption,
         permalink: 'https://www.instagram.com/reel/ABC/',
         views: 1000,
         reach: 900,
@@ -1877,6 +1877,24 @@ describe('SNS follower counts', () => {
         avg_watch_sec: 8.5,
         total_watch_sec: 765,
       });
+    });
+
+    it('caps a pathological caption at 2000 characters', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      const hugeCaption = 'あ'.repeat(2500);
+      fetchHandler = (url) => {
+        if (url.includes('/media?')) {
+          return res(200, { data: [Object.assign({}, reel, { caption: hugeCaption })] });
+        }
+        if (url.includes('media-reel-1/insights')) {
+          return res(200, mediaInsightsBody([['likes', 1]]));
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+      const { recent_media } = Code.fetchInstagramRecentMedia_();
+      expect(recent_media).toHaveLength(1);
+      expect(recent_media[0].caption).toHaveLength(2000);
+      expect(recent_media[0].caption).toBe(hugeCaption.slice(0, 2000));
     });
 
     it('retries with fewer metrics when the full set is rejected', () => {
