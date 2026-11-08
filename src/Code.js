@@ -17,6 +17,13 @@
  *                Multiple clauses are combined with AND. Example:
  *                filter=pagePath:contains:/blog/;sessionDefaultChannelGroup:exact:Organic Search
  *
+ * Actions:
+ *   action=music_count - the one public action: returns only the
+ *                cumulative music_play event count and its timestamp
+ *                (cached for about an hour). Every other request,
+ *                including the default report, requires authentication
+ *                once it is configured (see below).
+ *
  * The GA4 property ID comes from the Script Property GA4_PROPERTY_ID,
  * so it is never written in the source (see README "Setup").
  */
@@ -24,6 +31,66 @@
 const GA4_API_BASE = 'https://analyticsdata.googleapis.com/v1beta/properties/';
 const FRONTEND_URL = 'https://freddiefujiwara.com/ga/';
 const SHARE_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+// --- Public music play count (action=music_count) ---
+// The one deliberately unauthenticated action: the site header on
+// every page shows the cumulative music_play count, and a public
+// page cannot hold a credential. It returns exactly two values —
+// the total eventCount of the music_play event since the event was
+// introduced (2026-11-08) and when that total was produced — and
+// nothing else. Results are cached in CacheService so the GA4 Data
+// API is hit at most about once an hour no matter how often the
+// action is called.
+const MUSIC_COUNT_CACHE_KEY = 'music_count_v1';
+const MUSIC_COUNT_CACHE_SECONDS = 60 * 60;
+const MUSIC_PLAY_START_DATE = '2026-11-08';
+
+function fetchMusicCount_(propertyId) {
+  const cache =
+    typeof CacheService !== 'undefined' ? CacheService.getScriptCache() : null;
+  if (cache) {
+    const cached = cache.get(MUSIC_COUNT_CACHE_KEY);
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached);
+        if (parsed && Number.isFinite(parsed.count) && parsed.updated_at) {
+          return parsed;
+        }
+      } catch (error) {
+        // A corrupt cache entry is ignored; a fresh value is fetched.
+      }
+    }
+  }
+  const body = buildReportRequest_({
+    startDate: MUSIC_PLAY_START_DATE,
+    endDate: 'today',
+    metrics: ['eventCount'],
+    dimensions: [],
+    limit: 1,
+    offset: 0,
+    filters: parseFilterClauses_('eventName:exact:music_play'),
+  });
+  const result = fetchReport_(propertyId, body);
+  if (result.status !== 200) {
+    throw new Error('GA4 API request failed with status ' + result.status);
+  }
+  let count = 0;
+  const rows = (result.data && result.data.rows) || [];
+  if (rows.length > 0) {
+    const metricValues = rows[0].metricValues || [];
+    const value = Number(metricValues[0] && metricValues[0].value);
+    count = Number.isFinite(value) ? value : 0;
+  }
+  const payload = { count, updated_at: new Date().toISOString() };
+  if (cache) {
+    cache.put(
+      MUSIC_COUNT_CACHE_KEY,
+      JSON.stringify(payload),
+      MUSIC_COUNT_CACHE_SECONDS
+    );
+  }
+  return payload;
+}
 
 // --- Authentication (same scheme as the other apps: health / asset / tweet) ---
 // Script Properties:
@@ -289,6 +356,23 @@ function doGet(e) {
       });
     }
     const parameter = (e && e.parameter) || {};
+    // The public music play count is served before any
+    // authentication: it is the single action that is callable
+    // without a token, and it exposes only the aggregate count.
+    if (parameter.action === 'music_count') {
+      try {
+        const payload = fetchMusicCount_(propertyId);
+        return jsonOut_(
+          Object.assign({ ok: true, action: 'music_count' }, payload)
+        );
+      } catch (error) {
+        return jsonOut_({
+          ok: false,
+          status: 502,
+          error: String((error && error.message) || error),
+        });
+      }
+    }
     let shareSession = null;
     if (parameter.action === 'issue_share' || parameter.action === 'revoke_share') {
       try {
@@ -363,5 +447,6 @@ if (typeof exports !== 'undefined') {
   exports.parseRunParams_ = parseRunParams_;
   exports.buildReportRequest_ = buildReportRequest_;
   exports.fetchReport_ = fetchReport_;
+  exports.fetchMusicCount_ = fetchMusicCount_;
   exports.jsonOut_ = jsonOut_;
 }
