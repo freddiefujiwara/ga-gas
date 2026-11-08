@@ -230,6 +230,249 @@ function issueShareToken() {
   console.log('Share URL (expires ' + session.expires_at + '): ' + url);
   return url;
 }
+// --- SNS follower counts (YouTube / Instagram / Threads) ---
+// collectSnsCounts() runs on a time-driven trigger (see setupSnsTriggers)
+// and stores a snapshot in the Script Property SNS_COUNTS_SNAPSHOT.
+// The action=sns_counts endpoint is public by design: it only ever
+// returns that snapshot (service names, follower counts, collected_at).
+// It never exposes tokens or any GA4 data.
+//
+// Script Properties used here:
+//   META_ACCESS_TOKEN: Meta long-lived user token (about 60 days) used
+//     for the Instagram accounts through graph.facebook.com.
+//   META_APP_ID / META_APP_SECRET: when both are set, the token above is
+//     refreshed with fb_exchange_token before it gets close to expiry.
+//   META_TOKEN_EXPIRES_AT: ISO timestamp of the token expiry, maintained
+//     by refreshMetaTokenIfNeeded_().
+//   META_THREADS_ACCESS_TOKEN (optional): Threads long-lived token, used
+//     for graph.threads.net when set (Threads tokens are issued per app
+//     through the Threads use case, separately from Facebook tokens).
+//     Falls back to META_ACCESS_TOKEN when unset. When its expiry is
+//     recorded in META_THREADS_TOKEN_EXPIRES_AT, it is refreshed with
+//     th_refresh_token in the same way.
+
+const SNS_SNAPSHOT_PROPERTY = 'SNS_COUNTS_SNAPSHOT';
+const SNS_YOUTUBE_CHANNEL_ID = 'UCbiDZXbr391oT_vsRiqwPFg';
+const SNS_INSTAGRAM_MAIN_ID = '17841401041540002'; // @freddiefujiwara
+const SNS_INSTAGRAM_SUB_ID = '17841434285478967'; // @anemone_cancer
+const SNS_THREADS_USER_ID = '17841462976834295'; // @freddiefujiwara
+const META_GRAPH_BASE = 'https://graph.facebook.com/v25.0/';
+const THREADS_GRAPH_BASE = 'https://graph.threads.net/v1.0/';
+const SNS_TOKEN_REFRESH_WINDOW_MS = 10 * 24 * 60 * 60 * 1000;
+
+function getSnsCountsSnapshot_() {
+  const raw = getScriptProperty_(SNS_SNAPSHOT_PROPERTY);
+  if (!raw) {
+    return null;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    return null;
+  }
+}
+
+function buildSnsCountsResponse_() {
+  const snapshot = getSnsCountsSnapshot_();
+  if (!snapshot) {
+    return {
+      ok: true,
+      action: 'sns_counts',
+      collected_at: null,
+      youtube: { subscribers: null },
+      instagram: { freddiefujiwara: null, anemone_cancer: null },
+      threads: { followers: null },
+    };
+  }
+  return Object.assign({ ok: true, action: 'sns_counts' }, snapshot);
+}
+
+function fetchGraphFollowersCount_(url) {
+  try {
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) {
+      return null;
+    }
+    const data = JSON.parse(res.getContentText());
+    const count = Number(data && data.followers_count);
+    return Number.isFinite(count) ? count : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function fetchInstagramFollowers_(userId) {
+  const token = getScriptProperty_('META_ACCESS_TOKEN');
+  if (!token) {
+    return null;
+  }
+  return fetchGraphFollowersCount_(
+    META_GRAPH_BASE +
+      userId +
+      '?fields=followers_count&access_token=' +
+      encodeURIComponent(token)
+  );
+}
+
+function fetchThreadsFollowers_() {
+  const token =
+    getScriptProperty_('META_THREADS_ACCESS_TOKEN') ||
+    getScriptProperty_('META_ACCESS_TOKEN');
+  if (!token) {
+    return null;
+  }
+  return fetchGraphFollowersCount_(
+    THREADS_GRAPH_BASE +
+      SNS_THREADS_USER_ID +
+      '?fields=followers_count&access_token=' +
+      encodeURIComponent(token)
+  );
+}
+
+function fetchYouTubeSubscribers_() {
+  try {
+    if (typeof YouTube === 'undefined' || !YouTube.Channels) {
+      return null;
+    }
+    const res = YouTube.Channels.list('statistics', { id: SNS_YOUTUBE_CHANNEL_ID });
+    const items = (res && res.items) || [];
+    if (!items.length || !items[0].statistics) {
+      return null;
+    }
+    if (items[0].statistics.hiddenSubscriberCount) {
+      return null;
+    }
+    const count = Number(items[0].statistics.subscriberCount);
+    return Number.isFinite(count) ? count : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function isTokenRefreshDue_(expiresAtIso) {
+  if (!expiresAtIso) {
+    return true;
+  }
+  const expiresMs = Date.parse(expiresAtIso);
+  if (!Number.isFinite(expiresMs)) {
+    return true;
+  }
+  return expiresMs - Date.now() <= SNS_TOKEN_REFRESH_WINDOW_MS;
+}
+
+function storeRefreshedToken_(props, tokenKey, expiresKey, data) {
+  if (!data || !data.access_token) {
+    return false;
+  }
+  props.setProperty(tokenKey, data.access_token);
+  const expiresIn = Number(data.expires_in);
+  if (Number.isFinite(expiresIn) && expiresIn > 0) {
+    props.setProperty(
+      expiresKey,
+      new Date(Date.now() + expiresIn * 1000).toISOString()
+    );
+  }
+  return true;
+}
+
+function refreshMetaTokenIfNeeded_() {
+  const props = PropertiesService.getScriptProperties();
+  const appId = props.getProperty('META_APP_ID');
+  const appSecret = props.getProperty('META_APP_SECRET');
+  const token = props.getProperty('META_ACCESS_TOKEN');
+  if (!appId || !appSecret || !token) {
+    return false;
+  }
+  if (!isTokenRefreshDue_(props.getProperty('META_TOKEN_EXPIRES_AT'))) {
+    return false;
+  }
+  try {
+    const url =
+      META_GRAPH_BASE +
+      'oauth/access_token?grant_type=fb_exchange_token' +
+      '&client_id=' +
+      encodeURIComponent(appId) +
+      '&client_secret=' +
+      encodeURIComponent(appSecret) +
+      '&fb_exchange_token=' +
+      encodeURIComponent(token);
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) {
+      return false;
+    }
+    return storeRefreshedToken_(
+      props,
+      'META_ACCESS_TOKEN',
+      'META_TOKEN_EXPIRES_AT',
+      JSON.parse(res.getContentText())
+    );
+  } catch (err) {
+    return false;
+  }
+}
+
+function refreshThreadsTokenIfNeeded_() {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty('META_THREADS_ACCESS_TOKEN');
+  if (!token) {
+    return false;
+  }
+  if (!isTokenRefreshDue_(props.getProperty('META_THREADS_TOKEN_EXPIRES_AT'))) {
+    return false;
+  }
+  try {
+    const url =
+      'https://graph.threads.net/refresh_access_token?grant_type=th_refresh_token' +
+      '&access_token=' +
+      encodeURIComponent(token);
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) {
+      return false;
+    }
+    return storeRefreshedToken_(
+      props,
+      'META_THREADS_ACCESS_TOKEN',
+      'META_THREADS_TOKEN_EXPIRES_AT',
+      JSON.parse(res.getContentText())
+    );
+  } catch (err) {
+    return false;
+  }
+}
+
+// Trigger target: collects the latest follower counts and stores the
+// snapshot. Each service fails independently (null), so one broken or
+// unconfigured service never blocks the others.
+function collectSnsCounts() {
+  refreshMetaTokenIfNeeded_();
+  refreshThreadsTokenIfNeeded_();
+  const snapshot = {
+    collected_at: new Date().toISOString(),
+    youtube: { subscribers: fetchYouTubeSubscribers_() },
+    instagram: {
+      freddiefujiwara: fetchInstagramFollowers_(SNS_INSTAGRAM_MAIN_ID),
+      anemone_cancer: fetchInstagramFollowers_(SNS_INSTAGRAM_SUB_ID),
+    },
+    threads: { followers: fetchThreadsFollowers_() },
+  };
+  PropertiesService.getScriptProperties().setProperty(
+    SNS_SNAPSHOT_PROPERTY,
+    JSON.stringify(snapshot)
+  );
+  console.log('SNS counts collected: ' + JSON.stringify(snapshot));
+  return snapshot;
+}
+
+// Editor helper: (re)install the 6-hour time-driven trigger for
+// collectSnsCounts. Run once from the editor after deployment; triggers
+// are not part of the deployed code.
+function setupSnsTriggers() {
+  ScriptApp.getProjectTriggers()
+    .filter((trigger) => trigger.getHandlerFunction() === 'collectSnsCounts')
+    .forEach((trigger) => ScriptApp.deleteTrigger(trigger));
+  ScriptApp.newTrigger('collectSnsCounts').timeBased().everyHours(6).create();
+}
+
 const DEFAULT_START = '28daysAgo';
 const DEFAULT_END = 'today';
 const DEFAULT_METRICS = 'screenPageViews,activeUsers,sessions';
@@ -347,6 +590,12 @@ function jsonOut_(obj) {
 
 function doGet(e) {
   try {
+    const parameter = (e && e.parameter) || {};
+    if (parameter.action === 'sns_counts') {
+      // Public by design: returns only the stored SNS follower snapshot.
+      // Handled before the GA4 property check and before authentication.
+      return jsonOut_(buildSnsCountsResponse_());
+    }
     const propertyId =
       PropertiesService.getScriptProperties().getProperty('GA4_PROPERTY_ID');
     if (!propertyId) {
@@ -355,10 +604,8 @@ function doGet(e) {
         error: 'GA4_PROPERTY_ID is not set in Script Properties',
       });
     }
-    const parameter = (e && e.parameter) || {};
     // The public music play count is served before any
-    // authentication: it is the single action that is callable
-    // without a token, and it exposes only the aggregate count.
+    // authentication: it exposes only the aggregate count.
     if (parameter.action === 'music_count') {
       try {
         const payload = fetchMusicCount_(propertyId);
@@ -449,4 +696,15 @@ if (typeof exports !== 'undefined') {
   exports.fetchReport_ = fetchReport_;
   exports.fetchMusicCount_ = fetchMusicCount_;
   exports.jsonOut_ = jsonOut_;
+  exports.collectSnsCounts = collectSnsCounts;
+  exports.setupSnsTriggers = setupSnsTriggers;
+  exports.getSnsCountsSnapshot_ = getSnsCountsSnapshot_;
+  exports.buildSnsCountsResponse_ = buildSnsCountsResponse_;
+  exports.fetchGraphFollowersCount_ = fetchGraphFollowersCount_;
+  exports.fetchInstagramFollowers_ = fetchInstagramFollowers_;
+  exports.fetchThreadsFollowers_ = fetchThreadsFollowers_;
+  exports.fetchYouTubeSubscribers_ = fetchYouTubeSubscribers_;
+  exports.isTokenRefreshDue_ = isTokenRefreshDue_;
+  exports.refreshMetaTokenIfNeeded_ = refreshMetaTokenIfNeeded_;
+  exports.refreshThreadsTokenIfNeeded_ = refreshThreadsTokenIfNeeded_;
 }
