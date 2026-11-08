@@ -112,7 +112,7 @@ describe('Threads OAuth completed inside GAS', () => {
       expect(url).toContain('https://threads.net/oauth/authorize');
       expect(url).toContain('client_id=threads-app-id');
       expect(url).toContain('redirect_uri=' + encodeURIComponent(EXEC_URL));
-      expect(url).toContain('scope=threads_basic');
+      expect(url).toContain('scope=threads_basic,threads_manage_insights');
       expect(url).toContain('response_type=code');
       expect(store.THREADS_OAUTH_STATE).toBeTruthy();
       expect(url).toContain('state=' + encodeURIComponent(store.THREADS_OAUTH_STATE));
