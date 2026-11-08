@@ -570,4 +570,111 @@ describe('Code.js', () => {
       expect(lastJson().ok).toBe(true);
     });
   });
+
+  describe('doGet action=music_count', () => {
+    const mockCache = () => {
+      const entries = {};
+      global.CacheService = {
+        getScriptCache: () => ({
+          get: (key) => (key in entries ? entries[key] : null),
+          put: (key, value) => {
+            entries[key] = value;
+          },
+        }),
+      };
+      return entries;
+    };
+
+    const mockCountFetch = (count) =>
+      mockFetch(200, {
+        rows: [{ metricValues: [{ value: String(count) }] }],
+        rowCount: 1,
+      });
+
+    it('returns the cumulative music_play count without any token', () => {
+      setProperty(PROPERTY_ID);
+      mockCache();
+      mockCountFetch(85);
+      Code.doGet({ parameter: { action: 'music_count' } });
+      const json = lastJson();
+      expect(json.ok).toBe(true);
+      expect(json.action).toBe('music_count');
+      expect(json.count).toBe(85);
+      expect(typeof json.updated_at).toBe('string');
+
+      const [url, options] = global.UrlFetchApp.fetch.mock.calls[0];
+      expect(url).toBe(
+        'https://analyticsdata.googleapis.com/v1beta/properties/' +
+          PROPERTY_ID +
+          ':runReport'
+      );
+      const body = JSON.parse(options.payload);
+      expect(body.dateRanges).toEqual([{ startDate: '2026-11-08', endDate: 'today' }]);
+      expect(body.metrics).toEqual([{ name: 'eventCount' }]);
+      expect(body.dimensions).toEqual([]);
+      expect(body.dimensionFilter).toEqual({
+        filter: {
+          fieldName: 'eventName',
+          stringFilter: { matchType: 'EXACT', value: 'music_play', caseSensitive: false },
+        },
+      });
+    });
+
+    it('stays public while authentication is configured', () => {
+      setProperty(PROPERTY_ID);
+      store.GOOGLE_OAUTH_CLIENT_ID = 'client-id';
+      store.AVAILABLE_GMAILS = 'owner@example.com';
+      mockCache();
+      mockCountFetch(12);
+      Code.doGet({ parameter: { action: 'music_count' } });
+      const json = lastJson();
+      expect(json.ok).toBe(true);
+      expect(json.count).toBe(12);
+      // The only network call is the GA4 report itself: no tokeninfo.
+      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('serves the second call from CacheService without refetching', () => {
+      setProperty(PROPERTY_ID);
+      mockCache();
+      mockCountFetch(30);
+      Code.doGet({ parameter: { action: 'music_count' } });
+      const first = lastJson();
+      Code.doGet({ parameter: { action: 'music_count' } });
+      const second = lastJson();
+      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(1);
+      expect(second.count).toBe(30);
+      expect(second.updated_at).toBe(first.updated_at);
+    });
+
+    it('reports zero when GA4 has no music_play rows yet', () => {
+      setProperty(PROPERTY_ID);
+      mockCache();
+      mockFetch(200, { rows: [], rowCount: 0 });
+      Code.doGet({ parameter: { action: 'music_count' } });
+      const json = lastJson();
+      expect(json.ok).toBe(true);
+      expect(json.count).toBe(0);
+    });
+
+    it('returns an error when the GA4 request fails', () => {
+      setProperty(PROPERTY_ID);
+      mockCache();
+      mockFetch(500, { error: { message: 'boom' } });
+      Code.doGet({ parameter: { action: 'music_count' } });
+      const json = lastJson();
+      expect(json.ok).toBe(false);
+      expect(json.status).toBe(502);
+    });
+
+    it('keeps other actions behind the gate', () => {
+      setProperty(PROPERTY_ID);
+      store.GOOGLE_OAUTH_CLIENT_ID = 'client-id';
+      store.AVAILABLE_GMAILS = 'owner@example.com';
+      mockCache();
+      mockCountFetch(1);
+      Code.doGet({ parameter: {} });
+      expect(lastJson().status).toBe(401);
+    });
+  });
 });

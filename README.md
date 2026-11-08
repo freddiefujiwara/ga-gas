@@ -28,6 +28,7 @@ Muse の API 接続の仕組みは OAuth の入口が単一ドメインのサー
 - `limit`（既定 25）
 - `offset`（既定 0）：limit と組み合わせてページングする
 - `filter`：ディメンションの絞り込み。書式は `<ディメンション>:<マッチ種別>:<値>`、マッチ種別は exact / contains / beginsWith / endsWith / regexp。複数条件は `;` 区切りで AND 結合。例：`filter=pagePath:contains:/blog/`
+- `action=music_count`：唯一の公開アクション。サイト共通ヘッダーに出す「川口の歌」の累計再生回数のため、認証なしで呼べる。返すのは music_play イベントの累計 eventCount（2026-11-08以降）と更新日時だけで、他のデータは一切返さない。CacheService で約1時間キャッシュし、GA4 Data API を叩く頻度を抑える
 
 ## Setup
 
