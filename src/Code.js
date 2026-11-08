@@ -488,12 +488,16 @@ function fetchInstagramMediaCount_() {
 //
 // Request shape (Meta Graph API, on the IG user node):
 //   GET /{ig-id}/insights?metric=views&period=day
-//       &metric_type=total_value&breakdown=follower_type
+//       &metric_type=total_value&breakdown=follow_type
 //       &since=<unix>&until=<unix>&access_token=...
 // The total_value response carries the breakdown as
 // total_value.breakdowns[].results[] with dimension_values like
 // ["FOLLOWER"] / ["NON_FOLLOWER"]. If that shape is unavailable, a
-// plain per-day request (values[].value summed) fills views_30d only.
+// total_value request without the breakdown fills views_30d only —
+// its response may carry total_value.value directly, or per-day
+// values[].value to sum. (Observed in production on 2026-11-08: the
+// breakdown dimension is named follow_type, not follower_type, and
+// the views metric requires metric_type=total_value on every call.)
 //
 // Diagnostics: the result always carries insights_error — null when
 // the breakdown request succeeded, otherwise a short summary of what
@@ -520,23 +524,24 @@ function fetchInstagramViewsInsights_() {
     '&access_token=' +
     encodeURIComponent(token);
   const breakdownRes = fetchInsightsJson_(
-    base + '&metric_type=total_value&breakdown=follower_type'
+    base + '&metric_type=total_value&breakdown=follow_type'
   );
   const breakdown = parseViewsBreakdown_(breakdownRes.data);
   if (breakdown) {
     result.views_30d = breakdown.total;
-    if (breakdown.total > 0) {
+    const partsTotal = breakdown.follower + breakdown.nonFollower;
+    if (partsTotal > 0) {
       result.non_follower_pct =
-        Math.round((breakdown.nonFollower / breakdown.total) * 1000) / 10;
+        Math.round((breakdown.nonFollower / partsTotal) * 1000) / 10;
     }
     return result;
   }
-  const dailyRes = fetchInsightsJson_(base);
+  const dailyRes = fetchInsightsJson_(base + '&metric_type=total_value');
   const total = parseViewsDailyTotal_(dailyRes.data);
   if (total !== null) {
     result.views_30d = total;
     result.insights_error =
-      'follower_type breakdown unavailable' +
+      'follow_type breakdown unavailable' +
       (breakdownRes.error ? ' (' + breakdownRes.error + ')' : '') +
       '; used daily totals fallback';
     return result;
@@ -545,7 +550,7 @@ function fetchInstagramViewsInsights_() {
   notes.push(
     breakdownRes.error
       ? 'breakdown: ' + breakdownRes.error
-      : 'breakdown: response had no follower_type breakdown'
+      : 'breakdown: response had no follow_type breakdown'
   );
   notes.push(
     dailyRes.error
@@ -611,7 +616,7 @@ function summarizeInsightsError_(status, bodyText) {
 }
 
 // Returns { total, follower, nonFollower } in views, or null when the
-// total_value + follower_type breakdown shape is not present.
+// total_value + follow_type breakdown shape is not present.
 function parseViewsBreakdown_(data) {
   const entry = data && Array.isArray(data.data) ? data.data[0] : null;
   const totalValue = entry && entry.total_value;
@@ -625,7 +630,7 @@ function parseViewsBreakdown_(data) {
   let nonFollower = null;
   breakdowns.forEach((breakdown) => {
     const keys = (breakdown && breakdown.dimension_keys) || [];
-    if (!keys.includes('follower_type')) {
+    if (!keys.includes('follow_type')) {
       return;
     }
     ((breakdown && breakdown.results) || []).forEach((row) => {
@@ -653,10 +658,20 @@ function parseViewsBreakdown_(data) {
   };
 }
 
-// Sums the per-day values[] of a plain insights response, or null.
+// Reads the total views out of a no-breakdown insights response, or
+// null. With metric_type=total_value the response may carry
+// total_value.value directly; otherwise the per-day values[].value
+// are summed.
 function parseViewsDailyTotal_(data) {
   const entry = data && Array.isArray(data.data) ? data.data[0] : null;
-  const values = entry && Array.isArray(entry.values) ? entry.values : null;
+  if (!entry) {
+    return null;
+  }
+  const totalValue = Number(entry.total_value && entry.total_value.value);
+  if (Number.isFinite(totalValue)) {
+    return totalValue;
+  }
+  const values = Array.isArray(entry.values) ? entry.values : null;
   if (!values) {
     return null;
   }
