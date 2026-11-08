@@ -253,6 +253,9 @@ function issueShareToken() {
 //     Falls back to META_ACCESS_TOKEN when unset. When its expiry is
 //     recorded in META_THREADS_TOKEN_EXPIRES_AT, it is refreshed with
 //     th_refresh_token in the same way.
+//   SNS_HISTORY_SHEET_ID (optional): spreadsheet that receives one
+//     history row per collection (see appendSnsHistory_). Unset means
+//     no history is written.
 // The Instagram snapshot also carries account KPIs for the main
 // account: media_count (post count, available with instagram_basic)
 // plus views_30d / non_follower_pct from the account insights, which
@@ -1450,6 +1453,201 @@ function fetchYouTubeRecentVideos_() {
   }
 }
 
+// --- SNS snapshot history (Google Sheets) ---
+// The snapshot above is overwritten on every collection, so the
+// trend would be lost. When the Script Property SNS_HISTORY_SHEET_ID
+// names a spreadsheet, collectSnsCounts() also appends the snapshot
+// to it: one row per collection on the "account" sheet and one row
+// per recent post on the "media" sheet. Both sheets are created when
+// missing and get their header row when still empty. The sheet ID is
+// only ever read from the Script Property, never written in code.
+// Unset (the default) means no history is written at all, and a
+// failed append never fails the collection itself: it is logged as
+// one secret-free summary line instead.
+
+const SNS_HISTORY_SHEET_ID_PROPERTY = 'SNS_HISTORY_SHEET_ID';
+const SNS_HISTORY_ACCOUNT_COLUMNS = [
+  'collected_at',
+  'ig_followers',
+  'ig_anemone_followers',
+  'threads_followers',
+  'youtube_subscribers',
+  'total_followers',
+  'media_count',
+  'views_30d',
+  'non_follower_pct',
+  'reach_30d',
+  'accounts_engaged_30d',
+  'interactions_total',
+  'interactions_likes',
+  'interactions_comments',
+  'interactions_shares',
+  'interactions_saves',
+  'profile_links_taps_30d',
+  'profile_links_taps_source',
+  'follows_30d',
+  'unfollows_30d',
+  'yt_total_views',
+  'yt_video_count',
+];
+const SNS_HISTORY_MEDIA_COLUMNS = [
+  'collected_at',
+  'media_id',
+  'posted_at',
+  'type',
+  'caption',
+  'permalink',
+  'views',
+  'reach',
+  'likes',
+  'comments',
+  'shares',
+  'saves',
+  'avg_watch_sec',
+  'total_watch_sec',
+];
+
+// Numbers are written as numbers; anything else (null, undefined,
+// non-finite) becomes an empty cell so the sheet stays sortable.
+function snsHistoryNumCell_(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : '';
+}
+
+function snsHistoryTextCell_(value) {
+  return value === null || value === undefined ? '' : String(value);
+}
+
+// One "account" row from a snapshot. total_followers follows the
+// top-page definition — main Instagram + Threads + YouTube — summing
+// only the values that are numbers, and stays empty when all three
+// are null. Null values become empty cells throughout.
+function buildSnsHistoryAccountRow_(snapshot) {
+  const snap = snapshot || {};
+  const youtube = snap.youtube || {};
+  const instagram = snap.instagram || {};
+  const threads = snap.threads || {};
+  const interactions = instagram.interactions_30d || {};
+  const totalParts = [
+    snsNumberOrNull_(instagram.freddiefujiwara),
+    snsNumberOrNull_(threads.followers),
+    snsNumberOrNull_(youtube.subscribers),
+  ].filter((value) => value !== null);
+  return [
+    snsHistoryTextCell_(snap.collected_at),
+    snsHistoryNumCell_(instagram.freddiefujiwara),
+    snsHistoryNumCell_(instagram.anemone_cancer),
+    snsHistoryNumCell_(threads.followers),
+    snsHistoryNumCell_(youtube.subscribers),
+    totalParts.length
+      ? totalParts.reduce((sum, value) => sum + value, 0)
+      : '',
+    snsHistoryNumCell_(instagram.media_count),
+    snsHistoryNumCell_(instagram.views_30d),
+    snsHistoryNumCell_(instagram.non_follower_pct),
+    snsHistoryNumCell_(instagram.reach_30d),
+    snsHistoryNumCell_(instagram.accounts_engaged_30d),
+    snsHistoryNumCell_(interactions.total),
+    snsHistoryNumCell_(interactions.likes),
+    snsHistoryNumCell_(interactions.comments),
+    snsHistoryNumCell_(interactions.shares),
+    snsHistoryNumCell_(interactions.saves),
+    snsHistoryNumCell_(instagram.profile_links_taps_30d),
+    snsHistoryTextCell_(instagram.profile_links_taps_source),
+    snsHistoryNumCell_(instagram.follows_30d),
+    snsHistoryNumCell_(instagram.unfollows_30d),
+    snsHistoryNumCell_(youtube.total_views),
+    snsHistoryNumCell_(youtube.video_count),
+  ];
+}
+
+// One "media" row per entry of instagram.recent_media (an empty list
+// when the media fetch failed and the snapshot carries null), each
+// stamped with the snapshot's collected_at so a post's growth can be
+// followed across collections.
+function buildSnsHistoryMediaRows_(snapshot) {
+  const snap = snapshot || {};
+  const instagram = snap.instagram || {};
+  const media = Array.isArray(instagram.recent_media)
+    ? instagram.recent_media
+    : [];
+  return media.map((entry) => {
+    const item = entry || {};
+    return [
+      snsHistoryTextCell_(snap.collected_at),
+      snsHistoryTextCell_(item.id),
+      snsHistoryTextCell_(item.posted_at),
+      snsHistoryTextCell_(item.type),
+      snsHistoryTextCell_(item.caption),
+      snsHistoryTextCell_(item.permalink),
+      snsHistoryNumCell_(item.views),
+      snsHistoryNumCell_(item.reach),
+      snsHistoryNumCell_(item.likes),
+      snsHistoryNumCell_(item.comments),
+      snsHistoryNumCell_(item.shares),
+      snsHistoryNumCell_(item.saves),
+      snsHistoryNumCell_(item.avg_watch_sec),
+      snsHistoryNumCell_(item.total_watch_sec),
+    ];
+  });
+}
+
+// Returns the named sheet, creating it when missing, and writes the
+// header row only when the sheet is still empty (an existing header
+// — or any existing data — is left untouched).
+function ensureSnsHistorySheet_(spreadsheet, name, columns) {
+  let sheet = spreadsheet.getSheetByName(name);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(name);
+  }
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, columns.length).setValues([columns]);
+  }
+  return sheet;
+}
+
+// Compact, secret-free summary of a Sheets failure for the log. The
+// configured sheet ID is scrubbed first, in case a Drive error
+// message quotes it.
+function summarizeSnsHistoryError_(err, sheetId) {
+  let message = String((err && err.message) || err || 'unknown error');
+  if (sheetId) {
+    message = message.split(sheetId).join('[sheet]');
+  }
+  return message.slice(0, 200);
+}
+
+// Appends the snapshot to the history spreadsheet. No-op unless
+// SNS_HISTORY_SHEET_ID is set (SpreadsheetApp is not even touched
+// then). Never throws: any failure is logged as one line and the
+// collection that produced the snapshot still counts as a success.
+function appendSnsHistory_(snapshot) {
+  const sheetId = getScriptProperty_(SNS_HISTORY_SHEET_ID_PROPERTY);
+  if (!sheetId) {
+    return;
+  }
+  try {
+    const spreadsheet = SpreadsheetApp.openById(sheetId);
+    const accountSheet = ensureSnsHistorySheet_(
+      spreadsheet,
+      'account',
+      SNS_HISTORY_ACCOUNT_COLUMNS
+    );
+    accountSheet.appendRow(buildSnsHistoryAccountRow_(snapshot));
+    const mediaSheet = ensureSnsHistorySheet_(
+      spreadsheet,
+      'media',
+      SNS_HISTORY_MEDIA_COLUMNS
+    );
+    buildSnsHistoryMediaRows_(snapshot).forEach((row) =>
+      mediaSheet.appendRow(row)
+    );
+  } catch (err) {
+    console.log(
+      'SNS history append failed: ' + summarizeSnsHistoryError_(err, sheetId)
+    );
+  }
+}
+
 // Trigger target: collects the latest follower counts and stores the
 // snapshot. Each service fails independently (null), so one broken or
 // unconfigured service never blocks the others.
@@ -1507,6 +1705,7 @@ function collectSnsCounts() {
     SNS_SNAPSHOT_PROPERTY,
     JSON.stringify(snapshot)
   );
+  appendSnsHistory_(snapshot);
   console.log('SNS counts collected: ' + JSON.stringify(snapshot));
   return snapshot;
 }
@@ -1786,4 +1985,11 @@ if (typeof exports !== 'undefined') {
   exports.isTokenRefreshDue_ = isTokenRefreshDue_;
   exports.refreshMetaTokenIfNeeded_ = refreshMetaTokenIfNeeded_;
   exports.refreshThreadsTokenIfNeeded_ = refreshThreadsTokenIfNeeded_;
+  exports.appendSnsHistory_ = appendSnsHistory_;
+  exports.buildSnsHistoryAccountRow_ = buildSnsHistoryAccountRow_;
+  exports.buildSnsHistoryMediaRows_ = buildSnsHistoryMediaRows_;
+  exports.ensureSnsHistorySheet_ = ensureSnsHistorySheet_;
+  exports.summarizeSnsHistoryError_ = summarizeSnsHistoryError_;
+  exports.SNS_HISTORY_ACCOUNT_COLUMNS = SNS_HISTORY_ACCOUNT_COLUMNS;
+  exports.SNS_HISTORY_MEDIA_COLUMNS = SNS_HISTORY_MEDIA_COLUMNS;
 }
