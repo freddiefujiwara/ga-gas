@@ -1447,6 +1447,66 @@ function debugScrubToken_(text, token) {
   return value.split(token).join('<redacted>');
 }
 
+// --- Manual diagnostics: debugThreadsFollowers --------------------
+// Run by hand from the Apps Script editor when collectSnsCounts
+// keeps storing threads.followers = null after the Threads OAuth
+// flow has completed (as on 2026-11-09: authorization finished and
+// the long-lived token was saved, yet the followers fetch came back
+// null with no error recorded anywhere — fetchGraphFollowersCount_
+// returns null on any non-200 response or exception without keeping
+// the status or body, so the snapshot cannot say why). It logs
+// whether META_THREADS_ACCESS_TOKEN is set (never its value), which
+// user id the production fetch would use, and the raw status/body
+// of the very same request fetchThreadsFollowers_ makes, so the
+// next fix starts from what the Threads Graph API actually returns.
+// It is never called from a trigger or from doGet, and it does not
+// touch the snapshot. The request URL is printed with
+// access_token=<redacted> and the body is scrubbed the same way as
+// in debugSnsInsights.
+function debugThreadsFollowers() {
+  const threadsToken = getScriptProperty_('META_THREADS_ACCESS_TOKEN');
+  Logger.log(
+    'META_THREADS_ACCESS_TOKEN is ' +
+      (threadsToken ? 'set.' : 'not set.')
+  );
+  const token = threadsToken || getScriptProperty_('META_ACCESS_TOKEN');
+  if (!token) {
+    Logger.log('META_ACCESS_TOKEN is not set either; nothing to diagnose.');
+    return;
+  }
+  if (!threadsToken) {
+    Logger.log('Falling back to META_ACCESS_TOKEN (the Instagram token).');
+  }
+  const propertyUserId = getScriptProperty_('THREADS_USER_ID');
+  const userId = propertyUserId || SNS_THREADS_USER_ID;
+  Logger.log(
+    'Threads user id: ' +
+      userId +
+      (propertyUserId
+        ? ' (from THREADS_USER_ID)'
+        : ' (THREADS_USER_ID is not set; using the SNS_THREADS_USER_ID fallback)')
+  );
+  const base = THREADS_GRAPH_BASE + userId + '?fields=followers_count';
+  Logger.log('GET ' + base + '&access_token=<redacted>');
+  let res;
+  try {
+    res = UrlFetchApp.fetch(
+      base + '&access_token=' + encodeURIComponent(token),
+      { muteHttpExceptions: true }
+    );
+  } catch (err) {
+    Logger.log('fetch exception (' + ((err && err.name) || 'Error') + ')');
+    return;
+  }
+  Logger.log('HTTP ' + res.getResponseCode());
+  Logger.log(
+    debugScrubToken_(res.getContentText(), token).slice(
+      0,
+      SNS_DEBUG_LOG_LIMIT
+    )
+  );
+}
+
 // Reads the follows/unfollows split out of a follows_and_unfollows
 // total_value response. Production diagnostics on 2026-11-09
 // (debugSnsInsights) pinned down the only shape this metric returns
@@ -1685,6 +1745,14 @@ function fetchInstagramRecentMedia_() {
   };
 }
 
+// Captions are passed through in full: the /ga screen classifies
+// each post into a genre by keyword rules over the whole caption,
+// hashtags included, and the old 80-character cut-off hid the tail
+// of the caption (where the hashtags live) from that classification
+// and misfiled posts. SNS_CAPTION_MAX_LENGTH is only a safety cap
+// against pathological inputs, far beyond any real caption.
+const SNS_CAPTION_MAX_LENGTH = 2000;
+
 function buildRecentMediaEntry_(media) {
   const caption =
     media && media.caption != null ? String(media.caption) : '';
@@ -1692,7 +1760,7 @@ function buildRecentMediaEntry_(media) {
     id: media && media.id != null ? String(media.id) : null,
     type: (media && (media.media_product_type || media.media_type)) || null,
     posted_at: (media && media.timestamp) || null,
-    caption: caption.slice(0, 80),
+    caption: caption.slice(0, SNS_CAPTION_MAX_LENGTH),
     permalink: (media && media.permalink) || null,
     views: null,
     reach: null,
@@ -2572,6 +2640,7 @@ if (typeof exports !== 'undefined') {
   exports.parseViewsBreakdown_ = parseViewsBreakdown_;
   exports.parseViewsDailyTotal_ = parseViewsDailyTotal_;
   exports.fetchThreadsFollowers_ = fetchThreadsFollowers_;
+  exports.debugThreadsFollowers = debugThreadsFollowers;
   exports.fetchYouTubeSubscribers_ = fetchYouTubeSubscribers_;
   exports.buildSnsDetailResponse_ = buildSnsDetailResponse_;
   exports.buildEmptySnsDetail_ = buildEmptySnsDetail_;
