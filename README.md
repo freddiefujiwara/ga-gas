@@ -55,11 +55,20 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - Instagram 投稿ごと（新しい順・最大30件）：`instagram.recent_media[]` = `{id, type, posted_at, caption（80字まで）, permalink, views, reach, likes, comments, shares, saves, avg_watch_sec, total_watch_sec}`。リールの視聴時間はミリ秒→秒に変換。メディア種別で使える metric が違うため、失敗時は metric を絞って再試行する。失敗時は `instagram.media_error`
 - YouTube：`youtube.total_views`（総再生数）と `youtube.video_count`（動画数）を追加。`youtube.recent_videos[]`（新しい順・最大10件）= `{id, title, published_at, views, likes, comments, url}`。失敗時は `youtube.youtube_error`
 
+## SNS履歴（スプレッドシート）
+
+スナップショットは取得のたびに上書きされるため、推移を残す目的で `collectSnsCounts` が Google スプレッドシートへも追記する。スクリプトプロパティ `SNS_HISTORY_SHEET_ID` にスプレッドシートの ID が設定されているときだけ動作し、未設定なら何もしない（ID はコードに書かない）。
+
+- `account` シート：取得ごとに1行。列は collected_at、ig_followers、ig_anemone_followers、threads_followers、youtube_subscribers、total_followers（Instagram メイン＋Threads＋YouTube、トップページと同じ定義）、media_count、views_30d、non_follower_pct、reach_30d、accounts_engaged_30d、interactions_total / likes / comments / shares / saves、profile_links_taps_30d、profile_links_taps_source、follows_30d、unfollows_30d、yt_total_views、yt_video_count。null の項目は空欄
+- `media` シート：`recent_media` の投稿ごとに1行。列は collected_at、media_id、posted_at、type、caption、permalink、views、reach、likes、comments、shares、saves、avg_watch_sec、total_watch_sec
+- 両シートとも無ければ自動作成し、1行目が空（シートが空）のときだけヘッダー行を書く
+- 追記に失敗しても取得自体は成功として扱い、実行ログに `SNS history append failed: <要約>` が1行出る（要約に秘密値・URL は含めない）
+
 ## Setup
 
 - GCP プロジェクト：ga-gas-513811（番号 151603615892）。Google Analytics Data API 有効化済み。OAuth 同意画面は External / テストモード（テストユーザー zegenvs@gmail.com）。Apps Script プロジェクト（本番・ステージングとも）にリンクする。
 - スクリプトプロパティ：`GA4_PROPERTY_ID` = 561730442（freddiefujiwara.com の GA4 プロパティ）。本番・ステージングの両プロジェクトに設定する。
-- スコープ：analytics.readonly + script.external_request（appsscript.json で指定）。
+- スコープ：appsscript.json で指定（analytics.readonly、script.external_request、script.scriptapp、spreadsheets、youtube.readonly）。spreadsheets は SNS 履歴の追記用で、追加したプロジェクトでは初回実行時に再認可が要る場合がある。
 
 ## 開発とデプロイ
 

@@ -625,6 +625,247 @@ describe('SNS follower counts', () => {
     });
   });
 
+  describe('SNS history append', () => {
+    let sheets;
+    let spreadsheet;
+    let openById;
+
+    const makeSheet = () => {
+      const sheet = {
+        rows: [],
+        getLastRow() {
+          return sheet.rows.length;
+        },
+        getRange(row, col, numRows) {
+          return {
+            setValues: (values) => {
+              values.forEach((valueRow, i) => {
+                sheet.rows[row - 1 + i] = valueRow.slice();
+              });
+            },
+          };
+        },
+        appendRow(row) {
+          sheet.rows.push(row.slice());
+        },
+      };
+      return sheet;
+    };
+
+    const fixtureSnapshot = () => ({
+      collected_at: '2026-11-09T00:00:00.000Z',
+      youtube: {
+        subscribers: 8,
+        total_views: 123456,
+        video_count: 42,
+        recent_videos: [],
+        youtube_error: null,
+      },
+      instagram: {
+        freddiefujiwara: 1988,
+        anemone_cancer: 59,
+        media_count: 2404,
+        views_30d: 10000,
+        non_follower_pct: 96.3,
+        insights_error: null,
+        reach_30d: 5000,
+        accounts_engaged_30d: 1200,
+        interactions_30d: { total: 3000, likes: 2000, comments: 300, shares: 400, saves: 300 },
+        profile_links_taps_30d: 46,
+        profile_links_taps_source: 'total_value',
+        follows_30d: 180,
+        unfollows_30d: 30,
+        demographics: { age_gender: [], top_cities: [], top_countries: [] },
+        detail_error: null,
+        recent_media: [
+          {
+            id: 'media-reel-1',
+            type: 'REELS',
+            posted_at: '2026-11-08T03:00:00+0000',
+            caption: 'リールのキャプション',
+            permalink: 'https://www.instagram.com/reel/ABC/',
+            views: 1000,
+            reach: 900,
+            likes: 50,
+            comments: 5,
+            shares: 3,
+            saves: 7,
+            avg_watch_sec: 8.5,
+            total_watch_sec: 765,
+          },
+          {
+            id: 'media-image-1',
+            type: 'FEED',
+            posted_at: '2026-11-07T03:00:00+0000',
+            caption: '写真のキャプション',
+            permalink: 'https://www.instagram.com/p/DEF/',
+            views: 100,
+            reach: 90,
+            likes: 10,
+            comments: 1,
+            shares: 0,
+            saves: 2,
+            avg_watch_sec: null,
+            total_watch_sec: null,
+          },
+        ],
+        media_error: null,
+      },
+      threads: { followers: 252 },
+    });
+
+    const expectedAccountValues = [
+      1988, 59, 252, 8, 2248, 2404, 10000, 96.3, 5000, 1200, 3000, 2000, 300,
+      400, 300, 46, 'total_value', 180, 30, 123456, 42,
+    ];
+
+    beforeEach(() => {
+      sheets = {};
+      spreadsheet = {
+        getSheetByName: (name) => sheets[name] || null,
+        insertSheet: (name) => {
+          sheets[name] = makeSheet();
+          return sheets[name];
+        },
+      };
+      openById = vi.fn(() => spreadsheet);
+      global.SpreadsheetApp = { openById };
+    });
+
+    it('builds the account row from a snapshot fixture', () => {
+      expect(Code.buildSnsHistoryAccountRow_(fixtureSnapshot())).toEqual([
+        '2026-11-09T00:00:00.000Z',
+        ...expectedAccountValues,
+      ]);
+    });
+
+    it('builds one media row per recent post from a snapshot fixture', () => {
+      expect(Code.buildSnsHistoryMediaRows_(fixtureSnapshot())).toEqual([
+        [
+          '2026-11-09T00:00:00.000Z',
+          'media-reel-1',
+          '2026-11-08T03:00:00+0000',
+          'REELS',
+          'リールのキャプション',
+          'https://www.instagram.com/reel/ABC/',
+          1000, 900, 50, 5, 3, 7, 8.5, 765,
+        ],
+        [
+          '2026-11-09T00:00:00.000Z',
+          'media-image-1',
+          '2026-11-07T03:00:00+0000',
+          'FEED',
+          '写真のキャプション',
+          'https://www.instagram.com/p/DEF/',
+          100, 90, 10, 1, 0, 2, '', '',
+        ],
+      ]);
+    });
+
+    it('blanks null values and the total when every follower count is null', () => {
+      const row = Code.buildSnsHistoryAccountRow_({
+        collected_at: '2026-11-09T00:00:00.000Z',
+        youtube: { subscribers: null, total_views: null, video_count: null },
+        instagram: {
+          freddiefujiwara: null,
+          anemone_cancer: null,
+          interactions_30d: null,
+          profile_links_taps_source: null,
+        },
+        threads: { followers: null },
+      });
+      expect(row).toHaveLength(Code.SNS_HISTORY_ACCOUNT_COLUMNS.length);
+      expect(row[0]).toBe('2026-11-09T00:00:00.000Z');
+      expect(row.slice(1)).toEqual(
+        Array(Code.SNS_HISTORY_ACCOUNT_COLUMNS.length - 1).fill('')
+      );
+      expect(Code.buildSnsHistoryMediaRows_({ instagram: { recent_media: null } })).toEqual([]);
+    });
+
+    it('does not touch SpreadsheetApp while SNS_HISTORY_SHEET_ID is unset', () => {
+      Code.appendSnsHistory_(fixtureSnapshot());
+      expect(openById).not.toHaveBeenCalled();
+
+      store.META_ACCESS_TOKEN = 'meta-token';
+      mockGraphSuccess();
+      mockYouTubeFull();
+      const snapshot = Code.collectSnsCounts();
+      expect(snapshot).toBeTruthy();
+      expect(store.SNS_COUNTS_SNAPSHOT).toBeTruthy();
+      expect(openById).not.toHaveBeenCalled();
+    });
+
+    it('appends headers and rows end to end on collectSnsCounts', () => {
+      store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
+      store.META_ACCESS_TOKEN = 'meta-token';
+      mockGraphSuccess();
+      mockYouTubeFull();
+
+      Code.collectSnsCounts();
+
+      expect(openById).toHaveBeenCalledWith('history-sheet-id');
+      expect(sheets.account.rows[0]).toEqual(Code.SNS_HISTORY_ACCOUNT_COLUMNS);
+      expect(sheets.account.rows).toHaveLength(2);
+      expect(sheets.account.rows[1].slice(1)).toEqual(expectedAccountValues);
+      expect(sheets.media.rows[0]).toEqual(Code.SNS_HISTORY_MEDIA_COLUMNS);
+      expect(sheets.media.rows).toHaveLength(3);
+      expect(sheets.media.rows[1].slice(1, 7)).toEqual([
+        'media-reel-1',
+        '2026-11-08T03:00:00+0000',
+        'REELS',
+        'リールのキャプション',
+        'https://www.instagram.com/reel/ABC/',
+        1000,
+      ]);
+    });
+
+    it('writes each header only once and keeps an existing header', () => {
+      store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
+      Code.appendSnsHistory_(fixtureSnapshot());
+      Code.appendSnsHistory_(fixtureSnapshot());
+      expect(sheets.account.rows).toHaveLength(3);
+      expect(sheets.account.rows[0]).toEqual(Code.SNS_HISTORY_ACCOUNT_COLUMNS);
+      expect(sheets.account.rows[1].slice(1)).toEqual(expectedAccountValues);
+      expect(sheets.account.rows[2].slice(1)).toEqual(expectedAccountValues);
+      expect(sheets.media.rows).toHaveLength(5);
+      expect(sheets.media.rows[0]).toEqual(Code.SNS_HISTORY_MEDIA_COLUMNS);
+
+      const headed = makeSheet();
+      headed.rows.push(['preset', 'header']);
+      sheets.account = headed;
+      sheets.media = makeSheet();
+      sheets.media.rows.push(['preset', 'header']);
+      Code.appendSnsHistory_(fixtureSnapshot());
+      expect(headed.rows).toHaveLength(2);
+      expect(headed.rows[0]).toEqual(['preset', 'header']);
+      expect(sheets.media.rows[0]).toEqual(['preset', 'header']);
+    });
+
+    it('keeps collectSnsCounts successful when the append throws', () => {
+      store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
+      openById.mockImplementation(() => {
+        throw new Error('drive exploded for history-sheet-id');
+      });
+      store.META_ACCESS_TOKEN = 'meta-token';
+      mockGraphSuccess();
+      mockYouTubeFull();
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        const snapshot = Code.collectSnsCounts();
+        expect(snapshot.instagram.freddiefujiwara).toBe(1988);
+        expect(JSON.parse(store.SNS_COUNTS_SNAPSHOT)).toEqual(snapshot);
+        const failures = logSpy.mock.calls
+          .map((call) => String(call[0]))
+          .filter((line) => line.startsWith('SNS history append failed:'));
+        expect(failures).toHaveLength(1);
+        expect(failures[0]).toContain('drive exploded');
+        expect(failures[0]).not.toContain('history-sheet-id');
+      } finally {
+        logSpy.mockRestore();
+      }
+    });
+  });
+
   describe('Instagram KPIs', () => {
     const graphWithInsights = (insightsHandler) => {
       fetchHandler = (url) => {
