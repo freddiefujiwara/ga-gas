@@ -42,6 +42,16 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - Threads 専用トークンを使う場合は `META_THREADS_ACCESS_TOKEN` を設定する（未設定なら `META_ACCESS_TOKEN` で代用）。その有効期限は `META_THREADS_TOKEN_EXPIRES_AT` に記録され、`th_refresh_token` で自動延長される
 - トークン未設定・失効のサービスは null になり、他のサービスの取得は続く
 - Instagram の KPI（メインアカウントのみ、スナップショットの `instagram` 内）：`media_count`（投稿数、`instagram_basic` で取得可）、`views_30d`（過去30日の Views 合計）と `non_follower_pct`（そのうちフォロワー以外％、小数1桁）はインサイト由来で、`META_ACCESS_TOKEN` に `instagram_manage_insights` 権限が付くまでは null のまま（付与後は自動で数値が入る）。インサイト取得が失敗した場合は `instagram.insights_error` に API エラーの要約（HTTP ステータスと Graph API の code / subcode / message、秘密値は含まない）が入り、日別合計へのフォールバック時もその旨が記録される（成功時は null）
+- なお `action=sns_counts` が返すのは公開用の射影（上記のフォロワー数と KPI のみ）で、次節の詳細データは公開アクションには一切含まれない
+
+## SNS詳細（action=sns_detail、認証必須）
+
+/ga 管理画面用に、`collectSnsCounts` が同じスナップショットへ詳細データも保存する。読み取りは `?action=sns_detail` で、GA4 レポートと同じ認証ゲート（ID トークンまたは一時アクセスリンク）を通る。取得は項目ごとに独立して失敗し、取れない項目は null、失敗の要約はセクションごとのエラーキー（秘密値は含まない）に入る。
+
+- Instagram アカウント全体（過去30日、メインアカウント）：`reach_30d`、`accounts_engaged_30d`、`interactions_30d`（total / likes / comments / shares / saves）、`profile_links_taps_30d`、`follows_30d` / `unfollows_30d`（`follows_and_unfollows` の follow_type 内訳）。失敗時は `instagram.detail_error`
+- Instagram フォロワー属性（lifetime）：`instagram.demographics` = `age_gender`（`{key, value}` の降順リスト、key は "25-34/F" 形式）、`top_cities` / `top_countries`（各上位10件）。失敗分は `instagram.detail_error` に合算
+- Instagram 投稿ごと（新しい順・最大30件）：`instagram.recent_media[]` = `{id, type, posted_at, caption（80字まで）, permalink, views, reach, likes, comments, shares, saves, avg_watch_sec, total_watch_sec}`。リールの視聴時間はミリ秒→秒に変換。メディア種別で使える metric が違うため、失敗時は metric を絞って再試行する。失敗時は `instagram.media_error`
+- YouTube：`youtube.total_views`（総再生数）と `youtube.video_count`（動画数）を追加。`youtube.recent_videos[]`（新しい順・最大10件）= `{id, title, published_at, views, likes, comments, url}`。失敗時は `youtube.youtube_error`
 
 ## Setup
 
