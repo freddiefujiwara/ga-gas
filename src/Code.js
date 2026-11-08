@@ -362,6 +362,7 @@ function buildEmptySnsDetail_() {
         saves: null,
       },
       profile_links_taps_30d: null,
+      profile_links_taps_source: null,
       follows_30d: null,
       unfollows_30d: null,
       demographics: { age_gender: null, top_cities: null, top_countries: null },
@@ -816,6 +817,109 @@ function fetchAccountInsightTotal_(metric, extra) {
   return { value: parseViewsDailyTotal_(res.data), error: null, data: res.data };
 }
 
+// Reads only the total_value.value out of an insights response, or
+// null. Kept separate from parseViewsDailyTotal_ (which also sums
+// per-day values) so callers can tell which form a number came from.
+function parseInsightsTotalValue_(data) {
+  const entry = data && Array.isArray(data.data) ? data.data[0] : null;
+  if (!entry) {
+    return null;
+  }
+  const value = Number(entry.total_value && entry.total_value.value);
+  return Number.isFinite(value) ? value : null;
+}
+
+// Sums only the per-day values[].value of an insights response, or
+// null when the response carries no daily values.
+function parseInsightsDailySum_(data) {
+  const entry = data && Array.isArray(data.data) ? data.data[0] : null;
+  if (!entry || !Array.isArray(entry.values)) {
+    return null;
+  }
+  let total = 0;
+  let seen = false;
+  entry.values.forEach((row) => {
+    const value = Number(row && row.value);
+    if (Number.isFinite(value)) {
+      total += value;
+      seen = true;
+    }
+  });
+  return seen ? total : null;
+}
+
+// Fetches one account-level insights metric in the plain daily form
+// (no metric_type) and returns the raw { data, error }. Some metrics
+// reject a request without metric_type=total_value (observed for
+// views), so on an error the request is retried once in that form;
+// either response is only read for its per-day values.
+function fetchAccountInsightDaily_(metric) {
+  const token = getScriptProperty_('META_ACCESS_TOKEN');
+  const window = snsInsightsWindow_();
+  const base =
+    META_GRAPH_BASE +
+    SNS_INSTAGRAM_MAIN_ID +
+    '/insights?metric=' +
+    metric +
+    '&period=day&since=' +
+    window.since +
+    '&until=' +
+    window.until;
+  let res = fetchInsightsJson_(base + '&access_token=' + encodeURIComponent(token));
+  if (res.error) {
+    res = fetchInsightsJson_(
+      base + '&metric_type=total_value&access_token=' + encodeURIComponent(token)
+    );
+  }
+  return res;
+}
+
+// Profile link taps, in two stages. The total_value form is tried
+// first; when it comes back null or 0 — the production snapshot on
+// 2026-11-09 showed 0 while the Instagram app and the CLI reported
+// dozens of bio link taps for the same account — the per-day values
+// are summed instead, from the first response when it already
+// carries them and from a dedicated daily request otherwise. The
+// adopted form is reported as source ("total_value" / "daily_sum")
+// so a wrong-looking number stays diagnosable in the snapshot.
+// Returns { value, source, error } and never throws.
+function fetchProfileLinksTaps_() {
+  const first = fetchAccountInsightTotal_('profile_links_taps');
+  if (first.error) {
+    return { value: null, source: null, error: first.error };
+  }
+  const totalValue = parseInsightsTotalValue_(first.data);
+  if (totalValue !== null && totalValue > 0) {
+    return { value: totalValue, source: 'total_value', error: null };
+  }
+  let daily = parseInsightsDailySum_(first.data);
+  if (daily === null) {
+    const second = fetchAccountInsightDaily_('profile_links_taps');
+    if (second.error) {
+      if (totalValue === null) {
+        return {
+          value: null,
+          source: null,
+          error: 'profile_links_taps: ' + second.error,
+        };
+      }
+    } else {
+      daily = parseInsightsDailySum_(second.data);
+    }
+  }
+  if (daily !== null) {
+    return { value: daily, source: 'daily_sum', error: null };
+  }
+  if (totalValue !== null) {
+    return { value: totalValue, source: 'total_value', error: null };
+  }
+  return {
+    value: null,
+    source: null,
+    error: 'profile_links_taps: response had neither a total_value nor daily values',
+  };
+}
+
 // Account-level detail for the main Instagram account (last 30
 // days): reach, engaged accounts, the interaction totals, profile
 // link taps, and the follows/unfollows split. Each metric is a
@@ -832,6 +936,7 @@ function fetchInstagramAccountDetail_() {
       saves: null,
     },
     profile_links_taps_30d: null,
+    profile_links_taps_source: null,
     follows_30d: null,
     unfollows_30d: null,
     detail_error: null,
@@ -856,7 +961,12 @@ function fetchInstagramAccountDetail_() {
     shares: grab('shares'),
     saves: grab('saves'),
   };
-  result.profile_links_taps_30d = grab('profile_links_taps');
+  const taps = fetchProfileLinksTaps_();
+  result.profile_links_taps_30d = taps.value;
+  result.profile_links_taps_source = taps.source;
+  if (taps.error) {
+    errors.push(taps.error);
+  }
   const follows = fetchAccountInsightTotal_(
     'follows_and_unfollows',
     '&breakdown=follow_type'
@@ -868,6 +978,13 @@ function fetchInstagramAccountDetail_() {
     if (parsed) {
       result.follows_30d = parsed.follows;
       result.unfollows_30d = parsed.unfollows;
+    } else {
+      // No label matched: record what the API actually sent so the
+      // next adjustment starts from the observed labels, not a guess.
+      const labels = followsBreakdownLabels_(follows.data);
+      if (labels.length) {
+        errors.push('follows_and_unfollows labels: [' + labels.join(', ') + ']');
+      }
     }
   }
   result.detail_error = joinSnsErrors_(errors);
@@ -875,10 +992,15 @@ function fetchInstagramAccountDetail_() {
 }
 
 // Reads the follows/unfollows split out of a follows_and_unfollows
-// total_value response. Dimension values are matched as whole tokens
-// (FOLLOWS / UNFOLLOWS): the follower/non-follower labels used by
-// the views breakdown deliberately do not match, so an unexpected
-// labelling yields null instead of a wrong split.
+// total_value response. Matching is substring-based and
+// case-insensitive — a value containing UNFOLLOW is the unfollows
+// side, any other value containing FOLLOW is the follows side — so
+// label drift (FOLLOW / FOLLOWS / follow / FOLLOWER_FOLLOWS) is
+// absorbed. The one deliberate exception is the views breakdown's
+// own labels: the exact tokens FOLLOWER and NON_FOLLOWER never
+// count as a split, so a views-shaped response still yields null
+// instead of a wrong split. When nothing matches, the caller
+// records the observed labels via followsBreakdownLabels_.
 function parseFollowsBreakdown_(data) {
   const entry = data && Array.isArray(data.data) ? data.data[0] : null;
   const totalValue = entry && entry.total_value;
@@ -900,17 +1022,54 @@ function parseFollowsBreakdown_(data) {
       const dims = ((row && row.dimension_values) || []).map((dim) =>
         String(dim).toUpperCase()
       );
-      if (dims.includes('UNFOLLOWS') || dims.includes('UNFOLLOW')) {
-        unfollows = value;
-      } else if (dims.includes('FOLLOWS') || dims.includes('FOLLOW')) {
-        follows = value;
-      }
+      dims.forEach((dim) => {
+        if (dim.includes('UNFOLLOW')) {
+          unfollows = value;
+        } else if (
+          dim.includes('FOLLOW') &&
+          dim !== 'FOLLOWER' &&
+          dim !== 'NON_FOLLOWER' &&
+          dim !== 'NON-FOLLOWER'
+        ) {
+          follows = value;
+        }
+      });
     });
   });
   if (follows === null && unfollows === null) {
     return null;
   }
   return { follows, unfollows };
+}
+
+// Lists the dimension values a follows_and_unfollows response
+// actually carried on its follow_type breakdown (original casing,
+// deduplicated, in response order), or an empty list when the
+// response has no such breakdown. Used only to make an unmatched
+// labelling observable in instagram.detail_error; the values are
+// API labels, never secrets or URLs.
+function followsBreakdownLabels_(data) {
+  const entry = data && Array.isArray(data.data) ? data.data[0] : null;
+  const totalValue = entry && entry.total_value;
+  if (!totalValue || !Array.isArray(totalValue.breakdowns)) {
+    return [];
+  }
+  const labels = [];
+  totalValue.breakdowns.forEach((breakdown) => {
+    const keys = (breakdown && breakdown.dimension_keys) || [];
+    if (!keys.includes('follow_type')) {
+      return;
+    }
+    ((breakdown && breakdown.results) || []).forEach((row) => {
+      ((row && row.dimension_values) || []).forEach((dim) => {
+        const label = String(dim);
+        if (!labels.includes(label)) {
+          labels.push(label);
+        }
+      });
+    });
+  });
+  return labels;
 }
 
 // Follower demographics (period=lifetime): age/gender pairs, top
@@ -1322,6 +1481,7 @@ function collectSnsCounts() {
       accounts_engaged_30d: igDetail.accounts_engaged_30d,
       interactions_30d: igDetail.interactions_30d,
       profile_links_taps_30d: igDetail.profile_links_taps_30d,
+      profile_links_taps_source: igDetail.profile_links_taps_source,
       follows_30d: igDetail.follows_30d,
       unfollows_30d: igDetail.unfollows_30d,
       demographics: igDemographics.demographics,
@@ -1611,6 +1771,10 @@ if (typeof exports !== 'undefined') {
   exports.fetchAccountInsightTotal_ = fetchAccountInsightTotal_;
   exports.fetchInstagramAccountDetail_ = fetchInstagramAccountDetail_;
   exports.parseFollowsBreakdown_ = parseFollowsBreakdown_;
+  exports.followsBreakdownLabels_ = followsBreakdownLabels_;
+  exports.parseInsightsTotalValue_ = parseInsightsTotalValue_;
+  exports.parseInsightsDailySum_ = parseInsightsDailySum_;
+  exports.fetchProfileLinksTaps_ = fetchProfileLinksTaps_;
   exports.fetchInstagramDemographics_ = fetchInstagramDemographics_;
   exports.parseDemographicsBreakdown_ = parseDemographicsBreakdown_;
   exports.fetchInstagramRecentMedia_ = fetchInstagramRecentMedia_;

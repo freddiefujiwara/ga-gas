@@ -401,6 +401,8 @@ describe('SNS follower counts', () => {
           non_follower_pct: 96.3,
           insights_error: null,
           reach_30d: 5000,
+          profile_links_taps_30d: 46,
+          profile_links_taps_source: 'daily_sum',
           demographics: { age_gender: [{ key: '25-34/F', value: 500 }] },
           recent_media: [{ id: 'media-1', caption: 'a caption' }],
         },
@@ -422,6 +424,7 @@ describe('SNS follower counts', () => {
       );
       const text = outputs[outputs.length - 1].text;
       expect(text).not.toContain('recent_media');
+      expect(text).not.toContain('profile_links_taps');
       expect(text).not.toContain('demographics');
       expect(text).not.toContain('total_views');
       expect(text).not.toContain('recent_videos');
@@ -479,6 +482,7 @@ describe('SNS follower counts', () => {
         accounts_engaged_30d: 1200,
         interactions_30d: { total: 3000, likes: 2000, comments: 300, shares: 400, saves: 300 },
         profile_links_taps_30d: 46,
+        profile_links_taps_source: 'total_value',
         follows_30d: 180,
         unfollows_30d: 30,
         demographics: {
@@ -553,6 +557,7 @@ describe('SNS follower counts', () => {
         accounts_engaged_30d: null,
         interactions_30d: { total: null, likes: null, comments: null, shares: null, saves: null },
         profile_links_taps_30d: null,
+        profile_links_taps_source: null,
         follows_30d: null,
         unfollows_30d: null,
         demographics: { age_gender: null, top_cities: null, top_countries: null },
@@ -1121,6 +1126,7 @@ describe('SNS follower counts', () => {
         accounts_engaged_30d: 1200,
         interactions_30d: { total: 3000, likes: 2000, comments: 300, shares: 400, saves: 300 },
         profile_links_taps_30d: 46,
+        profile_links_taps_source: 'total_value',
         follows_30d: 180,
         unfollows_30d: 30,
         detail_error: null,
@@ -1181,6 +1187,181 @@ describe('SNS follower counts', () => {
       ).toBeNull();
       expect(Code.parseFollowsBreakdown_(null)).toBeNull();
       expect(Code.parseFollowsBreakdown_({ data: [] })).toBeNull();
+    });
+
+    it('parseFollowsBreakdown_ tolerates label drift but never the views labels', () => {
+      const bodyWith = (pairs) =>
+        totalValueBody('follows_and_unfollows', 0, [
+          {
+            dimension_keys: ['follow_type'],
+            results: pairs.map(([dim, value]) => ({
+              dimension_values: [dim],
+              value,
+            })),
+          },
+        ]);
+      expect(
+        Code.parseFollowsBreakdown_(bodyWith([['follow', 10], ['unfollow', 2]]))
+      ).toEqual({ follows: 10, unfollows: 2 });
+      expect(
+        Code.parseFollowsBreakdown_(bodyWith([['FOLLOW', 10], ['UNFOLLOW', 2]]))
+      ).toEqual({ follows: 10, unfollows: 2 });
+      expect(
+        Code.parseFollowsBreakdown_(bodyWith([['FOLLOWER_FOLLOWS', 7]]))
+      ).toEqual({ follows: 7, unfollows: null });
+      expect(
+        Code.parseFollowsBreakdown_(bodyWith([['GAINED', 7], ['LOST', 1]]))
+      ).toBeNull();
+      expect(
+        Code.followsBreakdownLabels_(bodyWith([['GAINED', 7], ['LOST', 1]]))
+      ).toEqual(['GAINED', 'LOST']);
+      expect(Code.followsBreakdownLabels_(null)).toEqual([]);
+      expect(Code.followsBreakdownLabels_({ data: [] })).toEqual([]);
+    });
+
+    it('records the observed follows labels when no label matches', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      detailHandler({
+        follows: () =>
+          res(
+            200,
+            totalValueBody('follows_and_unfollows', 8, [
+              {
+                dimension_keys: ['follow_type'],
+                results: [
+                  { dimension_values: ['GAINED'], value: 7 },
+                  { dimension_values: ['LOST'], value: 1 },
+                ],
+              },
+            ])
+          ),
+      });
+      const detail = Code.fetchInstagramAccountDetail_();
+      expect(detail.follows_30d).toBeNull();
+      expect(detail.unfollows_30d).toBeNull();
+      expect(detail.detail_error).toContain(
+        'follows_and_unfollows labels: [GAINED, LOST]'
+      );
+      expect(detail.detail_error).not.toContain('meta-token');
+    });
+
+    it('parseInsightsTotalValue_ and parseInsightsDailySum_ read only their own form', () => {
+      const both = {
+        data: [
+          {
+            name: 'profile_links_taps',
+            period: 'day',
+            total_value: { value: 9 },
+            values: [{ value: 3 }, { value: 4 }],
+          },
+        ],
+      };
+      expect(Code.parseInsightsTotalValue_(both)).toBe(9);
+      expect(Code.parseInsightsDailySum_(both)).toBe(7);
+      expect(
+        Code.parseInsightsTotalValue_({ data: [{ values: [{ value: 1 }] }] })
+      ).toBeNull();
+      expect(
+        Code.parseInsightsDailySum_({ data: [{ total_value: { value: 1 } }] })
+      ).toBeNull();
+      expect(Code.parseInsightsTotalValue_(null)).toBeNull();
+      expect(Code.parseInsightsDailySum_(null)).toBeNull();
+    });
+
+    const tapsDetailHandler = ({ firstBody, secondBody }) => {
+      const totals = {
+        reach: 5000,
+        accounts_engaged: 1200,
+        total_interactions: 3000,
+        likes: 2000,
+        comments: 300,
+        shares: 400,
+        saves: 300,
+      };
+      const calls = { taps: 0 };
+      fetchHandler = (url) => {
+        if (url.includes('metric=follows_and_unfollows')) {
+          return res(200, followsBreakdownBody());
+        }
+        if (url.includes('/insights')) {
+          const metric = metricFromUrl(url);
+          if (metric === 'profile_links_taps') {
+            calls.taps += 1;
+            return res(200, calls.taps === 1 ? firstBody : secondBody);
+          }
+          if (metric in totals) {
+            return res(200, totalValueBody(metric, totals[metric]));
+          }
+          throw new Error('unexpected insights metric: ' + metric);
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+      return calls;
+    };
+
+    it('falls back to the daily sum when the taps total_value is 0', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      const calls = tapsDetailHandler({
+        firstBody: totalValueBody('profile_links_taps', 0),
+        secondBody: {
+          data: [
+            {
+              name: 'profile_links_taps',
+              period: 'day',
+              values: [{ value: 3 }, { value: 4 }, { value: 0 }],
+            },
+          ],
+        },
+      });
+      const detail = Code.fetchInstagramAccountDetail_();
+      expect(detail.profile_links_taps_30d).toBe(7);
+      expect(detail.profile_links_taps_source).toBe('daily_sum');
+      expect(calls.taps).toBe(2);
+    });
+
+    it('sums daily values from the first response when its total_value is 0', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      const calls = tapsDetailHandler({
+        firstBody: {
+          data: [
+            {
+              name: 'profile_links_taps',
+              period: 'day',
+              total_value: { value: 0 },
+              values: [{ value: 5 }, { value: 6 }],
+            },
+          ],
+        },
+      });
+      const detail = Code.fetchInstagramAccountDetail_();
+      expect(detail.profile_links_taps_30d).toBe(11);
+      expect(detail.profile_links_taps_source).toBe('daily_sum');
+      expect(calls.taps).toBe(1);
+    });
+
+    it('keeps the total_value form when it is positive', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      const calls = tapsDetailHandler({
+        firstBody: totalValueBody('profile_links_taps', 46),
+      });
+      const detail = Code.fetchInstagramAccountDetail_();
+      expect(detail.profile_links_taps_30d).toBe(46);
+      expect(detail.profile_links_taps_source).toBe('total_value');
+      expect(calls.taps).toBe(1);
+    });
+
+    it('nulls the taps and records the error when the request fails', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      detailHandler({
+        errors: {
+          profile_links_taps: () =>
+            res(400, { error: { message: 'taps unsupported', code: 100 } }),
+        },
+      });
+      const detail = Code.fetchInstagramAccountDetail_();
+      expect(detail.profile_links_taps_30d).toBeNull();
+      expect(detail.profile_links_taps_source).toBeNull();
+      expect(detail.detail_error).toContain('profile_links_taps: HTTP 400 code=100');
     });
   });
 
