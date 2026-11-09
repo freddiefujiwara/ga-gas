@@ -727,6 +727,7 @@ describe('SNS follower counts', () => {
         media_error: null,
       },
       threads: { followers: 252 },
+      facebook: { followers: 321 },
     });
 
     const expectedAccountValues = [
@@ -748,9 +749,12 @@ describe('SNS follower counts', () => {
     });
 
     it('builds the account row from a snapshot fixture', () => {
+      // The trailing cell is the facebook_followers column, appended
+      // after yt_video_count when Facebook joined the snapshot.
       expect(Code.buildSnsHistoryAccountRow_(fixtureSnapshot())).toEqual([
         '2026-11-09T00:00:00.000Z',
         ...expectedAccountValues,
+        321,
       ]);
     });
 
@@ -821,7 +825,12 @@ describe('SNS follower counts', () => {
       expect(openById).toHaveBeenCalledWith('history-sheet-id');
       expect(sheets.account.rows[0]).toEqual(Code.SNS_HISTORY_ACCOUNT_COLUMNS);
       expect(sheets.account.rows).toHaveLength(2);
-      expect(sheets.account.rows[1].slice(1)).toEqual(expectedAccountValues);
+      // No Facebook token in this scenario: the trailing
+      // facebook_followers cell stays blank.
+      expect(sheets.account.rows[1].slice(1)).toEqual([
+        ...expectedAccountValues,
+        '',
+      ]);
       expect(sheets.media.rows[0]).toEqual(Code.SNS_HISTORY_MEDIA_COLUMNS);
       expect(sheets.media.rows).toHaveLength(3);
       expect(sheets.media.rows[1].slice(1, 7)).toEqual([
@@ -840,8 +849,14 @@ describe('SNS follower counts', () => {
       Code.appendSnsHistory_(fixtureSnapshot());
       expect(sheets.account.rows).toHaveLength(3);
       expect(sheets.account.rows[0]).toEqual(Code.SNS_HISTORY_ACCOUNT_COLUMNS);
-      expect(sheets.account.rows[1].slice(1)).toEqual(expectedAccountValues);
-      expect(sheets.account.rows[2].slice(1)).toEqual(expectedAccountValues);
+      expect(sheets.account.rows[1].slice(1)).toEqual([
+        ...expectedAccountValues,
+        321,
+      ]);
+      expect(sheets.account.rows[2].slice(1)).toEqual([
+        ...expectedAccountValues,
+        321,
+      ]);
       expect(sheets.media.rows).toHaveLength(5);
       expect(sheets.media.rows[0]).toEqual(Code.SNS_HISTORY_MEDIA_COLUMNS);
 

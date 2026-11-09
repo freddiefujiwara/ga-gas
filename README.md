@@ -32,7 +32,7 @@ Muse の API 接続の仕組みは OAuth の入口が単一ドメインのサー
 
 ## SNSフォロワー数（action=sns_counts）
 
-YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得し、保存済みスナップショットだけを認証なしで返す。
+YouTube・Instagram・Threads・Facebook のフォロワー数を GAS 自身が定期取得し、保存済みスナップショットだけを認証なしで返す。
 
 - 取得：`collectSnsCounts` を時間主導型トリガー（6時間ごと）で実行。トリガーはデプロイでは入らないため、エディタで `setupSnsTriggers` を1回実行して設置する
 - 保存先：スクリプトプロパティ `SNS_COUNTS_SNAPSHOT`（各SNSの数値＋取得日時 collected_at）
@@ -41,6 +41,8 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - Instagram / Threads：スクリプトプロパティ `META_ACCESS_TOKEN`（Meta の長期ユーザートークン）で Graph API から取得。`META_APP_ID` / `META_APP_SECRET` を設定すると、期限が近づいたトークンを `fb_exchange_token` で自動延長する（有効期限は `META_TOKEN_EXPIRES_AT` に記録）
 - Threads 専用トークンを使う場合は `META_THREADS_ACCESS_TOKEN` を設定する（未設定なら `META_ACCESS_TOKEN` で代用）。その有効期限は `META_THREADS_TOKEN_EXPIRES_AT` に記録され、`th_refresh_token` で自動延長される
 - Threads 専用アプリ（ユースケース「Access the Threads API」）のトークンは、GAS 内で完結して取得できる。`THREADS_APP_ID`（Threads API の Settings 画面上部の Threads app ID。Meta のアプリIDとは別物）と `THREADS_APP_SECRET` をスクリプトプロパティに設定し、同じ Settings 画面の「Redirect Callback URLs」にこの Web アプリの /exec のURLを登録したうえで、エディタで `threadsAuthorizeUrl` を実行してログのURLから認可すると、コールバックが長期トークンを `META_THREADS_ACCESS_TOKEN` に保存する。認可で求めるスコープは `threads_basic,threads_manage_insights`（フォロワー数はプロフィールではなく `threads_insights` から取るため、インサイト側の権限が要る）。スコープを広げたときは、自動更新では権限が増えないので認可をやり直すこと。取得日時が `THREADS_TOKEN_AT` に記録され、50日以上経つと `refreshThreadsTokenIfNeeded` が取得の前に自動更新する（失敗時はスナップショットの `threads.threads_error` に要約が入る）
+- Facebook ページのトークンも、Threads と同じく GAS 内で完結して取得できる。通常の Meta アプリ（Facebook ログイン製品を使う。Threads 専用アプリとは別）に `FACEBOOK_APP_ID` / `FACEBOOK_APP_SECRET` をスクリプトプロパティに設定し、Facebook ログインの「Valid OAuth Redirect URIs」にこの Web アプリの /exec のURL＋`?action=facebook_callback` を登録したうえで、エディタで `facebookAuthorizeUrl` を実行してログのURLから認可すると、コールバック（`action=facebook_callback`）が長期ユーザートークンを `FACEBOOK_USER_ACCESS_TOKEN` に、対象ページのアクセストークンと ID を `FACEBOOK_PAGE_ACCESS_TOKEN` / `FACEBOOK_PAGE_ID` に保存する。対象ページは、事前に `FACEBOOK_PAGE_ID` を設定しておけばそのページ、未設定なら `me/accounts` の先頭のページ。認可で求めるスコープは `pages_show_list,pages_read_engagement`（ページ自身の投稿とインサイトを読むのに必要な分だけ。訪問者の投稿など他人のコンテンツを読む `pages_read_user_content` は、取得対象でないため求めない）。リダイレクト URI は `FACEBOOK_REDIRECT_URI` で上書きできる。取得日時が `FACEBOOK_TOKEN_AT`、有効期限が `FACEBOOK_TOKEN_EXPIRES_AT` に記録され、期限が近づくと `refreshFacebookTokenIfNeeded` がユーザートークンを再交換し、ページトークンも取り直す（失敗時はスナップショットの `facebook.facebook_error` に要約が入る）
+- Facebook のフォロワー数はスナップショットの `facebook.followers` に入り、認証必須の `action=sns_detail` では常に返るが、公開の `action=sns_counts` には**まだ含めていない**（コード内の `SNS_COUNTS_INCLUDE_FACEBOOK = false`）。トップページの「SNS延べフォロワー数」は sns_counts の射影を合算して作るため、含めるかどうかは合計の意味を変える判断として本人が決める。含める場合はこの定数を `true` に変えるだけでよい
 - トークン未設定・失効のサービスは null になり、他のサービスの取得は続く
 - Instagram の KPI（メインアカウントのみ、スナップショットの `instagram` 内）：`media_count`（投稿数、`instagram_basic` で取得可）、`views_30d`（過去30日の Views 合計）と `non_follower_pct`（そのうちフォロワー以外％、小数1桁）はインサイト由来で、`META_ACCESS_TOKEN` に `instagram_manage_insights` 権限が付くまでは null のまま（付与後は自動で数値が入る）。インサイト取得が失敗した場合は `instagram.insights_error` に API エラーの要約（HTTP ステータスと Graph API の code / subcode / message、秘密値は含まない）が入り、日別合計へのフォールバック時もその旨が記録される（成功時は null）
 - なお `action=sns_counts` が返すのは公開用の射影（上記のフォロワー数と KPI のみ）で、次節の詳細データは公開アクションには一切含まれない
@@ -57,12 +59,14 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - YouTube：`youtube.total_views`（総再生数）と `youtube.video_count`（動画数）を追加。`youtube.recent_videos[]`（新しい順・最大10件）= `{id, title, published_at, views, likes, comments, url}`。失敗時は `youtube.youtube_error`
 - Threads アカウント全体（過去30日）：`threads.views_30d`、`threads.interactions_30d`（total / likes / replies / reposts / quotes）。`threads_insights` から metric ごとに取得し、total_value があればそれを、なければ日別 values の合計を読む（フォロワー数だけは現在値なので従来どおり別扱い）。失敗時は `threads.detail_error`
 - Threads 投稿ごと（新しい順・最大30件）：`threads.recent_posts[]` = `{id, type, posted_at, text（全文、上限2000字）, permalink, views, likes, replies, reposts, quotes}`。投稿一覧は本人の `threads` エッジ、数値は各投稿の media insights から。insights が取れない投稿（他人の投稿のリポスト等）は数値 null のまま残り、失敗件数は `threads.posts_error` に要約される
+- Facebook アカウント全体（過去28日）：`facebook.views_28d`、`unique_viewers_28d`、`engagement_28d`、`profile_visits_28d`、`new_followers_28d` / `unfollowers_28d`。ページ insights から metric ごとに取得し、total_value があればそれを、なければ日別 values の合計を読む。指標名は現行名（`page_media_view` 系）を先に試し、API が知らない名前なら従来名（`page_impressions` 系）へフォールバックする。失敗時は `facebook.detail_error`
+- Facebook 投稿ごと（新しい順・最大30件）：`facebook.recent_posts[]` = `{id, posted_at, message（全文、上限2000字）, permalink, views, unique_viewers, engagements, clicks, link_clicks, saves}`。投稿一覧はページの `published_posts` エッジ、数値は各投稿の post insights から（metric セットを段階的に絞って再試行する）。link_clicks は `post_clicks_by_type` の内訳から「link clicks」だけを取り出す。ページ投稿の insights には保存（saves）の指標が無いため `saves` は常に null。投稿一覧自体が取れない場合は `recent_posts` が null になり、投稿ごとの失敗件数は `facebook.posts_error` に要約される
 
 ## SNS履歴（スプレッドシート）
 
 スナップショットは取得のたびに上書きされるため、推移を残す目的で `collectSnsCounts` が Google スプレッドシートへも追記する。スクリプトプロパティ `SNS_HISTORY_SHEET_ID` にスプレッドシートの ID が設定されているときだけ動作し、未設定なら何もしない（ID はコードに書かない）。
 
-- `account` シート：取得ごとに1行。列は collected_at、ig_followers、ig_anemone_followers、threads_followers、youtube_subscribers、total_followers（Instagram メイン＋Threads＋YouTube、トップページと同じ定義）、media_count、views_30d、non_follower_pct、reach_30d、accounts_engaged_30d、interactions_total / likes / comments / shares / saves、profile_links_taps_30d、profile_links_taps_source、follows_30d、unfollows_30d、yt_total_views、yt_video_count。null の項目は空欄
+- `account` シート：取得ごとに1行。列は collected_at、ig_followers、ig_anemone_followers、threads_followers、youtube_subscribers、total_followers（Instagram メイン＋Threads＋YouTube、トップページと同じ定義）、media_count、views_30d、non_follower_pct、reach_30d、accounts_engaged_30d、interactions_total / likes / comments / shares / saves、profile_links_taps_30d、profile_links_taps_source、follows_30d、unfollows_30d、yt_total_views、yt_video_count、facebook_followers（末尾に追加した列。total_followers の定義には含めない）。null の項目は空欄
 - `media` シート：`recent_media` の投稿ごとに1行。列は collected_at、media_id、posted_at、type、caption、permalink、views、reach、likes、comments、shares、saves、avg_watch_sec、total_watch_sec
 - 両シートとも無ければ自動作成し、1行目が空（シートが空）のときだけヘッダー行を書く
 - 追記に失敗しても取得自体は成功として扱い、実行ログに `SNS history append failed: <要約>` が1行出る（要約に秘密値・URL は含めない）
@@ -75,6 +79,10 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 ## 診断関数 `debugThreadsFollowers` / `debugThreadsPosts`（手動実行専用）
 
 Threads の数値が取れないときの切り分け用。`debugThreadsFollowers` はフォロワー数取得（`threads_insights` の `followers_count`）の生応答を、`debugThreadsPosts` は詳細取得の3リクエスト（アカウント指標の合算リクエスト、投稿一覧 limit 3、先頭投稿の media insights）の生応答と、本番パーサが読み取った値を実行ログに出す（トークンは伏せる）。どちらもトリガーや doGet からは呼ばれず、スナップショットにも影響しない。
+
+## 診断関数 `debugFacebook`（手動実行専用）
+
+Facebook の数値が取れないときの切り分け用。プロパティの設定有無（値そのものは出さない）、ページ情報（`fan_count`）の生応答と読み取り値、本番のアカウント詳細取得が読んだ値、投稿一覧（limit 3）と先頭投稿の post insights の生応答と読み取り値を実行ログに出す（トークンは伏せる）。トリガーや doGet からは呼ばれず、スナップショットにも影響しない。ページ insights の指標名の現行名／従来名のどちらが生きているかは、この生応答で確定させる想定。
 
 ## Setup
 
