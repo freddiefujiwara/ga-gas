@@ -383,6 +383,10 @@ function issueShareToken() {
 // When the insights calls fail, instagram.insights_error holds a
 // short secret-free summary of the API error (null on success) so the
 // failure is visible in the snapshot instead of silently null.
+// The Threads section likewise carries detail beyond the follower
+// count — the account metrics and per-post insights described in
+// the Threads detail section below — under the same rule, with
+// threads.detail_error / threads.posts_error as the summaries.
 
 const SNS_SNAPSHOT_PROPERTY = 'SNS_COUNTS_SNAPSHOT';
 const SNS_YOUTUBE_CHANNEL_ID = 'UCbiDZXbr391oT_vsRiqwPFg';
@@ -493,7 +497,21 @@ function buildEmptySnsDetail_() {
       recent_media: null,
       media_error: null,
     },
-    threads: { followers: null, threads_error: null },
+    threads: {
+      followers: null,
+      threads_error: null,
+      views_30d: null,
+      interactions_30d: {
+        total: null,
+        likes: null,
+        replies: null,
+        reposts: null,
+        quotes: null,
+      },
+      detail_error: null,
+      recent_posts: null,
+      posts_error: null,
+    },
   };
 }
 
@@ -535,6 +553,22 @@ function fetchInstagramFollowers_(userId) {
   );
 }
 
+// The two inputs every Threads fetch needs, resolved the same way
+// everywhere: the dedicated Threads token when set (falling back
+// to the shared Meta token), and the authorized account's Threads
+// user id from the OAuth flow (THREADS_USER_ID), with the constant
+// as the pre-OAuth fallback.
+function threadsToken_() {
+  return (
+    getScriptProperty_('META_THREADS_ACCESS_TOKEN') ||
+    getScriptProperty_('META_ACCESS_TOKEN')
+  );
+}
+
+function threadsUserId_() {
+  return getScriptProperty_('THREADS_USER_ID') || SNS_THREADS_USER_ID;
+}
+
 // The one Threads insights request both the production fetch and
 // debugThreadsFollowers make: the followers_count metric on the
 // user's threads_insights edge. The URL carries no token; callers
@@ -545,15 +579,11 @@ function threadsFollowersInsightsUrl_(userId) {
 }
 
 function fetchThreadsFollowers_() {
-  const token =
-    getScriptProperty_('META_THREADS_ACCESS_TOKEN') ||
-    getScriptProperty_('META_ACCESS_TOKEN');
+  const token = threadsToken_();
   if (!token) {
     return null;
   }
-  // The OAuth flow stores the authorized account's Threads user id in
-  // THREADS_USER_ID; the constant is only the pre-OAuth fallback.
-  const userId = getScriptProperty_('THREADS_USER_ID') || SNS_THREADS_USER_ID;
+  const userId = threadsUserId_();
   try {
     const res = UrlFetchApp.fetch(
       threadsFollowersInsightsUrl_(userId) +
@@ -598,6 +628,299 @@ function parseThreadsFollowersCount_(data) {
     }
   }
   return null;
+}
+
+// --- Threads detail (account metrics + per-post, sns_detail only) --
+// Threads started as followers-only (the public snapshot). The /ga
+// Threads tab now wants the same depth as Instagram, so
+// collectSnsCounts() also gathers, into the snapshot's threads
+// section (served only through the authenticated action=sns_detail;
+// the public projection keeps returning followers only):
+//   - account-level totals for the last 30 days from the user's
+//     threads_insights edge: views plus the interaction split
+//     (likes / replies / reposts / quotes), failures summarised in
+//     threads.detail_error;
+//   - the newest posts (id, text, timestamp, permalink) from the
+//     user's threads edge, each with its media insights (views /
+//     likes / replies / reposts / quotes), failures summarised in
+//     threads.posts_error.
+// Every fetch fails independently, exactly like the Instagram
+// detail: an unobtainable value stays null and the rest of the
+// snapshot is unaffected, and error summaries are built from
+// response status/body only, never from a request URL.
+
+const SNS_THREADS_RECENT_POSTS_LIMIT = 30;
+const THREADS_MEDIA_INSIGHT_METRICS = 'views,likes,replies,reposts,quotes';
+const THREADS_ACCOUNT_METRICS = ['views', 'likes', 'replies', 'reposts', 'quotes'];
+
+// One account-level threads_insights request for a single metric
+// over the shared 30-day window. The URL carries no token; callers
+// append '&access_token=...' themselves.
+function threadsAccountInsightsUrl_(userId, metric, window) {
+  return (
+    THREADS_GRAPH_BASE +
+    userId +
+    '/threads_insights?metric=' +
+    metric +
+    '&since=' +
+    window.since +
+    '&until=' +
+    window.until
+  );
+}
+
+// Fetches one account-level Threads metric as a 30-day total.
+// Returns { value, error } and never throws. The total is read with
+// parseViewsDailyTotal_ (total_value when the response carries one,
+// otherwise the sum of the per-day values): the reading is
+// metric-agnostic, and for these flow metrics both forms mean the
+// 30-day total — unlike followers_count, which is a current total
+// and keeps its own parser above.
+function fetchThreadsAccountInsightTotal_(metric) {
+  const token = threadsToken_();
+  const res = fetchInsightsJson_(
+    threadsAccountInsightsUrl_(threadsUserId_(), metric, snsInsightsWindow_()) +
+      '&access_token=' +
+      encodeURIComponent(token)
+  );
+  if (res.error) {
+    return { value: null, error: metric + ': ' + res.error };
+  }
+  return { value: parseViewsDailyTotal_(res.data), error: null };
+}
+
+// Account-level detail for Threads (last 30 days): views and the
+// interaction totals. Each metric is a separate request, so one
+// rejected metric nulls only itself. interactions_30d.total is the
+// sum of the parts that came back, and stays null when none did.
+function fetchThreadsAccountDetail_() {
+  const result = {
+    views_30d: null,
+    interactions_30d: {
+      total: null,
+      likes: null,
+      replies: null,
+      reposts: null,
+      quotes: null,
+    },
+    detail_error: null,
+  };
+  if (!threadsToken_()) {
+    return result;
+  }
+  const errors = [];
+  const grab = (metric) => {
+    const fetched = fetchThreadsAccountInsightTotal_(metric);
+    if (fetched.error) {
+      errors.push(fetched.error);
+    }
+    return fetched.value;
+  };
+  result.views_30d = grab('views');
+  const likes = grab('likes');
+  const replies = grab('replies');
+  const reposts = grab('reposts');
+  const quotes = grab('quotes');
+  const parts = [likes, replies, reposts, quotes].filter(
+    (value) => value !== null
+  );
+  result.interactions_30d = {
+    total: parts.length
+      ? parts.reduce((sum, value) => sum + value, 0)
+      : null,
+    likes,
+    replies,
+    reposts,
+    quotes,
+  };
+  result.detail_error = joinSnsErrors_(errors);
+  return result;
+}
+
+// The user's own threads list (newest first). The URL carries no
+// token; callers append '&access_token=...' themselves so the
+// diagnostic can print the request with the token redacted.
+function threadsPostListUrl_(userId, limit) {
+  return (
+    THREADS_GRAPH_BASE +
+    userId +
+    '/threads?fields=id,text,timestamp,permalink,media_type&limit=' +
+    limit
+  );
+}
+
+// One snapshot entry for a Threads post, with the insight values
+// starting null (filled in by fetchThreadsPostInsights_). The text
+// is passed through under the same safety cap as Instagram
+// captions.
+function buildThreadsPostEntry_(post) {
+  const text = post && post.text != null ? String(post.text) : '';
+  return {
+    id: post && post.id != null ? String(post.id) : null,
+    type: (post && post.media_type) || null,
+    posted_at: (post && post.timestamp) || null,
+    text: text.slice(0, SNS_CAPTION_MAX_LENGTH),
+    permalink: (post && post.permalink) || null,
+    views: null,
+    likes: null,
+    replies: null,
+    reposts: null,
+    quotes: null,
+  };
+}
+
+// Maps one Threads media insights response to the snapshot's key
+// names. Metrics absent from the response (or not numeric) stay out
+// of the map, so the caller's nulls remain for them.
+function parseThreadsMediaInsights_(data) {
+  const values = {};
+  const entries = data && Array.isArray(data.data) ? data.data : [];
+  entries.forEach((entry) => {
+    if (!entry || !entry.name) {
+      return;
+    }
+    let raw = null;
+    if (Array.isArray(entry.values) && entry.values.length) {
+      raw = entry.values[0] && entry.values[0].value;
+    }
+    if (raw == null && entry.total_value) {
+      raw = entry.total_value.value;
+    }
+    const num = Number(raw);
+    if (!Number.isFinite(num)) {
+      return;
+    }
+    if (THREADS_ACCOUNT_METRICS.indexOf(entry.name) >= 0) {
+      values[entry.name] = num;
+    }
+  });
+  return values;
+}
+
+// Per-post insights for one Threads post. Returns { values, error };
+// a post the insights edge refuses (a repost of someone else's
+// post, say) keeps its nulls and contributes one error line.
+function fetchThreadsPostInsights_(post, token) {
+  const empty = {
+    views: null,
+    likes: null,
+    replies: null,
+    reposts: null,
+    quotes: null,
+  };
+  if (!post || post.id == null) {
+    return { values: empty, error: null };
+  }
+  const res = fetchInsightsJson_(
+    THREADS_GRAPH_BASE +
+      post.id +
+      '/insights?metric=' +
+      THREADS_MEDIA_INSIGHT_METRICS +
+      '&access_token=' +
+      encodeURIComponent(token)
+  );
+  if (res.error) {
+    return { values: empty, error: String(post.id) + ': ' + res.error };
+  }
+  return {
+    values: Object.assign({}, empty, parseThreadsMediaInsights_(res.data)),
+    error: null,
+  };
+}
+
+// The newest Threads posts with their per-post insights, mirroring
+// fetchInstagramRecentMedia_: the list fetch failing nulls the
+// whole section, while per-post failures only null that post's
+// numbers and are counted into posts_error.
+function fetchThreadsRecentPosts_() {
+  const token = threadsToken_();
+  if (!token) {
+    return { recent_posts: null, posts_error: null };
+  }
+  const listRes = fetchInsightsJson_(
+    threadsPostListUrl_(threadsUserId_(), SNS_THREADS_RECENT_POSTS_LIMIT) +
+      '&access_token=' +
+      encodeURIComponent(token)
+  );
+  if (listRes.error) {
+    return { recent_posts: null, posts_error: 'threads list: ' + listRes.error };
+  }
+  const items =
+    listRes.data && Array.isArray(listRes.data.data) ? listRes.data.data : null;
+  if (!items) {
+    return {
+      recent_posts: null,
+      posts_error: 'threads list: response had no threads array',
+    };
+  }
+  const failures = [];
+  const posts = items.slice(0, SNS_THREADS_RECENT_POSTS_LIMIT).map((post) => {
+    const entry = buildThreadsPostEntry_(post);
+    const insights = fetchThreadsPostInsights_(post, token);
+    if (insights.error) {
+      failures.push(insights.error);
+    }
+    Object.assign(entry, insights.values);
+    return entry;
+  });
+  return {
+    recent_posts: posts,
+    posts_error: failures.length
+      ? failures.length +
+        ' of ' +
+        posts.length +
+        ' post insights failed (' +
+        failures[0] +
+        ')'
+      : null,
+  };
+}
+
+// Reads one threads_insights entry (a single metric) as a total:
+// total_value.value when present, otherwise the sum of the per-day
+// values. This is the entry-level twin of parseViewsDailyTotal_,
+// shared by the debugThreadsPosts by-name reading below.
+function threadsInsightEntryTotal_(entry) {
+  if (!entry) {
+    return null;
+  }
+  const totalValue = Number(entry.total_value && entry.total_value.value);
+  if (Number.isFinite(totalValue)) {
+    return totalValue;
+  }
+  if (!Array.isArray(entry.values)) {
+    return null;
+  }
+  let total = 0;
+  let seen = false;
+  entry.values.forEach((row) => {
+    const value = Number(row && row.value);
+    if (Number.isFinite(value)) {
+      total += value;
+      seen = true;
+    }
+  });
+  return seen ? total : null;
+}
+
+// Maps a multi-metric threads_insights response to { name: total },
+// keeping only the metrics that read as numbers. Used by
+// debugThreadsPosts to show what the combined account request
+// actually carries before the per-metric production fetches are
+// trusted.
+function parseThreadsInsightsByName_(data) {
+  const totals = {};
+  const entries = data && Array.isArray(data.data) ? data.data : [];
+  entries.forEach((entry) => {
+    if (!entry || !entry.name) {
+      return;
+    }
+    const total = threadsInsightEntryTotal_(entry);
+    if (total !== null) {
+      totals[entry.name] = total;
+    }
+  });
+  return totals;
 }
 
 function fetchYouTubeSubscribers_() {
@@ -1154,16 +1477,19 @@ function parseViewsDailyTotal_(data) {
 // collectSnsCounts() also gathers the numbers the public snapshot
 // does not need: Instagram account-level insights for the last 30
 // days, follower demographics, per-post insights for the newest
-// media, and YouTube channel totals plus the newest videos. They
-// are stored in the same snapshot and served only through the
-// authenticated action=sns_detail; action=sns_counts keeps returning
-// the small public projection built above.
+// media, YouTube channel totals plus the newest videos, and the
+// Threads account metrics and per-post insights (see the Threads
+// detail section below). They are stored in the same snapshot and
+// served only through the authenticated action=sns_detail;
+// action=sns_counts keeps returning the small public projection
+// built above.
 //
 // Every fetch below fails independently: an unobtainable value stays
 // null and the rest of the snapshot is unaffected. Failures are
 // summarised per section — instagram.detail_error for the account
 // insights and demographics, instagram.media_error for per-post
-// insights, youtube.youtube_error for YouTube — using the same
+// insights, youtube.youtube_error for YouTube, threads.detail_error
+// and threads.posts_error for Threads — using the same
 // secret-free style as instagram.insights_error: summaries are built
 // from response status/body or exception names only, never from a
 // request URL (URLs carry the access token).
@@ -1579,6 +1905,133 @@ function debugThreadsFollowers() {
   Logger.log(
     'parsed followers_count: ' + (parsed === null ? 'null' : parsed)
   );
+}
+
+// --- Manual diagnostics: debugThreadsPosts ------------------------
+// Run by hand from the Apps Script editor after the Threads detail
+// collection (account metrics + per-post insights) is deployed, to
+// see the raw shapes the new requests actually return before
+// trusting the parsed snapshot — the same debug-first step
+// debugThreadsFollowers provided for the follower count. It runs
+// the three new request families once each: the combined account
+// insights request (metric=views,likes,replies,reposts,quotes over
+// the 30-day window), the user's threads list (limit 3, just enough
+// to see the entry shape), and the media insights of the first
+// listed post. Each stage logs its request URL with
+// access_token=<redacted>, the HTTP status and the scrubbed body,
+// plus the values the production parsers read out of it. The stages
+// are independent: a stage that fails or returns nothing usable
+// stops only itself. It is never called from a trigger or from
+// doGet, and it does not touch the snapshot.
+function debugThreadsPosts() {
+  const threadsToken = getScriptProperty_('META_THREADS_ACCESS_TOKEN');
+  Logger.log(
+    'META_THREADS_ACCESS_TOKEN is ' +
+      (threadsToken ? 'set.' : 'not set.')
+  );
+  const token = threadsToken || getScriptProperty_('META_ACCESS_TOKEN');
+  if (!token) {
+    Logger.log('META_ACCESS_TOKEN is not set either; nothing to diagnose.');
+    return;
+  }
+  if (!threadsToken) {
+    Logger.log('Falling back to META_ACCESS_TOKEN (the Instagram token).');
+  }
+  const propertyUserId = getScriptProperty_('THREADS_USER_ID');
+  const userId = propertyUserId || SNS_THREADS_USER_ID;
+  Logger.log(
+    'Threads user id: ' +
+      userId +
+      (propertyUserId
+        ? ' (from THREADS_USER_ID)'
+        : ' (THREADS_USER_ID is not set; using the SNS_THREADS_USER_ID fallback)')
+  );
+  const window = snsInsightsWindow_();
+  const accountData = debugThreadsGet_(
+    'account insights (metric=views,likes,replies,reposts,quotes, last 30 days)',
+    THREADS_GRAPH_BASE +
+      userId +
+      '/threads_insights?metric=' +
+      THREADS_ACCOUNT_METRICS.join(',') +
+      '&since=' +
+      window.since +
+      '&until=' +
+      window.until,
+    token
+  );
+  if (accountData) {
+    Logger.log(
+      'parsed account totals: ' +
+        JSON.stringify(parseThreadsInsightsByName_(accountData))
+    );
+  }
+  const listData = debugThreadsGet_(
+    'threads list (limit 3)',
+    threadsPostListUrl_(userId, 3),
+    token
+  );
+  const items =
+    listData && Array.isArray(listData.data) ? listData.data : null;
+  if (!items || !items.length) {
+    Logger.log('no posts in the list response; skipping media insights.');
+    return;
+  }
+  const firstEntry = buildThreadsPostEntry_(items[0]);
+  Logger.log('first post entry: ' + JSON.stringify(firstEntry));
+  if (firstEntry.id == null) {
+    Logger.log('first post has no id; skipping media insights.');
+    return;
+  }
+  const mediaData = debugThreadsGet_(
+    'media insights for the first post',
+    THREADS_GRAPH_BASE +
+      firstEntry.id +
+      '/insights?metric=' +
+      THREADS_MEDIA_INSIGHT_METRICS,
+    token
+  );
+  if (mediaData) {
+    Logger.log(
+      'parsed media insights: ' +
+        JSON.stringify(parseThreadsMediaInsights_(mediaData))
+    );
+  }
+}
+
+// One GET for debugThreadsPosts: logs the label, the request URL
+// with the token redacted, the HTTP status and the scrubbed body
+// (truncated like the other diagnostics), and returns the parsed
+// body on HTTP 200 — null on any failure, so the calling stage can
+// stop without throwing. The token itself is only ever appended to
+// the real request, never to the logged one.
+function debugThreadsGet_(label, url, token) {
+  Logger.log('=== ' + label + ' ===');
+  Logger.log('GET ' + url + '&access_token=<redacted>');
+  let res;
+  try {
+    res = UrlFetchApp.fetch(
+      url + '&access_token=' + encodeURIComponent(token),
+      { muteHttpExceptions: true }
+    );
+  } catch (err) {
+    Logger.log('fetch exception (' + ((err && err.name) || 'Error') + ')');
+    return null;
+  }
+  const status = res.getResponseCode();
+  Logger.log('HTTP ' + status);
+  const bodyText = res.getContentText();
+  Logger.log(
+    debugScrubToken_(bodyText, token).slice(0, SNS_DEBUG_LOG_LIMIT)
+  );
+  if (status !== 200) {
+    return null;
+  }
+  try {
+    return JSON.parse(bodyText);
+  } catch (err) {
+    Logger.log('response body is not JSON; nothing parsed.');
+    return null;
+  }
 }
 
 // Reads the follows/unfollows split out of a follows_and_unfollows
@@ -2344,6 +2797,8 @@ function collectSnsCounts() {
   const igDemographics = fetchInstagramDemographics_();
   const igMedia = fetchInstagramRecentMedia_();
   const yt = fetchYouTubeChannelDetail_();
+  const thDetail = fetchThreadsAccountDetail_();
+  const thPosts = fetchThreadsRecentPosts_();
   const snapshot = {
     collected_at: new Date().toISOString(),
     youtube: {
@@ -2375,10 +2830,21 @@ function collectSnsCounts() {
     threads: {
       followers: fetchThreadsFollowers_(),
       threads_error: threadsRefreshError,
+      views_30d: thDetail.views_30d,
+      interactions_30d: thDetail.interactions_30d,
+      detail_error: thDetail.detail_error,
+      recent_posts: thPosts.recent_posts,
+      posts_error: thPosts.posts_error,
     },
   };
   if (snapshot.threads.threads_error) {
     console.log('Threads refresh error: ' + snapshot.threads.threads_error);
+  }
+  if (snapshot.threads.detail_error) {
+    console.log('Threads detail error: ' + snapshot.threads.detail_error);
+  }
+  if (snapshot.threads.posts_error) {
+    console.log('Threads posts error: ' + snapshot.threads.posts_error);
   }
   if (igViews.insights_error) {
     console.log('Instagram insights error: ' + igViews.insights_error);
@@ -2716,6 +3182,19 @@ if (typeof exports !== 'undefined') {
   exports.fetchThreadsFollowers_ = fetchThreadsFollowers_;
   exports.parseThreadsFollowersCount_ = parseThreadsFollowersCount_;
   exports.threadsFollowersInsightsUrl_ = threadsFollowersInsightsUrl_;
+  exports.threadsToken_ = threadsToken_;
+  exports.threadsUserId_ = threadsUserId_;
+  exports.threadsAccountInsightsUrl_ = threadsAccountInsightsUrl_;
+  exports.fetchThreadsAccountInsightTotal_ = fetchThreadsAccountInsightTotal_;
+  exports.fetchThreadsAccountDetail_ = fetchThreadsAccountDetail_;
+  exports.threadsPostListUrl_ = threadsPostListUrl_;
+  exports.buildThreadsPostEntry_ = buildThreadsPostEntry_;
+  exports.parseThreadsMediaInsights_ = parseThreadsMediaInsights_;
+  exports.fetchThreadsPostInsights_ = fetchThreadsPostInsights_;
+  exports.fetchThreadsRecentPosts_ = fetchThreadsRecentPosts_;
+  exports.threadsInsightEntryTotal_ = threadsInsightEntryTotal_;
+  exports.parseThreadsInsightsByName_ = parseThreadsInsightsByName_;
+  exports.debugThreadsPosts = debugThreadsPosts;
   exports.debugThreadsFollowers = debugThreadsFollowers;
   exports.fetchYouTubeSubscribers_ = fetchYouTubeSubscribers_;
   exports.buildSnsDetailResponse_ = buildSnsDetailResponse_;

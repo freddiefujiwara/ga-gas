@@ -55,6 +55,8 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - Instagram フォロワー属性（lifetime）：`instagram.demographics` = `age_gender`（`{key, value}` の降順リスト、key は "25-34/F" 形式）、`top_cities` / `top_countries`（各上位10件）。失敗分は `instagram.detail_error` に合算
 - Instagram 投稿ごと（新しい順・最大30件）：`instagram.recent_media[]` = `{id, type, posted_at, caption（80字まで）, permalink, views, reach, likes, comments, shares, saves, avg_watch_sec, total_watch_sec}`。リールの視聴時間はミリ秒→秒に変換。メディア種別で使える metric が違うため、失敗時は metric を絞って再試行する。失敗時は `instagram.media_error`
 - YouTube：`youtube.total_views`（総再生数）と `youtube.video_count`（動画数）を追加。`youtube.recent_videos[]`（新しい順・最大10件）= `{id, title, published_at, views, likes, comments, url}`。失敗時は `youtube.youtube_error`
+- Threads アカウント全体（過去30日）：`threads.views_30d`、`threads.interactions_30d`（total / likes / replies / reposts / quotes）。`threads_insights` から metric ごとに取得し、total_value があればそれを、なければ日別 values の合計を読む（フォロワー数だけは現在値なので従来どおり別扱い）。失敗時は `threads.detail_error`
+- Threads 投稿ごと（新しい順・最大30件）：`threads.recent_posts[]` = `{id, type, posted_at, text（全文、上限2000字）, permalink, views, likes, replies, reposts, quotes}`。投稿一覧は本人の `threads` エッジ、数値は各投稿の media insights から。insights が取れない投稿（他人の投稿のリポスト等）は数値 null のまま残り、失敗件数は `threads.posts_error` に要約される
 
 ## SNS履歴（スプレッドシート）
 
@@ -69,6 +71,10 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 ## 診断関数 `debugSnsInsights`（手動実行専用）
 
 詳細の数値が実態と食い違うときの切り分け用。エディタから手動実行すると、`follows_and_unfollows` と `profile_links_taps` について6つのリクエスト形（A：現行の breakdown=follow_type 形、B：breakdown なし、C：metric_type なし、D：現行の total_value 形、E：metric_type なし＋values の件数・合計、F：period=lifetime）の生応答を実行ログに出す（各応答は先頭3000文字まで、トークンは伏せる）。トリガーや doGet からは呼ばれず、スナップショットにも影響しない。2026-11-09 の本番切り分けで、breakdown=follow_type のラベルは結果の状態（FOLLOWER＝フォローした数、NON_FOLLOWER＝フォローを外した数）を表すことと、profile_links_taps は現行の両形とも 0 だったことが判明済みで、その原因確定のために使う。
+
+## 診断関数 `debugThreadsFollowers` / `debugThreadsPosts`（手動実行専用）
+
+Threads の数値が取れないときの切り分け用。`debugThreadsFollowers` はフォロワー数取得（`threads_insights` の `followers_count`）の生応答を、`debugThreadsPosts` は詳細取得の3リクエスト（アカウント指標の合算リクエスト、投稿一覧 limit 3、先頭投稿の media insights）の生応答と、本番パーサが読み取った値を実行ログに出す（トークンは伏せる）。どちらもトリガーや doGet からは呼ばれず、スナップショットにも影響しない。
 
 ## Setup
 
