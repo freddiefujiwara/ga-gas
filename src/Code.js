@@ -554,6 +554,8 @@ function buildEmptySnsDetail_() {
       profile_links_taps_source: null,
       follows_30d: null,
       unfollows_30d: null,
+      daily_follows: null,
+      daily_follows_error: null,
       demographics: { age_gender: null, top_cities: null, top_countries: null },
       detail_error: null,
       recent_media: null,
@@ -2374,6 +2376,8 @@ function fetchInstagramAccountDetail_() {
     profile_links_taps_source: null,
     follows_30d: null,
     unfollows_30d: null,
+    daily_follows: null,
+    daily_follows_error: null,
     detail_error: null,
   };
   if (!getScriptProperty_('META_ACCESS_TOKEN')) {
@@ -2422,8 +2426,191 @@ function fetchInstagramAccountDetail_() {
       }
     }
   }
+  // The per-day series fails on its own key, not into detail_error:
+  // the /ga chart wants to tell "no data yet" apart from "the
+  // totals are broken", and the totals above already report into
+  // detail_error.
+  const dailyFollows = fetchInstagramDailyFollows_();
+  result.daily_follows = dailyFollows.series;
+  result.daily_follows_error = dailyFollows.error;
   result.detail_error = joinSnsErrors_(errors);
   return result;
+}
+
+// --- Instagram daily follows series --------------------------------
+// Per-day follows/unfollows for the last 30 days, so the /ga
+// Instagram tab can chart follows and unfollows per day and map
+// the day's posts onto the same axis. Meta offers no per-post
+// follow attribution, so the day series plus the post dates (from
+// recent_media) is the closest honest view; the shaping lives
+// here, the mapping lives in the frontend.
+//
+// Date convention: a daily insights value closes its day bucket at
+// end_time, and the bucket's own timezone is not stated in the
+// response (observed end_time values sit at 08:00 UTC, i.e. a
+// Pacific midnight, regardless of the account's timezone). The
+// series therefore dates each bucket by its midpoint read in
+// Asia/Tokyo: the midpoint falls on the JST calendar date that
+// holds most of the bucket for Pacific, UTC and JST buckets
+// alike, so the date is stable whichever timezone the API used.
+// debugInstagramDailyFollows logs the raw end_time values so this
+// convention can be re-checked against production responses.
+const SNS_DAILY_BUCKET_MIDPOINT_MS = 12 * 60 * 60 * 1000;
+const SNS_JST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+function insightsDailyDateKey_(endTime) {
+  const endMs = Date.parse(endTime);
+  if (!Number.isFinite(endMs)) {
+    return null;
+  }
+  const mid = new Date(endMs - SNS_DAILY_BUCKET_MIDPOINT_MS + SNS_JST_OFFSET_MS);
+  const month = String(mid.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(mid.getUTCDate()).padStart(2, '0');
+  return mid.getUTCFullYear() + '-' + month + '-' + day;
+}
+
+// Maps one follow_type dimension label to its series side, with
+// the same exactness as parseFollowsBreakdown_ (FOLLOWER and
+// NON_FOLLOWER / NON-FOLLOWER only, case-insensitive). Returns
+// 'follows', 'unfollows' or null.
+function followsDailySide_(label) {
+  const upper = String(label).toUpperCase();
+  if (upper === 'FOLLOWER') {
+    return 'follows';
+  }
+  if (upper === 'NON_FOLLOWER' || upper === 'NON-FOLLOWER') {
+    return 'unfollows';
+  }
+  return null;
+}
+
+// Reads a per-day follows/unfollows series out of a
+// follows_and_unfollows period=day response. Two shapes are
+// accepted, because the totals diagnosis (2026-11-09) showed this
+// metric only answers in the form it chooses, and the daily form
+// was not observable from here:
+//  - values[] rows whose value is an object keyed by the
+//    follow_type labels ({ FOLLOWER: n, NON_FOLLOWER: m }) with
+//    the bucket's end_time on the row;
+//  - total_value.breakdowns[] results that carry their own
+//    end_time ({ dimension_values: ['FOLLOWER'], value, end_time }).
+// A label key missing from a day's object leaves that side null
+// (not reported), never 0; days are deduplicated by date (a later
+// row wins) and returned in ascending date order. Returns
+// { series, labels }: series is null when no day parsed at all,
+// and labels lists every dimension label observed (original
+// casing), so an unparseable response stays diagnosable like the
+// totals path.
+function parseInstagramDailyFollows_(data) {
+  const entries = data && Array.isArray(data.data) ? data.data : [];
+  const byDate = {};
+  const labels = [];
+  const noteLabel = (label) => {
+    const text = String(label);
+    if (!labels.includes(text)) {
+      labels.push(text);
+    }
+  };
+  const put = (endTime, side, value) => {
+    const date = insightsDailyDateKey_(endTime);
+    if (!date || !side || !Number.isFinite(value)) {
+      return;
+    }
+    if (!byDate[date]) {
+      byDate[date] = { date: date, follows: null, unfollows: null };
+    }
+    byDate[date][side] = value;
+  };
+  entries.forEach((entry) => {
+    const values = entry && Array.isArray(entry.values) ? entry.values : [];
+    values.forEach((row) => {
+      const value = row && row.value;
+      if (!value || typeof value !== 'object') {
+        return;
+      }
+      Object.keys(value).forEach((key) => {
+        noteLabel(key);
+        put(row.end_time, followsDailySide_(key), Number(value[key]));
+      });
+    });
+    const totalValue = entry && entry.total_value;
+    const breakdowns =
+      totalValue && Array.isArray(totalValue.breakdowns)
+        ? totalValue.breakdowns
+        : [];
+    breakdowns.forEach((breakdown) => {
+      const keys = (breakdown && breakdown.dimension_keys) || [];
+      if (!keys.includes('follow_type')) {
+        return;
+      }
+      const results =
+        breakdown && Array.isArray(breakdown.results) ? breakdown.results : [];
+      results.forEach((row) => {
+        const dims = (row && row.dimension_values) || [];
+        dims.forEach(noteLabel);
+        const sides = dims.map(followsDailySide_).filter(Boolean);
+        if (sides.length) {
+          put(row.end_time, sides[0], Number(row && row.value));
+        }
+      });
+    });
+  });
+  const dates = Object.keys(byDate).sort();
+  return {
+    series: dates.length ? dates.map((date) => byDate[date]) : null,
+    labels: labels,
+  };
+}
+
+// Fetches the per-day follows/unfollows series. Two request
+// shapes are tried in order — the plain period=day form, then
+// the metric_type=total_value form — because the 2026-11-09
+// diagnosis showed this metric rejecting the plain form for the
+// totals; whichever response first yields per-day values wins.
+// Returns { series, error } and never throws: a failure leaves
+// series null and keeps the other detail fields unaffected.
+function fetchInstagramDailyFollows_() {
+  const token = getScriptProperty_('META_ACCESS_TOKEN');
+  if (!token) {
+    return { series: null, error: null };
+  }
+  const window = snsInsightsWindow_();
+  const base =
+    META_GRAPH_BASE +
+    SNS_INSTAGRAM_MAIN_ID +
+    '/insights?metric=follows_and_unfollows&period=day&since=' +
+    window.since +
+    '&until=' +
+    window.until +
+    '&breakdown=follow_type';
+  const urls = [
+    base + '&access_token=' + encodeURIComponent(token),
+    base + '&metric_type=total_value&access_token=' + encodeURIComponent(token),
+  ];
+  let lastError = null;
+  let lastLabels = [];
+  for (let i = 0; i < urls.length; i++) {
+    const res = fetchInsightsJson_(urls[i]);
+    if (res.error) {
+      lastError = 'follows_and_unfollows daily: ' + res.error;
+      continue;
+    }
+    const parsed = parseInstagramDailyFollows_(res.data);
+    if (parsed.series) {
+      return { series: parsed.series, error: null };
+    }
+    lastError = null;
+    lastLabels = parsed.labels;
+  }
+  if (lastError) {
+    return { series: null, error: lastError };
+  }
+  return {
+    series: null,
+    error:
+      'follows_and_unfollows daily: response had no per-day values' +
+      (lastLabels.length ? ' (labels: [' + lastLabels.join(', ') + '])' : ''),
+  };
 }
 
 // --- Manual diagnostics: debugSnsInsights -------------------------
@@ -2487,6 +2674,53 @@ function debugSnsInsights() {
     'metric=profile_links_taps&period=lifetime&metric_type=total_value',
     token,
     { errorsOnly: true }
+  );
+}
+
+// --- Manual diagnostics: debugInstagramDailyFollows ---------------
+// Run by hand from the Apps Script editor to pin down the real
+// response shape of the per-day follows_and_unfollows request
+// before trusting daily_follows in the snapshot. The totals were
+// only readable as metric_type=total_value + breakdown=follow_type
+// (see debugSnsInsights), but whether the daily form returns
+// values[] keyed by label, and which end_time each day bucket
+// carries, cannot be known from the totals shape — this logs both
+// daily request shapes raw (token redacted by
+// debugLogInsightsShape_), then logs what
+// parseInstagramDailyFollows_ makes of the live fetch, so the
+// date convention (bucket midpoint read in Asia/Tokyo) can be
+// checked against the logged end_time values. Never called from
+// a trigger or doGet; does not touch the snapshot.
+function debugInstagramDailyFollows() {
+  const token = getScriptProperty_('META_ACCESS_TOKEN');
+  if (!token) {
+    Logger.log('META_ACCESS_TOKEN is not set; nothing to diagnose.');
+    return;
+  }
+  const window = snsInsightsWindow_();
+  const range = '&since=' + window.since + '&until=' + window.until;
+  debugLogInsightsShape_(
+    'G follows_and_unfollows period=day breakdown=follow_type (plain)',
+    'metric=follows_and_unfollows&period=day' + range + '&breakdown=follow_type',
+    token,
+    {}
+  );
+  debugLogInsightsShape_(
+    'H follows_and_unfollows period=day breakdown=follow_type metric_type=total_value',
+    'metric=follows_and_unfollows&period=day&metric_type=total_value' +
+      range +
+      '&breakdown=follow_type',
+    token,
+    {}
+  );
+  const parsed = fetchInstagramDailyFollows_();
+  Logger.log('=== parsed daily_follows ===');
+  Logger.log('error: ' + (parsed.error || '(none)'));
+  Logger.log(
+    debugScrubToken_(JSON.stringify(parsed.series), token).slice(
+      0,
+      SNS_DEBUG_LOG_LIMIT
+    )
   );
 }
 
@@ -3668,6 +3902,8 @@ function collectSnsCounts() {
       profile_links_taps_source: igDetail.profile_links_taps_source,
       follows_30d: igDetail.follows_30d,
       unfollows_30d: igDetail.unfollows_30d,
+      daily_follows: igDetail.daily_follows,
+      daily_follows_error: igDetail.daily_follows_error,
       demographics: igDemographics.demographics,
       detail_error: joinSnsErrors_([igDetail.detail_error, igDemographics.error]),
       recent_media: igMedia.recent_media,
@@ -3710,6 +3946,11 @@ function collectSnsCounts() {
   }
   if (snapshot.instagram.detail_error) {
     console.log('Instagram detail error: ' + snapshot.instagram.detail_error);
+  }
+  if (snapshot.instagram.daily_follows_error) {
+    console.log(
+      'Instagram daily follows error: ' + snapshot.instagram.daily_follows_error
+    );
   }
   if (snapshot.instagram.media_error) {
     console.log('Instagram media error: ' + snapshot.instagram.media_error);
@@ -4113,6 +4354,10 @@ if (typeof exports !== 'undefined') {
   exports.followsBreakdownLabels_ = followsBreakdownLabels_;
   exports.parseInsightsTotalValue_ = parseInsightsTotalValue_;
   exports.parseInsightsDailySum_ = parseInsightsDailySum_;
+  exports.fetchInstagramDailyFollows_ = fetchInstagramDailyFollows_;
+  exports.parseInstagramDailyFollows_ = parseInstagramDailyFollows_;
+  exports.insightsDailyDateKey_ = insightsDailyDateKey_;
+  exports.debugInstagramDailyFollows = debugInstagramDailyFollows;
   exports.fetchProfileLinksTaps_ = fetchProfileLinksTaps_;
   exports.fetchInstagramDemographics_ = fetchInstagramDemographics_;
   exports.parseDemographicsBreakdown_ = parseDemographicsBreakdown_;
