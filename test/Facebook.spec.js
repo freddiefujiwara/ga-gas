@@ -110,11 +110,30 @@ describe('Facebook Page collection completed inside GAS', () => {
           encodeURIComponent(EXEC_URL + '?action=facebook_callback')
       );
       expect(url).toContain('scope=pages_show_list,pages_read_engagement');
+      expect(url).not.toContain('config_id');
       expect(url).toContain('response_type=code');
       expect(store.FACEBOOK_OAUTH_STATE).toBeTruthy();
       expect(url).toContain(
         'state=' + encodeURIComponent(store.FACEBOOK_OAUTH_STATE)
       );
+    });
+
+    it('uses the config_id form without a scope when FACEBOOK_CONFIG_ID is set', () => {
+      setupApp();
+      store.FACEBOOK_CONFIG_ID = 'test-config-id';
+      const url = Code.facebookAuthorizeUrl();
+      expect(url).toBe(
+        'https://www.facebook.com/v25.0/dialog/oauth' +
+          '?client_id=facebook-app-id' +
+          '&config_id=test-config-id' +
+          '&redirect_uri=' +
+          encodeURIComponent(EXEC_URL + '?action=facebook_callback') +
+          '&response_type=code' +
+          '&state=' +
+          encodeURIComponent(store.FACEBOOK_OAUTH_STATE)
+      );
+      expect(url).not.toContain('scope=');
+      expect(store.FACEBOOK_OAUTH_STATE).toBeTruthy();
     });
 
     it('prefers FACEBOOK_REDIRECT_URI over the service URL', () => {
@@ -212,6 +231,28 @@ describe('Facebook Page collection completed inside GAS', () => {
       expect(lastOutput().text).toContain('認可に失敗');
     });
 
+    it('explains on the failure page when me/accounts returns 0 Pages', () => {
+      setupApp();
+      store.FACEBOOK_OAUTH_STATE = 'expected-state';
+      mockSuccessfulCallback([]);
+      Code.doGet({
+        parameter: {
+          action: 'facebook_callback',
+          code: 'auth-code',
+          state: 'expected-state',
+        },
+      });
+      // The user token was stored, but no Page token can be: the
+      // authorization granted no Page asset.
+      expect(store.FACEBOOK_USER_ACCESS_TOKEN).toBe('long-user-token');
+      expect(store.FACEBOOK_PAGE_ACCESS_TOKEN).toBeUndefined();
+      expect(lastOutput().text).toContain('認可に失敗');
+      expect(lastOutput().text).toContain('me/accounts returned 0 Pages');
+      expect(lastOutput().text).toContain('select the Page when authorizing');
+      expect(lastOutput().text).toContain('Configuration');
+      expect(lastOutput().text).not.toContain('long-user-token');
+    });
+
     it('ignores a callback whose state does not match, without any token call', () => {
       setupApp();
       store.FACEBOOK_OAUTH_STATE = 'expected-state';
@@ -243,6 +284,24 @@ describe('Facebook Page collection completed inside GAS', () => {
       expect(store.FACEBOOK_USER_ACCESS_TOKEN).toBeUndefined();
       expect(store.FACEBOOK_PAGE_ACCESS_TOKEN).toBeUndefined();
       expect(lastOutput().text).toContain('認可に失敗');
+    });
+  });
+
+  describe('selectFacebookPage_ / storeFacebookPageToken_', () => {
+    it('spells out the 0-Pages cause instead of a bare failure', () => {
+      const selected = Code.selectFacebookPage_([]);
+      expect(selected.page).toBeNull();
+      expect(selected.error).toContain('me/accounts returned 0 Pages');
+      expect(selected.error).toContain('select the Page when authorizing');
+      expect(Code.selectFacebookPage_(null).error).toContain('0 Pages');
+    });
+
+    it('propagates the 0-Pages explanation from storeFacebookPageToken_', () => {
+      fetchHandler = () => res(200, { data: [] });
+      const result = Code.storeFacebookPageToken_('some-user-token');
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain('me/accounts returned 0 Pages');
+      expect(store.FACEBOOK_PAGE_ACCESS_TOKEN).toBeUndefined();
     });
   });
 
@@ -304,6 +363,33 @@ describe('Facebook Page collection completed inside GAS', () => {
       expect(error).toContain('refresh:');
       expect(error).toContain('user token expired');
       expect(store.FACEBOOK_USER_ACCESS_TOKEN).toBe('old-user-token');
+    });
+
+    it('surfaces the 0-Pages explanation when the renewed token has no Page', () => {
+      setupRefreshable();
+      fetchHandler = (url) => {
+        if (url.includes('me/accounts')) {
+          return res(200, { data: [] });
+        }
+        if (url.includes('grant_type=fb_exchange_token')) {
+          return res(200, { access_token: 'new-user-token', expires_in: 5184000 });
+        }
+        throw new Error('unexpected fetch: ' + url);
+      };
+      const error = Code.refreshFacebookTokenIfNeeded();
+      expect(error).toContain('refresh: page token:');
+      expect(error).toContain('me/accounts returned 0 Pages');
+      expect(store.FACEBOOK_PAGE_ACCESS_TOKEN).toBeUndefined();
+    });
+  });
+
+  describe('escapeHtml_', () => {
+    it('escapes markup metacharacters and tolerates null', () => {
+      expect(Code.escapeHtml_('<a href="x">&</a>')).toBe(
+        '&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;'
+      );
+      expect(Code.escapeHtml_(null)).toBe('');
+      expect(Code.escapeHtml_('plain text')).toBe('plain text');
     });
   });
 
