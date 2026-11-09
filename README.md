@@ -1,4 +1,4 @@
-# ga-gas
+# social-gas
 
 GA4 Data API ブリッジ。Google Apps Script の Web アプリが、所有者の Google アカウント権限で GA4 Data API（runReport）を叩き、結果を JSON で返す。
 
@@ -47,10 +47,10 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 
 ## SNS詳細（action=sns_detail、認証必須）
 
-/ga 管理画面用に、`collectSnsCounts` が同じスナップショットへ詳細データも保存する。読み取りは `?action=sns_detail` で、GA4 レポートと同じ認証ゲート（ID トークンまたは一時アクセスリンク）を通る。取得は項目ごとに独立して失敗し、取れない項目は null、失敗の要約はセクションごとのエラーキー（秘密値は含まない）に入る。
+/social 管理画面用に、`collectSnsCounts` が同じスナップショットへ詳細データも保存する。読み取りは `?action=sns_detail` で、GA4 レポートと同じ認証ゲート（ID トークンまたは一時アクセスリンク）を通る。取得は項目ごとに独立して失敗し、取れない項目は null、失敗の要約はセクションごとのエラーキー（秘密値は含まない）に入る。
 
 - Instagram アカウント全体（過去30日、メインアカウント）：`reach_30d`、`accounts_engaged_30d`、`interactions_30d`（total / likes / comments / shares / saves）、`profile_links_taps_30d`、`follows_30d` / `unfollows_30d`（`follows_and_unfollows` の follow_type 内訳）、`daily_follows`（日次フォロー／フォロー解除系列）。失敗時は `instagram.detail_error`（ただし `daily_follows` の失敗だけは `instagram.daily_follows_error` に分けて記録する）
-  - `daily_follows` は `{date, follows, unfollows}`（date は Asia/Tokyo の暦日 \"YYYY-MM-DD\"、日付昇順）の配列で、/ga の Instagram タブで日ごとのフォロー・フォロー解除グラフに投稿日を重ねるための系列。投稿ごとのフォロー帰属は Meta のデータに存在しないため、日次系列と投稿日の重ね合わせで代替する。取得方式は2026-11-09 の本番デバッグで確定した：`follows_and_unfollows` は period=day の素の形が HTTP 400 で拒否され、`metric_type=total_value` 形は指定期間全体の合算（follow_type 内訳）しか返さないため、1回のリクエストでは日次系列は作れない。そこで過去30日の各日について、その日の JST ウィンドウ（00:00:00〜23:59:59 を Unix 秒に変換）で total_value＋breakdown=follow_type を取得し、1日ずつ組み立てる。当日分は途中経過の値で、次の収集で更新される。1日の取得が失敗したらその日は両側 null のまま残し、欠けた日数は `daily_follows_missing_days` に記録する（部分的失敗はエラーにしない）。全日失敗のときだけ系列を null にし、`daily_follows_error` に要約を入れる。ラベルが欠けた側は null（未報告）で、0 にはしない。実応答の形はエディタから `debugInstagramDailyFollows()` を手動実行して確認する
+  - `daily_follows` は `{date, follows, unfollows}`（date は Asia/Tokyo の暦日 \"YYYY-MM-DD\"、日付昇順）の配列で、/social の Instagram タブで日ごとのフォロー・フォロー解除グラフに投稿日を重ねるための系列。投稿ごとのフォロー帰属は Meta のデータに存在しないため、日次系列と投稿日の重ね合わせで代替する。取得方式は2026-11-09 の本番デバッグで確定した：`follows_and_unfollows` は period=day の素の形が HTTP 400 で拒否され、`metric_type=total_value` 形は指定期間全体の合算（follow_type 内訳）しか返さないため、1回のリクエストでは日次系列は作れない。そこで過去30日の各日について、その日の JST ウィンドウ（00:00:00〜23:59:59 を Unix 秒に変換）で total_value＋breakdown=follow_type を取得し、1日ずつ組み立てる。当日分は途中経過の値で、次の収集で更新される。1日の取得が失敗したらその日は両側 null のまま残し、欠けた日数は `daily_follows_missing_days` に記録する（部分的失敗はエラーにしない）。全日失敗のときだけ系列を null にし、`daily_follows_error` に要約を入れる。ラベルが欠けた側は null（未報告）で、0 にはしない。実応答の形はエディタから `debugInstagramDailyFollows()` を手動実行して確認する
   - `profile_links_taps_30d` は2段構え：まず total_value を取り、null または 0 のときは日別 values の30日合計で補完する。採用した形は `profile_links_taps_source`（`"total_value"` / `"daily_sum"`）に記録する（2026-11-09 の本番初回実行で total_value が実態と食い違う 0 を返したための対策）
   - follows 内訳は、2026-11-09 の本番診断で確定した形で読む：`follows_and_unfollows` は `metric_type=total_value`＋`breakdown=follow_type` のときにだけ内訳が返り、ラベルは結果の状態を表す（`FOLLOWER`＝フォローした数 → `follows_30d`、`NON_FOLLOWER`＝フォローを外した数 → `unfollows_30d`）。照合はこの2ラベルの完全一致（大文字小文字は無視）を最優先とし、どちらにも一致しなかった場合は観測したラベル一覧が `instagram.detail_error` に `follows_and_unfollows labels: [...]` として記録される
 - Instagram フォロワー属性（lifetime）：`instagram.demographics` = `age_gender`（`{key, value}` の降順リスト、key は "25-34/F" 形式）、`top_cities` / `top_countries`（各上位10件）。失敗分は `instagram.detail_error` に合算
@@ -79,7 +79,7 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - upsert の方式：収集のたびにタブ全体を読み、キーでマージして（新しい取得値が勝つ。ただし新しい値が null の項目は空欄として扱い、既存値を残す＝null で潰さない）、ヘッダー＋1キー1行で書き戻し、余った行は削除する。この方式により、追記方式だった頃に貯まった `media` の重複行（30投稿×収集回数分）も、次回収集で自動的に1投稿1行へ整理される
 - どのシートも無ければ自動作成し、1行目が空（シートが空）のときだけヘッダー行を書く。既存のヘッダー行は upsert でも書き換えない
 - 書き込みに失敗しても取得自体は成功として扱い、実行ログに `SNS history append failed: <要約>` が1行出る（要約に秘密値・URL は含めない）
-- 読み取りは `?action=sns_history`（認証必須、sns_detail と同じゲート）で、/ga の推移グラフ用。`account` シートの行を collected_at 昇順で最大直近2400行返し（1時間ごとの収集で約100日分）、項目は collected_at、ig_followers、threads_followers、youtube_subscribers、total_followers、media_count、views_30d、non_follower_pct、reach_30d、interactions_total、follows_30d、unfollows_30d、yt_total_views の13項目に絞る（空欄は null）。プロパティ未設定・シートが無い／空の場合はエラーにせず `rows: []` を返す
+- 読み取りは `?action=sns_history`（認証必須、sns_detail と同じゲート）で、/social の推移グラフ用。`account` シートの行を collected_at 昇順で最大直近2400行返し（1時間ごとの収集で約100日分）、項目は collected_at、ig_followers、threads_followers、youtube_subscribers、total_followers、media_count、views_30d、non_follower_pct、reach_30d、interactions_total、follows_30d、unfollows_30d、yt_total_views の13項目に絞る（空欄は null）。プロパティ未設定・シートが無い／空の場合はエラーにせず `rows: []` を返す
 
 ## 診断関数 `debugSnsInsights`（手動実行専用）
 
@@ -110,4 +110,4 @@ Threads の数値が取れないときの切り分け用。`debugThreadsFollower
 ## 注意
 
 - GAS の認可は黙って失効することがある。/exec がエラーやサインイン画面を返したら、エディタで doGet を実行して同意をやり直す。
-- Drive 上の置き場所：本番プロジェクトは API フォルダ内（2026-11-06 にマイドライブ直下から移動）。ステージング用プロジェクト ga-gas-staging も同日作成（Script ID: 1fHczPxzhetaG4QC2whqGfUGwMuOXWY9o3p-1dquqIcKuv7IatyGp7xiU）。GitHub リポジトリ freddiefujiwara/ga-gas で管理し、PR（ブランチ push）→ ステージング、main マージ → 本番に CI デプロイされる。
+- Drive 上の置き場所：本番プロジェクトは API フォルダ内（2026-11-06 にマイドライブ直下から移動）。ステージング用プロジェクト social-gas-staging も同日作成（Script ID: 1fHczPxzhetaG4QC2whqGfUGwMuOXWY9o3p-1dquqIcKuv7IatyGp7xiU）。GitHub リポジトリ freddiefujiwara/social-gas で管理し、PR（ブランチ push）→ ステージング、main マージ → 本番に CI デプロイされる。

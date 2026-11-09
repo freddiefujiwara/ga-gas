@@ -33,7 +33,7 @@
  */
 
 const GA4_API_BASE = 'https://analyticsdata.googleapis.com/v1beta/properties/';
-const FRONTEND_URL = 'https://freddiefujiwara.com/ga/';
+const FRONTEND_URL = 'https://freddiefujiwara.com/social/';
 const SHARE_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 // --- Public music play count (action=music_count) ---
