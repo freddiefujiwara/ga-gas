@@ -66,12 +66,19 @@ YouTube・Instagram・Threads・Facebook のフォロワー数を GAS 自身が�
 
 ## SNS履歴（スプレッドシート）
 
-スナップショットは取得のたびに上書きされるため、推移を残す目的で `collectSnsCounts` が Google スプレッドシートへも追記する。スクリプトプロパティ `SNS_HISTORY_SHEET_ID` にスプレッドシートの ID が設定されているときだけ動作し、未設定なら何もしない（ID はコードに書かない）。
+スナップショットは取得のたびに上書きされるため、推移を残す目的で `collectSnsCounts` が Google スプレッドシートにも書き込む。スクリプトプロパティ `SNS_HISTORY_SHEET_ID` にスプレッドシートの ID が設定されているときだけ動作し、未設定なら何もしない（ID はコードに書かない）。
 
-- `account` シート：取得ごとに1行。列は collected_at、ig_followers、ig_anemone_followers、threads_followers、youtube_subscribers、total_followers（Instagram メイン＋Threads＋YouTube、トップページと同じ定義）、media_count、views_30d、non_follower_pct、reach_30d、accounts_engaged_30d、interactions_total / likes / comments / shares / saves、profile_links_taps_30d、profile_links_taps_source、follows_30d、unfollows_30d、yt_total_views、yt_video_count、facebook_followers（末尾に追加した列。total_followers の定義には含めない）。null の項目は空欄
-- `media` シート：`recent_media` の投稿ごとに1行。列は collected_at、media_id、posted_at、type、caption、permalink、views、reach、likes、comments、shares、saves、avg_watch_sec、total_watch_sec
-- 両シートとも無ければ自動作成し、1行目が空（シートが空）のときだけヘッダー行を書く
-- 追記に失敗しても取得自体は成功として扱い、実行ログに `SNS history append failed: <要約>` が1行出る（要約に秘密値・URL は含めない）
+書き方はタブで2種類に分かれる。**投稿系と日次は「1キー1行の上書き（upsert）」で、account のみ時系列の追記**。
+
+- `account` シート（例外的に追記のまま）：取得ごとに1行を追記する。フォロワー推移グラフの元データなので、ここだけは収集の履歴そのものを残す。列は collected_at、ig_followers、ig_anemone_followers、threads_followers、youtube_subscribers、total_followers（Instagram メイン＋Threads＋YouTube、トップページと同じ定義）、media_count、views_30d、non_follower_pct、reach_30d、accounts_engaged_30d、interactions_total / likes / comments / shares / saves、profile_links_taps_30d、profile_links_taps_source、follows_30d、unfollows_30d、yt_total_views、yt_video_count、facebook_followers（末尾に追加した列。total_followers の定義には含めない）。null の項目は空欄
+- `media` シート（キー `media_id` で upsert）：`recent_media` の投稿ごとに1行。列は collected_at、media_id、posted_at、type、caption、permalink、views、reach、likes、comments、shares、saves、avg_watch_sec、total_watch_sec
+- `daily` シート（キー `date` で upsert）：Instagram の日次フォロー。列は date、follows、unfollows、collected_at。`daily_follows` は収集のたびに過去30日分が再取得されるため、date をキーに上書きし、30日より古い日も残り続ける。両側 null の日は行を作らず、既存行も消さない
+- `threads_media` シート（キー `post_id` で upsert）：`threads.recent_posts` の投稿ごとに1行。列は collected_at、post_id、posted_at、type、text、permalink、views、likes、replies、reposts、quotes
+- `youtube_media` シート（キー `video_id` で upsert）：`youtube.recent_videos` の動画ごとに1行。列は collected_at、video_id、published_at、title、views、likes、comments。動画ごとの数値はもともと毎回の収集でアップロード一覧から取得していた分（最大10件）で、履歴のために追加の取得はしていない
+- `facebook_media` シート（キー `post_id` で upsert）：`facebook.recent_posts` の投稿ごとに1行。列は collected_at、post_id、posted_at、message、permalink、views、unique_viewers、engagements、clicks、link_clicks、saves（ページ投稿の insights に保存の指標が無いため saves は常に空欄）。Facebook が未認可・取得エラーの間は投稿が無いものとして静かにスキップする
+- upsert の方式：収集のたびにタブ全体を読み、キーでマージして（新しい取得値が勝つ。ただし新しい値が null の項目は空欄として扱い、既存値を残す＝null で潰さない）、ヘッダー＋1キー1行で書き戻し、余った行は削除する。この方式により、追記方式だった頃に貯まった `media` の重複行（30投稿×収集回数分）も、次回収集で自動的に1投稿1行へ整理される
+- どのシートも無ければ自動作成し、1行目が空（シートが空）のときだけヘッダー行を書く。既存のヘッダー行は upsert でも書き換えない
+- 書き込みに失敗しても取得自体は成功として扱い、実行ログに `SNS history append failed: <要約>` が1行出る（要約に秘密値・URL は含めない）
 - 読み取りは `?action=sns_history`（認証必須、sns_detail と同じゲート）で、/ga の推移グラフ用。`account` シートの行を collected_at 昇順で最大直近400行返し、項目は collected_at、ig_followers、threads_followers、youtube_subscribers、total_followers、media_count、views_30d、non_follower_pct、reach_30d、interactions_total、follows_30d、unfollows_30d、yt_total_views の13項目に絞る（空欄は null）。プロパティ未設定・シートが無い／空の場合はエラーにせず `rows: []` を返す
 
 ## 診断関数 `debugSnsInsights`（手動実行専用）
@@ -90,7 +97,7 @@ Facebook の数値が取れないときの切り分け用。プロパティの�
 
 - GCP プロジェクト：ga-gas-513811（番号 151603615892）。Google Analytics Data API 有効化済み。OAuth 同意画面は External / テストモード（テストユーザー zegenvs@gmail.com）。Apps Script プロジェクト（本番・ステージングとも）にリンクする。
 - スクリプトプロパティ：`GA4_PROPERTY_ID` = 561730442（freddiefujiwara.com の GA4 プロパティ）。本番・ステージングの両プロジェクトに設定する。
-- スコープ：appsscript.json で指定（analytics.readonly、script.external_request、script.scriptapp、spreadsheets、youtube.readonly）。spreadsheets は SNS 履歴の追記用で、追加したプロジェクトでは初回実行時に再認可が要る場合がある。
+- スコープ：appsscript.json で指定（analytics.readonly、script.external_request、script.scriptapp、spreadsheets、youtube.readonly）。spreadsheets は SNS 履歴の書き込み用で、追加したプロジェクトでは初回実行時に再認可が要る場合がある。
 
 ## 開発とデプロイ
 
