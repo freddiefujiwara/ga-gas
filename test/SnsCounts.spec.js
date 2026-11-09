@@ -1410,7 +1410,21 @@ describe('SNS follower counts', () => {
         top_countries: null,
       });
       expect(json.instagram.recent_media).toBeNull();
-      expect(json.threads).toEqual({ followers: null, threads_error: null });
+      expect(json.threads).toEqual({
+        followers: null,
+        threads_error: null,
+        views_30d: null,
+        interactions_30d: {
+          total: null,
+          likes: null,
+          replies: null,
+          reposts: null,
+          quotes: null,
+        },
+        detail_error: null,
+        recent_posts: null,
+        posts_error: null,
+      });
     });
 
     it('returns the full stored snapshot, detail included', () => {
@@ -2051,6 +2065,294 @@ describe('SNS follower counts', () => {
       expect(detail.recent_videos).toBeNull();
       expect(detail.youtube_error).toBe('YouTube advanced service is unavailable');
       expect(Code.fetchYouTubeSubscribers_()).toBeNull();
+    });
+  });
+
+  describe('Threads detail', () => {
+    const THREADS_POSTS = [
+      {
+        id: 'th-post-1',
+        text: '川口の投稿その1',
+        timestamp: '2026-11-09T01:00:00+0000',
+        permalink: 'https://www.threads.net/@freddiefujiwara/post/AAA',
+        media_type: 'TEXT_POST',
+      },
+      {
+        id: 'th-post-2',
+        text: '写真つきの投稿',
+        timestamp: '2026-11-08T01:00:00+0000',
+        permalink: 'https://www.threads.net/@freddiefujiwara/post/BBB',
+        media_type: 'IMAGE',
+      },
+    ];
+
+    const threadsDailyBody = (name, values) => ({
+      data: [
+        {
+          name,
+          period: 'day',
+          values: values.map((value) => ({ value })),
+        },
+      ],
+    });
+
+    // Routes every Threads URL collectSnsCounts (or the detail
+    // fetchers) can produce. Account metrics are per-metric
+    // requests: views comes back as a daily series to sum, the
+    // interaction metrics as total_value bodies.
+    const mockThreadsSuccess = () => {
+      const accountTotals = { likes: 40, replies: 12, reposts: 5, quotes: 3 };
+      fetchHandler = (url) => {
+        if (url.includes('/threads_insights')) {
+          const metric = metricFromUrl(url);
+          if (metric === 'followers_count') {
+            return res(200, totalValueBody('followers_count', 252));
+          }
+          if (metric === 'views') {
+            return res(200, threadsDailyBody('views', [100, 250]));
+          }
+          if (metric in accountTotals) {
+            return res(200, totalValueBody(metric, accountTotals[metric]));
+          }
+          throw new Error('unexpected threads metric: ' + metric);
+        }
+        if (url.includes('/threads?')) {
+          return res(200, { data: THREADS_POSTS });
+        }
+        if (url.includes('th-post-1/insights')) {
+          return res(
+            200,
+            mediaInsightsBody([
+              ['views', 500],
+              ['likes', 20],
+              ['replies', 4],
+              ['reposts', 2],
+              ['quotes', 1],
+            ])
+          );
+        }
+        if (url.includes('th-post-2/insights')) {
+          return res(
+            200,
+            mediaInsightsBody([
+              ['views', 80],
+              ['likes', 3],
+            ])
+          );
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+    };
+
+    it('collects account totals, summing the daily views series', () => {
+      store.META_THREADS_ACCESS_TOKEN = 'threads-token';
+      mockThreadsSuccess();
+      const detail = Code.fetchThreadsAccountDetail_();
+      expect(detail).toEqual({
+        views_30d: 350,
+        interactions_30d: { total: 60, likes: 40, replies: 12, reposts: 5, quotes: 3 },
+        detail_error: null,
+      });
+    });
+
+    it('returns nulls without a token and never fetches', () => {
+      const detail = Code.fetchThreadsAccountDetail_();
+      expect(detail.views_30d).toBeNull();
+      expect(detail.interactions_30d).toEqual({
+        total: null,
+        likes: null,
+        replies: null,
+        reposts: null,
+        quotes: null,
+      });
+      expect(detail.detail_error).toBeNull();
+      const posts = Code.fetchThreadsRecentPosts_();
+      expect(posts).toEqual({ recent_posts: null, posts_error: null });
+      expect(global.UrlFetchApp.fetch).not.toHaveBeenCalled();
+    });
+
+    it('nulls only the rejected metric and records it in detail_error', () => {
+      store.META_THREADS_ACCESS_TOKEN = 'threads-token';
+      mockThreadsSuccess();
+      const inner = fetchHandler;
+      fetchHandler = (url) => {
+        if (url.includes('/threads_insights') && url.includes('metric=replies')) {
+          return res(400, {
+            error: { message: 'Invalid metric', code: 100 },
+          });
+        }
+        return inner(url);
+      };
+      const detail = Code.fetchThreadsAccountDetail_();
+      expect(detail.views_30d).toBe(350);
+      expect(detail.interactions_30d.likes).toBe(40);
+      expect(detail.interactions_30d.replies).toBeNull();
+      expect(detail.interactions_30d.total).toBe(48);
+      expect(detail.detail_error).toContain('replies');
+      expect(detail.detail_error).toContain('Invalid metric');
+      expect(detail.detail_error).not.toContain('threads-token');
+    });
+
+    it('collects recent posts with their insights merged in', () => {
+      store.META_THREADS_ACCESS_TOKEN = 'threads-token';
+      mockThreadsSuccess();
+      const { recent_posts, posts_error } = Code.fetchThreadsRecentPosts_();
+      expect(posts_error).toBeNull();
+      expect(recent_posts).toEqual([
+        {
+          id: 'th-post-1',
+          type: 'TEXT_POST',
+          posted_at: '2026-11-09T01:00:00+0000',
+          text: '川口の投稿その1',
+          permalink: 'https://www.threads.net/@freddiefujiwara/post/AAA',
+          views: 500,
+          likes: 20,
+          replies: 4,
+          reposts: 2,
+          quotes: 1,
+        },
+        {
+          id: 'th-post-2',
+          type: 'IMAGE',
+          posted_at: '2026-11-08T01:00:00+0000',
+          text: '写真つきの投稿',
+          permalink: 'https://www.threads.net/@freddiefujiwara/post/BBB',
+          views: 80,
+          likes: 3,
+          replies: null,
+          reposts: null,
+          quotes: null,
+        },
+      ]);
+    });
+
+    it('nulls the whole section when the threads list fails', () => {
+      store.META_THREADS_ACCESS_TOKEN = 'threads-token';
+      fetchHandler = (url) => {
+        if (url.includes('/threads?')) {
+          return res(403, {
+            error: {
+              message: 'Application does not have permission for this action',
+              code: 10,
+            },
+          });
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+      const { recent_posts, posts_error } = Code.fetchThreadsRecentPosts_();
+      expect(recent_posts).toBeNull();
+      expect(posts_error).toContain('threads list');
+      expect(posts_error).toContain('code=10');
+    });
+
+    it('keeps a post with nulls when only its insights fail', () => {
+      store.META_THREADS_ACCESS_TOKEN = 'threads-token';
+      mockThreadsSuccess();
+      const inner = fetchHandler;
+      fetchHandler = (url) => {
+        if (url.includes('th-post-2/insights')) {
+          return res(400, { error: { message: 'No insights for reposts', code: 100 } });
+        }
+        return inner(url);
+      };
+      const { recent_posts, posts_error } = Code.fetchThreadsRecentPosts_();
+      expect(recent_posts).toHaveLength(2);
+      expect(recent_posts[0].views).toBe(500);
+      expect(recent_posts[1]).toMatchObject({
+        id: 'th-post-2',
+        views: null,
+        likes: null,
+        replies: null,
+        reposts: null,
+        quotes: null,
+      });
+      expect(posts_error).toContain('1 of 2 post insights failed');
+      expect(posts_error).toContain('th-post-2');
+    });
+
+    it('parseThreadsMediaInsights_ maps known metrics and ignores the rest', () => {
+      const parsed = Code.parseThreadsMediaInsights_({
+        data: [
+          { name: 'views', values: [{ value: 42 }] },
+          { name: 'likes', total_value: { value: 7 } },
+          { name: 'shares', values: [{ value: 9 }] },
+          { name: 'replies', values: [{ value: 'many' }] },
+          { values: [{ value: 1 }] },
+        ],
+      });
+      expect(parsed).toEqual({ views: 42, likes: 7 });
+      expect(Code.parseThreadsMediaInsights_(null)).toEqual({});
+      expect(Code.parseThreadsMediaInsights_({ data: 'nope' })).toEqual({});
+    });
+
+    it('parseThreadsInsightsByName_ reads totals per metric name', () => {
+      const totals = Code.parseThreadsInsightsByName_({
+        data: [
+          { name: 'views', values: [{ value: 10 }, { value: 5 }] },
+          { name: 'likes', total_value: { value: 33 } },
+          { name: 'quotes', values: [] },
+        ],
+      });
+      expect(totals).toEqual({ views: 15, likes: 33 });
+      expect(Code.parseThreadsInsightsByName_(null)).toEqual({});
+    });
+
+    it('buildThreadsPostEntry_ defaults missing fields and caps the text', () => {
+      expect(Code.buildThreadsPostEntry_(null)).toEqual({
+        id: null,
+        type: null,
+        posted_at: null,
+        text: '',
+        permalink: null,
+        views: null,
+        likes: null,
+        replies: null,
+        reposts: null,
+        quotes: null,
+      });
+      const long = Code.buildThreadsPostEntry_({
+        id: 123,
+        text: 'あ'.repeat(3000),
+      });
+      expect(long.id).toBe('123');
+      expect(long.text).toHaveLength(2000);
+    });
+
+    it('stores the Threads detail in the snapshot via collectSnsCounts', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      store.META_THREADS_ACCESS_TOKEN = 'threads-token';
+      mockThreadsSuccess();
+      const threadsHandler = fetchHandler;
+      fetchHandler = (url) => {
+        if (url.includes('graph.threads.net')) {
+          return threadsHandler(url);
+        }
+        if (url.includes('graph.facebook.com')) {
+          return res(200, { followers_count: 100, media_count: 10 });
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+      mockYouTube({ items: [] });
+      const snapshot = Code.collectSnsCounts();
+      expect(snapshot.threads.followers).toBe(252);
+      expect(snapshot.threads.views_30d).toBe(350);
+      expect(snapshot.threads.interactions_30d).toEqual({
+        total: 60,
+        likes: 40,
+        replies: 12,
+        reposts: 5,
+        quotes: 3,
+      });
+      expect(snapshot.threads.detail_error).toBeNull();
+      expect(snapshot.threads.recent_posts).toHaveLength(2);
+      expect(snapshot.threads.recent_posts[0].views).toBe(500);
+      expect(snapshot.threads.posts_error).toBeNull();
+      // The public projection still exposes followers only.
+      const detail = Code.buildSnsDetailResponse_();
+      expect(detail.threads.recent_posts).toHaveLength(2);
+      expect(Code.buildSnsCountsResponse_().threads).toEqual({
+        followers: 252,
+      });
     });
   });
 

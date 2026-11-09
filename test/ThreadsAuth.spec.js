@@ -406,4 +406,135 @@ describe('Threads OAuth completed inside GAS', () => {
       expect(allLogs()).not.toContain('threads-secret-token');
     });
   });
+
+  describe('debugThreadsPosts', () => {
+    let logs;
+
+    beforeEach(() => {
+      logs = [];
+      global.Logger = {
+        log: vi.fn((...args) => logs.push(args.join(' '))),
+      };
+    });
+
+    const allLogs = () => logs.join('\n');
+
+    const mockDebugThreadsSuccess = () => {
+      fetchHandler = (url) => {
+        if (url.includes('/threads_insights')) {
+          return res(200, {
+            data: [
+              { name: 'views', period: 'day', values: [{ value: 10 }, { value: 5 }] },
+              { name: 'likes', period: 'day', total_value: { value: 33 } },
+              { name: 'replies', period: 'day', values: [{ value: 7 }] },
+              { name: 'reposts', period: 'day', total_value: { value: 2 } },
+              { name: 'quotes', period: 'day', values: [{ value: 1 }] },
+            ],
+          });
+        }
+        if (url.includes('/threads?')) {
+          return res(200, {
+            data: [
+              {
+                id: 'th-1',
+                text: 'テスト投稿',
+                timestamp: '2026-11-09T00:00:00+0000',
+                permalink: 'https://www.threads.net/@freddiefujiwara/post/XXX',
+                media_type: 'TEXT_POST',
+              },
+            ],
+          });
+        }
+        if (url.includes('th-1/insights')) {
+          return res(200, {
+            data: [
+              { name: 'views', values: [{ value: 500 }] },
+              { name: 'likes', values: [{ value: 20 }] },
+              { name: 'replies', values: [{ value: 4 }] },
+              { name: 'reposts', values: [{ value: 2 }] },
+              { name: 'quotes', values: [{ value: 1 }] },
+            ],
+          });
+        }
+        throw new Error('unexpected fetch: ' + url);
+      };
+    };
+
+    it('logs that no token is set and does not fetch', () => {
+      Code.debugThreadsPosts();
+      expect(allLogs()).toContain('META_THREADS_ACCESS_TOKEN is not set.');
+      expect(allLogs()).toContain('META_ACCESS_TOKEN is not set either');
+      expect(fetchCalls).toHaveLength(0);
+    });
+
+    it('logs all three stages with parsed values and no token', () => {
+      store.META_THREADS_ACCESS_TOKEN = 'threads-secret-token';
+      store.THREADS_USER_ID = 'threads-user-42';
+      mockDebugThreadsSuccess();
+      Code.debugThreadsPosts();
+      expect(allLogs()).toContain('Threads user id: threads-user-42 (from THREADS_USER_ID)');
+      expect(allLogs()).toContain(
+        'parsed account totals: {"views":15,"likes":33,"replies":7,"reposts":2,"quotes":1}'
+      );
+      expect(allLogs()).toContain('"id":"th-1"');
+      expect(allLogs()).toContain(
+        'parsed media insights: {"views":500,"likes":20,"replies":4,"reposts":2,"quotes":1}'
+      );
+      expect(allLogs()).not.toContain('threads-secret-token');
+      expect(fetchCalls).toHaveLength(3);
+      expect(fetchCalls[0].url).toContain(
+        '/threads_insights?metric=views,likes,replies,reposts,quotes'
+      );
+      expect(fetchCalls[0].url).toContain('access_token=threads-secret-token');
+      expect(fetchCalls[1].url).toContain('/threads?fields=id,text,timestamp,permalink,media_type&limit=3');
+      expect(fetchCalls[2].url).toContain(
+        '/th-1/insights?metric=views,likes,replies,reposts,quotes'
+      );
+    });
+
+    it('logs a refused account request and an empty list without throwing', () => {
+      store.META_THREADS_ACCESS_TOKEN = 'threads-secret-token';
+      fetchHandler = (url) => {
+        if (url.includes('/threads_insights')) {
+          return res(403, {
+            error: {
+              message: 'Application does not have permission for this action',
+              code: 10,
+            },
+          });
+        }
+        if (url.includes('/threads?')) {
+          return res(200, { data: [] });
+        }
+        throw new Error('unexpected fetch: ' + url);
+      };
+      Code.debugThreadsPosts();
+      expect(allLogs()).toContain('HTTP 403');
+      expect(allLogs()).toContain(
+        'Application does not have permission for this action'
+      );
+      expect(allLogs()).not.toContain('parsed account totals');
+      expect(allLogs()).toContain(
+        'no posts in the list response; skipping media insights.'
+      );
+      expect(allLogs()).not.toContain('threads-secret-token');
+      expect(fetchCalls).toHaveLength(2);
+    });
+
+    it('survives a fetch exception in the media insights stage', () => {
+      store.META_THREADS_ACCESS_TOKEN = 'threads-secret-token';
+      mockDebugThreadsSuccess();
+      const inner = fetchHandler;
+      fetchHandler = (url) => {
+        if (url.includes('th-1/insights')) {
+          throw new Error('network down');
+        }
+        return inner(url);
+      };
+      Code.debugThreadsPosts();
+      expect(allLogs()).toContain('fetch exception (Error)');
+      expect(allLogs()).toContain('"id":"th-1"');
+      expect(allLogs()).not.toContain('parsed media insights');
+    });
+  });
 });
