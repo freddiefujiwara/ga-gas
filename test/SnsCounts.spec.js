@@ -55,7 +55,9 @@ describe('SNS follower counts', () => {
       }),
       MimeType: { JSON: 'application/json' },
     };
-    global.UrlFetchApp = { fetch: vi.fn((url) => fetchHandler(url)) };
+    global.UrlFetchApp = {
+      fetch: vi.fn((url, options) => fetchHandler(url, options)),
+    };
     global.ScriptApp = {
       getOAuthToken: vi.fn(() => 'test-token'),
       getProjectTriggers: vi.fn(() => triggers),
@@ -962,6 +964,68 @@ describe('SNS follower counts', () => {
       ).toEqual([]);
     });
 
+    it('builds one demographics row per breakdown segment', () => {
+      const snapshot = fixtureSnapshot();
+      snapshot.instagram.demographics = {
+        age_gender: [
+          { key: '25-34/F', value: 500 },
+          { key: '35-44/M', value: 300 },
+        ],
+        top_cities: [{ key: 'Kawaguchi, Saitama', value: 800 }],
+        top_countries: null,
+      };
+      expect(Code.buildSnsHistoryDemographicsRows_(snapshot)).toEqual([
+        [
+          'age_gender|25-34/F',
+          'age_gender',
+          '25-34/F',
+          500,
+          '2026-11-09T00:00:00.000Z',
+        ],
+        [
+          'age_gender|35-44/M',
+          'age_gender',
+          '35-44/M',
+          300,
+          '2026-11-09T00:00:00.000Z',
+        ],
+        [
+          'city|Kawaguchi, Saitama',
+          'city',
+          'Kawaguchi, Saitama',
+          800,
+          '2026-11-09T00:00:00.000Z',
+        ],
+      ]);
+      // A failed breakdown (null) and an empty snapshot both
+      // contribute nothing, so stored rows survive an outage.
+      expect(
+        Code.buildSnsHistoryDemographicsRows_({ instagram: { demographics: null } })
+      ).toEqual([]);
+      expect(Code.buildSnsHistoryDemographicsRows_({})).toEqual([]);
+    });
+
+    it('builds threads account rows only for metrics that came back', () => {
+      const snapshot = fixtureSnapshot();
+      snapshot.threads.views_30d = 53342;
+      snapshot.threads.interactions_30d = {
+        total: 808,
+        likes: 654,
+        replies: 151,
+        reposts: 3,
+        quotes: null,
+      };
+      expect(Code.buildSnsHistoryThreadsAccountRows_(snapshot)).toEqual([
+        ['views_30d', 53342, '2026-11-09T00:00:00.000Z'],
+        ['interactions_total', 808, '2026-11-09T00:00:00.000Z'],
+        ['interactions_likes', 654, '2026-11-09T00:00:00.000Z'],
+        ['interactions_replies', 151, '2026-11-09T00:00:00.000Z'],
+        ['interactions_reposts', 3, '2026-11-09T00:00:00.000Z'],
+      ]);
+      // The plain fixture carries no Threads detail at all.
+      expect(Code.buildSnsHistoryThreadsAccountRows_(fixtureSnapshot())).toEqual([]);
+    });
+
     it('merges rows by key: fresh values win, fresh blanks keep stored values', () => {
       const merged = Code.mergeSnsHistoryRows_(
         [
@@ -1070,6 +1134,41 @@ describe('SNS follower counts', () => {
         1000,
         50,
         4,
+      ]);
+      // The demographics tab lands keyed by breakdown segment;
+      // the mocked breakdowns give two age/gender segments, two
+      // cities and two countries.
+      expect(sheets.ig_demographics.rows[0]).toEqual(
+        Code.SNS_HISTORY_DEMOGRAPHICS_COLUMNS
+      );
+      expect(sheets.ig_demographics.rows).toHaveLength(7);
+      expect(sheets.ig_demographics.rows[1].slice(0, 4)).toEqual([
+        'age_gender|25-34/F',
+        'age_gender',
+        '25-34/F',
+        500,
+      ]);
+      expect(sheets.ig_demographics.rows[6].slice(0, 4)).toEqual([
+        'country|US',
+        'country',
+        'US',
+        20,
+      ]);
+      // The Threads account tab: under the graph mock every
+      // account metric reads the same total (252), so all six
+      // metric rows land, with the interactions total summed.
+      expect(sheets.threads_account.rows[0]).toEqual(
+        Code.SNS_HISTORY_THREADS_ACCOUNT_COLUMNS
+      );
+      expect(
+        sheets.threads_account.rows.slice(1).map((row) => row.slice(0, 2))
+      ).toEqual([
+        ['views_30d', 252],
+        ['interactions_total', 1008],
+        ['interactions_likes', 252],
+        ['interactions_replies', 252],
+        ['interactions_reposts', 252],
+        ['interactions_quotes', 252],
       ]);
     });
 
@@ -1226,6 +1325,335 @@ describe('SNS follower counts', () => {
     });
   });
 
+  describe('Blog history append', () => {
+    let sheets;
+    let spreadsheet;
+    let openById;
+    let nowSpy;
+    let ga4Requests;
+
+    const makeSheet = () => {
+      const sheet = {
+        rows: [],
+        getLastRow() {
+          return sheet.rows.length;
+        },
+        getRange(row, col, numRows, numCols) {
+          return {
+            setValues: (values) => {
+              values.forEach((valueRow, i) => {
+                sheet.rows[row - 1 + i] = valueRow.slice();
+              });
+            },
+            getValues: () => {
+              const out = [];
+              for (let i = 0; i < numRows; i++) {
+                const source = sheet.rows[row - 1 + i] || [];
+                out.push(source.slice(col - 1, col - 1 + (numCols || source.length)));
+              }
+              return out;
+            },
+          };
+        },
+        appendRow(row) {
+          sheet.rows.push(row.slice());
+        },
+        deleteRows(position, count) {
+          sheet.rows.splice(position - 1, count);
+        },
+      };
+      return sheet;
+    };
+
+    const ga4Row = (dimensionValues, metricValues) => ({
+      dimensionValues: dimensionValues.map((value) => ({ value })),
+      metricValues: metricValues.map((value) => ({ value: String(value) })),
+    });
+
+    // Routes the GA4 runReport calls of the blog history by the
+    // request body: the by-date totals, the music_play counts,
+    // the wv_lcp speed aggregates and the per-path article views.
+    const mockGa4Blog = (overrides = {}) => {
+      const bodies = {
+        totals: [
+          ga4Row(['20261108'], [100, 40, 55]),
+          ga4Row(['20261109'], [30, 12, 15]),
+        ],
+        music: [ga4Row(['20261108'], [7])],
+        speed: [
+          ga4Row(['20261108'], [240000, 100]),
+          ga4Row(['20261109'], [5000, 2]),
+        ],
+        posts: [
+          ga4Row(['/1abcdefghijklmnopqrstuvwx', '記事タイトルA'], [10]),
+          ga4Row(['/blog/1abcdefghijklmnopqrstuvwx', '記事タイトルA別形'], [5]),
+          ga4Row(['/blog/2abcdefghijklmnopqrstuvwx', '(not set)'], [3]),
+          ga4Row(['/', 'トップ'], [999]),
+          ga4Row(['/blog/', 'ブログトップ'], [50]),
+        ],
+      };
+      Object.assign(bodies, overrides);
+      fetchHandler = (url, options) => {
+        if (!url.includes('analyticsdata.googleapis.com')) {
+          throw new Error('unexpected url: ' + url);
+        }
+        const body = JSON.parse(options.payload);
+        ga4Requests.push(body);
+        const dimensions = (body.dimensions || []).map((d) => d.name);
+        const filterText = JSON.stringify(body.dimensionFilter || {});
+        if (dimensions.includes('pagePath')) {
+          return res(200, { rows: bodies.posts });
+        }
+        if (filterText.includes('music_play')) {
+          return res(200, { rows: bodies.music });
+        }
+        if (filterText.includes('wv_lcp')) {
+          return res(200, { rows: bodies.speed });
+        }
+        return res(200, { rows: bodies.totals });
+      };
+    };
+
+    beforeEach(() => {
+      nowSpy = freezeNowAtNov9();
+      sheets = {};
+      spreadsheet = {
+        getSheetByName: (name) => sheets[name] || null,
+        insertSheet: (name) => {
+          sheets[name] = makeSheet();
+          return sheets[name];
+        },
+      };
+      openById = vi.fn(() => spreadsheet);
+      global.SpreadsheetApp = { openById };
+      ga4Requests = [];
+      store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
+      store.GA4_PROPERTY_ID = '561730442';
+    });
+
+    afterEach(() => {
+      nowSpy.mockRestore();
+    });
+
+    it('converts GA4 date keys to ISO dates', () => {
+      expect(Code.ga4DateKey_('20261109')).toBe('2026-11-09');
+      expect(Code.ga4DateKey_('2026-11-09')).toBe('');
+      expect(Code.ga4DateKey_(null)).toBe('');
+      expect(Code.ga4DateKey_('')).toBe('');
+    });
+
+    it('fetches yesterday and today and merges the three reports by date', () => {
+      mockGa4Blog();
+      const byDate = Code.fetchBlogDailyData_('561730442');
+      expect(byDate).toEqual({
+        '2026-11-08': {
+          views: 100,
+          users: 40,
+          sessions: 55,
+          avg_speed_ms: 2400,
+          music_plays: 7,
+        },
+        '2026-11-09': {
+          views: 30,
+          users: 12,
+          sessions: 15,
+          avg_speed_ms: 2500,
+          music_plays: null,
+        },
+      });
+      // The totals report asks for exactly yesterday..today (JST).
+      const totalsBody = ga4Requests.find((body) =>
+        (body.metrics || []).some((m) => m.name === 'screenPageViews')
+      );
+      expect(totalsBody.dateRanges).toEqual([
+        { startDate: '2026-11-08', endDate: '2026-11-09' },
+      ]);
+    });
+
+    it('returns null when the totals report fails, and blanks when only the side reports fail', () => {
+      fetchHandler = () => res(500, { error: { message: 'boom' } });
+      expect(Code.fetchBlogDailyData_('561730442')).toBeNull();
+
+      mockGa4Blog();
+      const inner = fetchHandler;
+      fetchHandler = (url, options) => {
+        const body = JSON.parse(options.payload);
+        const filterText = JSON.stringify(body.dimensionFilter || {});
+        if (filterText.includes('music_play') || filterText.includes('wv_lcp')) {
+          return res(500, { error: { message: 'boom' } });
+        }
+        return inner(url, options);
+      };
+      const byDate = Code.fetchBlogDailyData_('561730442');
+      expect(byDate['2026-11-08']).toEqual({
+        views: 100,
+        users: 40,
+        sessions: 55,
+        avg_speed_ms: null,
+        music_plays: null,
+      });
+    });
+
+    it('builds blog_daily rows oldest first with blanks for missing values', () => {
+      const rows = Code.buildBlogDailyRows_(
+        {
+          '2026-11-09': {
+            views: 30,
+            users: 12,
+            sessions: 15,
+            avg_speed_ms: null,
+            music_plays: null,
+          },
+          '2026-11-08': {
+            views: 100,
+            users: 40,
+            sessions: 55,
+            avg_speed_ms: 2400,
+            music_plays: 7,
+          },
+        },
+        '2026-11-09T03:00:00.000Z'
+      );
+      expect(rows).toEqual([
+        ['2026-11-08', 100, 40, 55, 2400, 7, '2026-11-09T03:00:00.000Z'],
+        ['2026-11-09', 30, 12, 15, '', '', '2026-11-09T03:00:00.000Z'],
+      ]);
+      expect(Code.buildBlogDailyRows_(null, 't')).toEqual([]);
+    });
+
+    it('merges split article paths under the canonical /blog/<id>', () => {
+      mockGa4Blog();
+      const posts = Code.fetchBlogPostsData_('561730442');
+      expect(posts).toEqual([
+        {
+          path: '/blog/1abcdefghijklmnopqrstuvwx',
+          title: '記事タイトルA',
+          views_28d: 15,
+        },
+        {
+          path: '/blog/2abcdefghijklmnopqrstuvwx',
+          title: '',
+          views_28d: 3,
+        },
+      ]);
+      expect(
+        Code.buildBlogPostsRows_(posts, '2026-11-09T03:00:00.000Z')
+      ).toEqual([
+        [
+          '/blog/1abcdefghijklmnopqrstuvwx',
+          '記事タイトルA',
+          15,
+          '2026-11-09T03:00:00.000Z',
+        ],
+        [
+          '/blog/2abcdefghijklmnopqrstuvwx',
+          '',
+          3,
+          '2026-11-09T03:00:00.000Z',
+        ],
+      ]);
+      // The window matches the /ga blog tab's default range.
+      const postsBody = ga4Requests.find((body) =>
+        (body.dimensions || []).some((d) => d.name === 'pagePath')
+      );
+      expect(postsBody.dateRanges).toEqual([
+        { startDate: '28daysAgo', endDate: 'today' },
+      ]);
+    });
+
+    it('returns null for the posts data when the report fails', () => {
+      fetchHandler = () => res(500, { error: { message: 'boom' } });
+      expect(Code.fetchBlogPostsData_('561730442')).toBeNull();
+    });
+
+    it('writes both blog tabs end to end and upserts on the next run', () => {
+      mockGa4Blog();
+      Code.appendBlogHistory_();
+      expect(openById).toHaveBeenCalledWith('history-sheet-id');
+      expect(sheets.blog_daily.rows[0]).toEqual(
+        Code.SNS_HISTORY_BLOG_DAILY_COLUMNS
+      );
+      expect(sheets.blog_daily.rows).toHaveLength(3);
+      expect(sheets.blog_daily.rows[1].slice(0, 6)).toEqual([
+        '2026-11-08',
+        100,
+        40,
+        55,
+        2400,
+        7,
+      ]);
+      expect(sheets.blog_daily.rows[2].slice(0, 6)).toEqual([
+        '2026-11-09',
+        30,
+        12,
+        15,
+        2500,
+        '',
+      ]);
+      expect(sheets.blog_posts.rows[0]).toEqual(
+        Code.SNS_HISTORY_BLOG_POSTS_COLUMNS
+      );
+      expect(sheets.blog_posts.rows).toHaveLength(3);
+
+      Code.appendBlogHistory_();
+      // Still one row per key after a second collection.
+      expect(sheets.blog_daily.rows).toHaveLength(3);
+      expect(sheets.blog_posts.rows).toHaveLength(3);
+      expect(sheets.account).toBeUndefined();
+    });
+
+    it('does nothing while either property is unset', () => {
+      mockGa4Blog();
+      delete store.GA4_PROPERTY_ID;
+      Code.appendBlogHistory_();
+      expect(openById).not.toHaveBeenCalled();
+      expect(ga4Requests).toHaveLength(0);
+
+      store.GA4_PROPERTY_ID = '561730442';
+      delete store.SNS_HISTORY_SHEET_ID;
+      Code.appendBlogHistory_();
+      expect(openById).not.toHaveBeenCalled();
+      expect(ga4Requests).toHaveLength(0);
+    });
+
+    it('keeps the collection successful when the blog write throws', () => {
+      mockGa4Blog();
+      openById.mockImplementation(() => {
+        throw new Error('drive exploded for history-sheet-id');
+      });
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        Code.appendBlogHistory_();
+        const failures = logSpy.mock.calls
+          .map((call) => String(call[0]))
+          .filter((line) => line.startsWith('Blog history append failed:'));
+        expect(failures).toHaveLength(1);
+        expect(failures[0]).not.toContain('history-sheet-id');
+      } finally {
+        logSpy.mockRestore();
+      }
+    });
+
+    it('collectSnsCounts rides the blog history along', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      mockGraphSuccess();
+      mockYouTubeFull();
+      const graphHandler = fetchHandler;
+      mockGa4Blog();
+      const ga4Handler = fetchHandler;
+      fetchHandler = (url, options) =>
+        url.includes('analyticsdata.googleapis.com')
+          ? ga4Handler(url, options)
+          : graphHandler(url);
+
+      Code.collectSnsCounts();
+
+      expect(sheets.blog_daily.rows).toHaveLength(3);
+      expect(sheets.blog_posts.rows).toHaveLength(3);
+      expect(sheets.account.rows).toHaveLength(2);
+    });
+  });
+
   describe('doGet action=sns_history', () => {
     const HEADER = Code.SNS_HISTORY_ACCOUNT_COLUMNS;
 
@@ -1338,16 +1766,16 @@ describe('SNS follower counts', () => {
       expect(json.rows.map((row) => row.ig_followers)).toEqual([1988, 2000]);
     });
 
-    it('caps the response at the newest 400 rows', () => {
+    it('caps the response at the newest 2400 rows', () => {
       const rows = [HEADER];
-      for (let i = 0; i < 405; i += 1) {
-        const at = new Date(Date.UTC(2026, 0, 1) + i * 6 * 3600 * 1000);
+      for (let i = 0; i < 2405; i += 1) {
+        const at = new Date(Date.UTC(2026, 0, 1) + i * 3600 * 1000);
         rows.push(dataRow({ collected_at: at.toISOString(), ig_followers: i }));
       }
       const json = serveHistory(makeReadableSheet(rows));
-      expect(json.rows).toHaveLength(400);
+      expect(json.rows).toHaveLength(2400);
       expect(json.rows[0].ig_followers).toBe(5);
-      expect(json.rows[399].ig_followers).toBe(404);
+      expect(json.rows[2399].ig_followers).toBe(2404);
     });
 
     it('rejects anonymous calls while authentication is configured', () => {
@@ -2949,14 +3377,14 @@ describe('SNS follower counts', () => {
   });
 
   describe('setupSnsTriggers', () => {
-    it('replaces existing collectSnsCounts triggers with one 6-hour trigger', () => {
+    it('replaces existing collectSnsCounts triggers with one hourly trigger', () => {
       const mine = { getHandlerFunction: () => 'collectSnsCounts' };
       const other = { getHandlerFunction: () => 'somethingElse' };
       triggers = [mine, other];
       Code.setupSnsTriggers();
       expect(global.ScriptApp.deleteTrigger).toHaveBeenCalledTimes(1);
       expect(global.ScriptApp.deleteTrigger).toHaveBeenCalledWith(mine);
-      expect(createdTriggers).toEqual([{ handler: 'collectSnsCounts', hours: 6 }]);
+      expect(createdTriggers).toEqual([{ handler: 'collectSnsCounts', hours: 1 }]);
     });
   });
 });

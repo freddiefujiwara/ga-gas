@@ -34,7 +34,7 @@ Muse の API 接続の仕組みは OAuth の入口が単一ドメインのサー
 
 YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得し、保存済みスナップショットだけを認証なしで返す。
 
-- 取得：`collectSnsCounts` を時間主導型トリガー（6時間ごと）で実行。トリガーはデプロイでは入らないため、エディタで `setupSnsTriggers` を1回実行して設置する
+- 取得：`collectSnsCounts` を時間主導型トリガー（1時間ごと）で実行。トリガーはデプロイでは入らないため、エディタで `setupSnsTriggers` を1回実行して設置する
 - 保存先：スクリプトプロパティ `SNS_COUNTS_SNAPSHOT`（各SNSの数値＋取得日時 collected_at）
 - 読み取り：`?action=sns_counts`。返すのはスナップショットのみで、トークンや GA4 データは含まない
 - YouTube：高度なサービス（YouTube Data API v3）で登録者数を取得。GCP プロジェクト側で YouTube Data API v3 の有効化が必要
@@ -71,10 +71,15 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - `daily` シート（キー `date` で upsert）：Instagram の日次フォロー。列は date、follows、unfollows、collected_at。`daily_follows` は収集のたびに過去30日分が再取得されるため、date をキーに上書きし、30日より古い日も残り続ける。両側 null の日は行を作らず、既存行も消さない
 - `threads_media` シート（キー `post_id` で upsert）：`threads.recent_posts` の投稿ごとに1行。列は collected_at、post_id、posted_at、type、text、permalink、views、likes、replies、reposts、quotes
 - `youtube_media` シート（キー `video_id` で upsert）：`youtube.recent_videos` の動画ごとに1行。列は collected_at、video_id、published_at、title、views、likes、comments。動画ごとの数値はもともと毎回の収集でアップロード一覧から取得していた分（最大10件）で、履歴のために追加の取得はしていない
+- `ig_demographics` シート（キー `breakdown_key` で upsert）：Instagram のフォロワー属性。列は breakdown_key、breakdown、key、value、collected_at。breakdown は age_gender（年代×性別、key は `25-34/F` の形）、city（上位の市）、country（上位の国）の3種で、キーで1行にまとめる。取得に失敗した breakdown は行を作らず、既存行も消さない
+- `threads_account` シート（キー `metric` で upsert）：Threads のアカウント指標（過去30日）。列は metric、value、collected_at。metric は views_30d、interactions_total / likes / replies / reposts / quotes。数値が取れた metric だけ行を作る
+- `blog_daily` シート（キー `date` で upsert）：ブログの日次 KPI を GA4 から取得して書く（スナップショット経由ではない）。列は date、views、users、sessions、avg_speed_ms、music_plays、collected_at。対象は前日（確定）と当日（途中経過、次の収集で上書き）。avg_speed_ms は `wv_lcp` イベントの平均値（eventValue / eventCount、ミリ秒）で、表示スピードの指標。music_plays はその日の `music_play` イベント件数
+- `blog_posts` シート（キー `path` で upsert）：ブログの記事ごとに1行。列は path、title、views_28d、collected_at。path は `/<id>` と `/blog/<id>` を一本化した正規形 `/blog/<id>`（フロントのランキングと同じ合算ルール、記事IDの判定は `action=top_articles` と同じ）。views_28d は直近28日の表示回数、title は GA4 の pageTitle
+- ブログの2タブは `SNS_HISTORY_SHEET_ID` と `GA4_PROPERTY_ID` の両方が設定されているときだけ書く。GA4 の取得に失敗したタブはスキップし、実行ログに1行出して収集自体は成功として扱う（SNS 側の書き込みとは独立）
 - upsert の方式：収集のたびにタブ全体を読み、キーでマージして（新しい取得値が勝つ。ただし新しい値が null の項目は空欄として扱い、既存値を残す＝null で潰さない）、ヘッダー＋1キー1行で書き戻し、余った行は削除する。この方式により、追記方式だった頃に貯まった `media` の重複行（30投稿×収集回数分）も、次回収集で自動的に1投稿1行へ整理される
 - どのシートも無ければ自動作成し、1行目が空（シートが空）のときだけヘッダー行を書く。既存のヘッダー行は upsert でも書き換えない
 - 書き込みに失敗しても取得自体は成功として扱い、実行ログに `SNS history append failed: <要約>` が1行出る（要約に秘密値・URL は含めない）
-- 読み取りは `?action=sns_history`（認証必須、sns_detail と同じゲート）で、/ga の推移グラフ用。`account` シートの行を collected_at 昇順で最大直近400行返し、項目は collected_at、ig_followers、threads_followers、youtube_subscribers、total_followers、media_count、views_30d、non_follower_pct、reach_30d、interactions_total、follows_30d、unfollows_30d、yt_total_views の13項目に絞る（空欄は null）。プロパティ未設定・シートが無い／空の場合はエラーにせず `rows: []` を返す
+- 読み取りは `?action=sns_history`（認証必須、sns_detail と同じゲート）で、/ga の推移グラフ用。`account` シートの行を collected_at 昇順で最大直近2400行返し（1時間ごとの収集で約100日分）、項目は collected_at、ig_followers、threads_followers、youtube_subscribers、total_followers、media_count、views_30d、non_follower_pct、reach_30d、interactions_total、follows_30d、unfollows_30d、yt_total_views の13項目に絞る（空欄は null）。プロパティ未設定・シートが無い／空の場合はエラーにせず `rows: []` を返す
 
 ## 診断関数 `debugSnsInsights`（手動実行専用）
 

@@ -376,8 +376,10 @@ function issueShareToken() {
 //   SNS_HISTORY_SHEET_ID (optional): spreadsheet that receives the
 //     history writes of every collection (see appendSnsHistory_):
 //     one appended row per collection on "account", one upserted
-//     row per post / video / day on the other tabs. Unset means
-//     no history is written.
+//     row per post / video / day / segment / metric on the other
+//     tabs. The same spreadsheet also receives the blog's GA4
+//     history on every collection (see appendBlogHistory_). Unset
+//     means no history is written.
 // The Instagram snapshot also carries account KPIs for the main
 // account: media_count (post count, available with instagram_basic)
 // plus views_30d / non_follower_pct from the account insights, which
@@ -2739,15 +2741,19 @@ function fetchYouTubeRecentVideos_() {
 //   - "account" is the one time series: one appended row per
 //     collection, the input of the /ga trend charts.
 //   - Every post-shaped tab ("media", "threads_media",
-//     "youtube_media") and the "daily" tab hold
-//     ONE row per key (media_id / post_id / video_id / date) and
-//     are upserted: the whole tab is read back, the fresh rows are
+//     "youtube_media"), the "daily" tab, the follower-demographics
+//     tab ("ig_demographics") and the Threads account-metrics tab
+//     ("threads_account") hold ONE row per key (media_id / post_id /
+//     video_id / date / breakdown segment / metric) and are
+//     upserted: the whole tab is read back, the fresh rows are
 //     merged in by key — a fresh value wins, but a null in the
 //     fresh fetch becomes an empty cell and never erases the
 //     stored value — and the tab is rewritten as header + one row
 //     per key. That also folds duplicates written by earlier
 //     append-only collections into a single row per post on the
 //     next run.
+// The blog's GA4 numbers are written to the same spreadsheet by
+// appendBlogHistory_ below ("blog_daily" / "blog_posts").
 // All sheets are created when missing and get their header row
 // when still empty. The sheet ID is only ever read from the Script
 // Property, never written in code. Unset (the default) means no
@@ -2826,6 +2832,43 @@ const SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS = [
   'views',
   'likes',
   'comments',
+];
+// "ig_demographics" is keyed by its first column, the breakdown
+// and segment joined ("age_gender|25-34/F", "city|Kawaguchi",
+// "country|JP"), so the three follower_demographics breakdowns
+// share one tab in the same 1-key-1-row shape.
+const SNS_HISTORY_DEMOGRAPHICS_COLUMNS = [
+  'breakdown_key',
+  'breakdown',
+  'key',
+  'value',
+  'collected_at',
+];
+// "threads_account" is keyed by metric name: the Threads account
+// totals (30-day views and the interaction parts) that the
+// "account" tab never carried.
+const SNS_HISTORY_THREADS_ACCOUNT_COLUMNS = [
+  'metric',
+  'value',
+  'collected_at',
+];
+// The blog tabs (written by appendBlogHistory_ from GA4, not from
+// the SNS snapshot). "blog_daily" is keyed by date like "daily";
+// "blog_posts" is keyed by the canonical article path.
+const SNS_HISTORY_BLOG_DAILY_COLUMNS = [
+  'date',
+  'views',
+  'users',
+  'sessions',
+  'avg_speed_ms',
+  'music_plays',
+  'collected_at',
+];
+const SNS_HISTORY_BLOG_POSTS_COLUMNS = [
+  'path',
+  'title',
+  'views_28d',
+  'collected_at',
 ];
 // Numbers are written as numbers; anything else (null, undefined,
 // non-finite) becomes an empty cell so the sheet stays sortable.
@@ -2988,6 +3031,72 @@ function buildSnsHistoryYouTubeMediaRows_(snapshot) {
       snsHistoryNumCell_(item.comments),
     ];
   });
+}
+
+// One "ig_demographics" row per (breakdown, segment) of
+// instagram.demographics — the age x gender pyramid segments and
+// the top cities / countries the "account" tab has no shape for.
+// A breakdown the fresh fetch failed (null) contributes no rows,
+// so its stored segments are never erased by an outage; a segment
+// that drops out of a later top list simply keeps its last value.
+function buildSnsHistoryDemographicsRows_(snapshot) {
+  const snap = snapshot || {};
+  const instagram = snap.instagram || {};
+  const demographics = instagram.demographics || {};
+  const breakdowns = [
+    ['age_gender', demographics.age_gender],
+    ['city', demographics.top_cities],
+    ['country', demographics.top_countries],
+  ];
+  const rows = [];
+  breakdowns.forEach((pair) => {
+    const name = pair[0];
+    const segments = pair[1];
+    if (!Array.isArray(segments)) {
+      return;
+    }
+    segments.forEach((segment) => {
+      const item = segment || {};
+      const key = snsHistoryTextCell_(item.key);
+      if (!key) {
+        return;
+      }
+      rows.push([
+        name + '|' + key,
+        name,
+        key,
+        snsHistoryNumCell_(item.value),
+        snsHistoryTextCell_(snap.collected_at),
+      ]);
+    });
+  });
+  return rows;
+}
+
+// One "threads_account" row per Threads account metric — the
+// 30-day views and interaction totals the snapshot carries but no
+// tab held. Only metrics that came back as numbers produce a row
+// (the same rule as "daily"), so a failed metric never erases its
+// stored value through the upsert.
+function buildSnsHistoryThreadsAccountRows_(snapshot) {
+  const snap = snapshot || {};
+  const threads = snap.threads || {};
+  const interactions = threads.interactions_30d || {};
+  const candidates = [
+    ['views_30d', threads.views_30d],
+    ['interactions_total', interactions.total],
+    ['interactions_likes', interactions.likes],
+    ['interactions_replies', interactions.replies],
+    ['interactions_reposts', interactions.reposts],
+    ['interactions_quotes', interactions.quotes],
+  ];
+  return candidates
+    .filter((pair) => snsNumberOrNull_(pair[1]) !== null)
+    .map((pair) => [
+      pair[0],
+      snsHistoryNumCell_(pair[1]),
+      snsHistoryTextCell_(snap.collected_at),
+    ]);
 }
 
 // Returns the named sheet, creating it when missing, and writes the
@@ -3160,9 +3269,328 @@ function appendSnsHistory_(snapshot) {
       1,
       buildSnsHistoryYouTubeMediaRows_(snapshot)
     );
+    upsertSnsHistorySheet_(
+      spreadsheet,
+      'ig_demographics',
+      SNS_HISTORY_DEMOGRAPHICS_COLUMNS,
+      0,
+      buildSnsHistoryDemographicsRows_(snapshot)
+    );
+    upsertSnsHistorySheet_(
+      spreadsheet,
+      'threads_account',
+      SNS_HISTORY_THREADS_ACCOUNT_COLUMNS,
+      0,
+      buildSnsHistoryThreadsAccountRows_(snapshot)
+    );
   } catch (err) {
     console.log(
       'SNS history append failed: ' + summarizeSnsHistoryError_(err, sheetId)
+    );
+  }
+}
+
+// --- Blog history (GA4 -> the same history spreadsheet) ---
+// Stage 1 of serving /ga from the spreadsheet: the blog's numbers
+// join the SNS history in the same workbook, so the collection
+// side is complete before any read side switches over.
+// collectSnsCounts() calls appendBlogHistory_() right after the
+// SNS writes; it pulls the blog's GA4 numbers through the same
+// runReport bridge the /ga screen's live reads use
+// (buildReportRequest_ / fetchReport_ with GA4_PROPERTY_ID) and
+// upserts two tabs:
+//   - "blog_daily" (key: date): one row per calendar day —
+//     yesterday (final) and today (still in progress; the next
+//     collection overwrites it). views / users / sessions are the
+//     day's GA4 totals. avg_speed_ms is the day's average wv_lcp
+//     value: the blog sends each Core Web Vital as its own event
+//     (wv_lcp, wv_inp, ...) with the measured value in the
+//     standard `value` parameter, so the Data API aggregates the
+//     day's mean as eventValue / eventCount — the aggregation the
+//     earlier speed checks used — and LCP is the display-speed
+//     metric of that set. music_plays is the day's music_play
+//     eventCount.
+//   - "blog_posts" (key: path): one row per article, carrying its
+//     views over the last 28 days — the window the /ga blog tab
+//     reads. Article paths arrive split as /<id> and /blog/<id>;
+//     both merge under the canonical /blog/<id>, the merge rule
+//     the frontend's page ranking applies (and the same article-id
+//     test as action=top_articles). The title is GA4's pageTitle
+//     on the article's most-viewed path form.
+// Both writes are best-effort in the same way as the SNS history:
+// gated on SNS_HISTORY_SHEET_ID and GA4_PROPERTY_ID, and a failure
+// logs one line instead of failing the collection.
+
+const BLOG_POSTS_WINDOW_DAYS = 28;
+const BLOG_POSTS_FETCH_LIMIT = 1000;
+const BLOG_SPEED_EVENT_NAME = 'wv_lcp';
+const BLOG_MUSIC_EVENT_NAME = 'music_play';
+
+// One runReport call for the blog history: the report's rows, or
+// null when the API did not answer 200 (or the fetch itself
+// failed). Callers read null as "no fresh data", never as zeros.
+function fetchBlogReportRows_(propertyId, params) {
+  try {
+    const result = fetchReport_(propertyId, buildReportRequest_(params));
+    if (result.status !== 200) {
+      return null;
+    }
+    return (result.data && result.data.rows) || [];
+  } catch (err) {
+    return null;
+  }
+}
+
+// GA4 reports the date dimension as YYYYMMDD; the sheet keys days
+// by the ISO form every other daily tab uses. Anything else reads
+// as no date.
+function ga4DateKey_(value) {
+  const raw = String(value || '');
+  if (!/^\d{8}$/.test(raw)) {
+    return '';
+  }
+  return raw.slice(0, 4) + '-' + raw.slice(4, 6) + '-' + raw.slice(6, 8);
+}
+
+function blogReportRowDate_(row) {
+  const values = (row && row.dimensionValues) || [];
+  return ga4DateKey_(values[0] && values[0].value);
+}
+
+function blogReportMetric_(row, index) {
+  const values = (row && row.metricValues) || [];
+  const num = Number(values[index] && values[index].value);
+  return Number.isFinite(num) ? num : null;
+}
+
+// Yesterday's and today's blog numbers from GA4, keyed by ISO
+// date: { views, users, sessions, avg_speed_ms, music_plays },
+// each field null when its report carried no value for that day.
+// Returns null when the totals report itself failed — without it
+// there is no day to key the rows by. The music and speed reports
+// fail independently of it: their fields just stay null.
+function fetchBlogDailyData_(propertyId) {
+  const nowMs = Date.now();
+  const range = {
+    startDate: jstDateKey_(nowMs - SNS_DAY_MS),
+    endDate: jstDateKey_(nowMs),
+  };
+  const totals = fetchBlogReportRows_(
+    propertyId,
+    Object.assign({}, range, {
+      metrics: ['screenPageViews', 'activeUsers', 'sessions'],
+      dimensions: ['date'],
+      limit: 10,
+      offset: 0,
+      filters: [],
+    })
+  );
+  if (!totals) {
+    return null;
+  }
+  const byDate = {};
+  const day = (key) => {
+    if (!byDate[key]) {
+      byDate[key] = {
+        views: null,
+        users: null,
+        sessions: null,
+        avg_speed_ms: null,
+        music_plays: null,
+      };
+    }
+    return byDate[key];
+  };
+  totals.forEach((row) => {
+    const key = blogReportRowDate_(row);
+    if (!key) {
+      return;
+    }
+    const entry = day(key);
+    entry.views = blogReportMetric_(row, 0);
+    entry.users = blogReportMetric_(row, 1);
+    entry.sessions = blogReportMetric_(row, 2);
+  });
+  const music = fetchBlogReportRows_(
+    propertyId,
+    Object.assign({}, range, {
+      metrics: ['eventCount'],
+      dimensions: ['date'],
+      limit: 10,
+      offset: 0,
+      filters: parseFilterClauses_(
+        'eventName:exact:' + BLOG_MUSIC_EVENT_NAME
+      ),
+    })
+  );
+  if (music) {
+    music.forEach((row) => {
+      const key = blogReportRowDate_(row);
+      if (key) {
+        day(key).music_plays = blogReportMetric_(row, 0);
+      }
+    });
+  }
+  const speed = fetchBlogReportRows_(
+    propertyId,
+    Object.assign({}, range, {
+      metrics: ['eventValue', 'eventCount'],
+      dimensions: ['date'],
+      limit: 10,
+      offset: 0,
+      filters: parseFilterClauses_(
+        'eventName:exact:' + BLOG_SPEED_EVENT_NAME
+      ),
+    })
+  );
+  if (speed) {
+    speed.forEach((row) => {
+      const key = blogReportRowDate_(row);
+      if (!key) {
+        return;
+      }
+      const totalValue = blogReportMetric_(row, 0);
+      const count = blogReportMetric_(row, 1);
+      if (totalValue !== null && count) {
+        day(key).avg_speed_ms = Math.round(totalValue / count);
+      }
+    });
+  }
+  return byDate;
+}
+
+// One "blog_daily" row per day of fetchBlogDailyData_, oldest
+// first. A day the totals report did not mention never enters the
+// map, so a day GA4 has not processed yet neither records a row
+// nor erases a stored one through the upsert.
+function buildBlogDailyRows_(byDate, collectedAt) {
+  return Object.keys(byDate || {})
+    .sort()
+    .map((date) => {
+      const entry = byDate[date] || {};
+      return [
+        date,
+        snsHistoryNumCell_(entry.views),
+        snsHistoryNumCell_(entry.users),
+        snsHistoryNumCell_(entry.sessions),
+        snsHistoryNumCell_(entry.avg_speed_ms),
+        snsHistoryNumCell_(entry.music_plays),
+        snsHistoryTextCell_(collectedAt),
+      ];
+    });
+}
+
+// The blog's per-article views over the last 28 days, merged
+// under the canonical /blog/<id> path as described above. Returns
+// null when the report failed. Entries come back sorted by views
+// descending; the upsert keeps stored rows in place regardless.
+function fetchBlogPostsData_(propertyId) {
+  const rows = fetchBlogReportRows_(propertyId, {
+    startDate: BLOG_POSTS_WINDOW_DAYS + 'daysAgo',
+    endDate: 'today',
+    metrics: ['screenPageViews'],
+    dimensions: ['pagePath', 'pageTitle'],
+    limit: BLOG_POSTS_FETCH_LIMIT,
+    offset: 0,
+    filters: [],
+  });
+  if (!rows) {
+    return null;
+  }
+  const byPath = {};
+  rows.forEach((row) => {
+    const dimensionValues = (row && row.dimensionValues) || [];
+    const id = articleIdFromPath_(
+      dimensionValues[0] && dimensionValues[0].value
+    );
+    if (!id) {
+      return;
+    }
+    const path = '/blog/' + id;
+    const views = blogReportMetric_(row, 0) || 0;
+    const rawTitle = String(
+      (dimensionValues[1] && dimensionValues[1].value) || ''
+    );
+    const title = rawTitle === '(not set)' ? '' : rawTitle;
+    const existing = byPath[path];
+    if (!existing) {
+      byPath[path] = { path, title, views_28d: views, topViews: views };
+      return;
+    }
+    existing.views_28d += views;
+    if (views > existing.topViews) {
+      existing.topViews = views;
+      existing.title = title;
+    }
+  });
+  return Object.keys(byPath)
+    .map((path) => byPath[path])
+    .sort((a, b) => b.views_28d - a.views_28d)
+    .map((entry) => ({
+      path: entry.path,
+      title: entry.title,
+      views_28d: entry.views_28d,
+    }));
+}
+
+// One "blog_posts" row per entry of fetchBlogPostsData_.
+function buildBlogPostsRows_(entries, collectedAt) {
+  return (entries || []).map((entry) => {
+    const item = entry || {};
+    return [
+      snsHistoryTextCell_(item.path),
+      snsHistoryTextCell_(item.title),
+      snsHistoryNumCell_(item.views_28d),
+      snsHistoryTextCell_(collectedAt),
+    ];
+  });
+}
+
+// Writes the blog's two history tabs into the SNS history
+// spreadsheet. No-op unless SNS_HISTORY_SHEET_ID and
+// GA4_PROPERTY_ID are both set (SpreadsheetApp is not touched and
+// GA4 is not queried then). Never throws, in the same way as
+// appendSnsHistory_: a failed tab is logged and skipped, and the
+// collection that called it still counts as a success.
+function appendBlogHistory_() {
+  const sheetId = getScriptProperty_(SNS_HISTORY_SHEET_ID_PROPERTY);
+  if (!sheetId) {
+    return;
+  }
+  const propertyId = getScriptProperty_('GA4_PROPERTY_ID');
+  if (!propertyId) {
+    return;
+  }
+  try {
+    const spreadsheet = SpreadsheetApp.openById(sheetId);
+    const collectedAt = new Date().toISOString();
+    const byDate = fetchBlogDailyData_(propertyId);
+    if (byDate) {
+      upsertSnsHistorySheet_(
+        spreadsheet,
+        'blog_daily',
+        SNS_HISTORY_BLOG_DAILY_COLUMNS,
+        0,
+        buildBlogDailyRows_(byDate, collectedAt)
+      );
+    } else {
+      console.log('Blog history: daily report failed, blog_daily skipped');
+    }
+    const posts = fetchBlogPostsData_(propertyId);
+    if (posts) {
+      upsertSnsHistorySheet_(
+        spreadsheet,
+        'blog_posts',
+        SNS_HISTORY_BLOG_POSTS_COLUMNS,
+        0,
+        buildBlogPostsRows_(posts, collectedAt)
+      );
+    } else {
+      console.log('Blog history: posts report failed, blog_posts skipped');
+    }
+  } catch (err) {
+    console.log(
+      'Blog history append failed: ' + summarizeSnsHistoryError_(err, sheetId)
     );
   }
 }
@@ -3171,8 +3599,10 @@ function appendSnsHistory_(snapshot) {
 // The authenticated counterpart of the append above: the /ga
 // trend charts read the "account" sheet back through this action.
 // Only the columns the charts need are served, and the response is
-// capped at the newest 400 rows (about 100 days at four collections
-// a day). An unset property or a missing/empty sheet is not an
+// capped at the newest 2400 rows (about 100 days at hourly
+// collections — the cap counts rows, so it grew with the move from
+// 6-hourly to hourly collection to keep the same window). An
+// unset property or a missing/empty sheet is not an
 // error: the history simply has not started yet, so rows is [].
 
 const SNS_HISTORY_RESPONSE_COLUMNS = [
@@ -3190,7 +3620,7 @@ const SNS_HISTORY_RESPONSE_COLUMNS = [
   'unfollows_30d',
   'yt_total_views',
 ];
-const SNS_HISTORY_MAX_ROWS = 400;
+const SNS_HISTORY_MAX_ROWS = 2400;
 
 // Sheets hands date cells back as Date objects and numbers as
 // numbers, while untouched cells come back as ''. Normalize to the
@@ -3349,18 +3779,19 @@ function collectSnsCounts() {
     JSON.stringify(snapshot)
   );
   appendSnsHistory_(snapshot);
+  appendBlogHistory_();
   console.log('SNS counts collected: ' + JSON.stringify(snapshot));
   return snapshot;
 }
 
-// Editor helper: (re)install the 6-hour time-driven trigger for
+// Editor helper: (re)install the hourly time-driven trigger for
 // collectSnsCounts. Run once from the editor after deployment; triggers
 // are not part of the deployed code.
 function setupSnsTriggers() {
   ScriptApp.getProjectTriggers()
     .filter((trigger) => trigger.getHandlerFunction() === 'collectSnsCounts')
     .forEach((trigger) => ScriptApp.deleteTrigger(trigger));
-  ScriptApp.newTrigger('collectSnsCounts').timeBased().everyHours(6).create();
+  ScriptApp.newTrigger('collectSnsCounts').timeBased().everyHours(1).create();
 }
 
 const DEFAULT_START = '28daysAgo';
@@ -3724,6 +4155,15 @@ if (typeof exports !== 'undefined') {
   exports.buildSnsHistoryDailyRows_ = buildSnsHistoryDailyRows_;
   exports.buildSnsHistoryThreadsMediaRows_ = buildSnsHistoryThreadsMediaRows_;
   exports.buildSnsHistoryYouTubeMediaRows_ = buildSnsHistoryYouTubeMediaRows_;
+  exports.buildSnsHistoryDemographicsRows_ = buildSnsHistoryDemographicsRows_;
+  exports.buildSnsHistoryThreadsAccountRows_ = buildSnsHistoryThreadsAccountRows_;
+  exports.appendBlogHistory_ = appendBlogHistory_;
+  exports.fetchBlogReportRows_ = fetchBlogReportRows_;
+  exports.fetchBlogDailyData_ = fetchBlogDailyData_;
+  exports.buildBlogDailyRows_ = buildBlogDailyRows_;
+  exports.fetchBlogPostsData_ = fetchBlogPostsData_;
+  exports.buildBlogPostsRows_ = buildBlogPostsRows_;
+  exports.ga4DateKey_ = ga4DateKey_;
   exports.mergeSnsHistoryRows_ = mergeSnsHistoryRows_;
   exports.snsHistoryKeyCell_ = snsHistoryKeyCell_;
   exports.readSnsHistoryRows_ = readSnsHistoryRows_;
@@ -3735,4 +4175,8 @@ if (typeof exports !== 'undefined') {
   exports.SNS_HISTORY_DAILY_COLUMNS = SNS_HISTORY_DAILY_COLUMNS;
   exports.SNS_HISTORY_THREADS_MEDIA_COLUMNS = SNS_HISTORY_THREADS_MEDIA_COLUMNS;
   exports.SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS = SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS;
+  exports.SNS_HISTORY_DEMOGRAPHICS_COLUMNS = SNS_HISTORY_DEMOGRAPHICS_COLUMNS;
+  exports.SNS_HISTORY_THREADS_ACCOUNT_COLUMNS = SNS_HISTORY_THREADS_ACCOUNT_COLUMNS;
+  exports.SNS_HISTORY_BLOG_DAILY_COLUMNS = SNS_HISTORY_BLOG_DAILY_COLUMNS;
+  exports.SNS_HISTORY_BLOG_POSTS_COLUMNS = SNS_HISTORY_BLOG_POSTS_COLUMNS;
 }
