@@ -374,14 +374,12 @@ function issueShareToken() {
 //     (default: this Web App's own /exec URL); the same URI must be
 //     registered in the Threads app's settings.
 //   FACEBOOK_APP_ID / FACEBOOK_APP_SECRET (optional): credentials of
-//     the Meta app used for the Facebook Page (a normal Meta app with
-//     the Facebook Login product; a separate app from the Threads
-//     one, because the two login products keep separate settings).
-//     When set, the Page's tokens can be obtained entirely inside
-//     GAS, mirroring the Threads flow: run facebookAuthorizeUrl() in
-//     the editor, open the logged URL and approve the
-//     pages_show_list and pages_read_engagement scopes; the OAuth
-//     callback lands on this Web App's /exec with
+//     the Meta app used for the Facebook Page (a separate app from
+//     the Threads one, because the two login products keep separate
+//     settings). When set, the Page's tokens can be obtained
+//     entirely inside GAS, mirroring the Threads flow: run
+//     facebookAuthorizeUrl() in the editor, open the logged URL and
+//     approve; the OAuth callback lands on this Web App's /exec with
 //     action=facebook_callback (see handleFacebookOAuthCallback_)
 //     and stores the long-lived user token in
 //     FACEBOOK_USER_ACCESS_TOKEN (acquisition time in
@@ -397,6 +395,18 @@ function issueShareToken() {
 //     (default: this Web App's own /exec URL plus
 //     ?action=facebook_callback); the same URI must be registered
 //     in the Meta app's Facebook Login settings.
+//   FACEBOOK_CONFIG_ID (optional, required for Facebook Login for
+//     Business): the id of the Configuration created in the Meta
+//     app's Facebook Login for Business settings. Apps on that
+//     product (e.g. the "Manage everything on your Page" use case)
+//     do not take scopes on the authorize URL; the Configuration
+//     bundles the permissions (pages_show_list,
+//     pages_read_engagement) and the Page asset they apply to.
+//     When this property is set, facebookAuthorizeUrl() builds the
+//     config_id form of the URL; without it, authorizing through
+//     such an app yields a token whose me/accounts is empty, and no
+//     Page token can be stored. Leave it unset for a plain Facebook
+//     Login app, which uses the scope form.
 //   SNS_HISTORY_SHEET_ID (optional): spreadsheet that receives one
 //     history row per collection (see appendSnsHistory_). Unset means
 //     no history is written.
@@ -1695,10 +1705,21 @@ function refreshThreadsTokenIfNeeded() {
 // ones, through the channel's own login product: the owner runs
 // facebookAuthorizeUrl() in the editor, opens the logged URL and
 // approves the pages_show_list and pages_read_engagement scopes.
-// pages_show_list covers listing the owner's Pages through
-// me/accounts (and with it, receiving the Page access tokens), and
-// pages_read_engagement covers the Page insights and the Page's own
-// published posts, message text included. pages_read_user_content
+// There are two shapes of that approval. A plain Facebook Login app
+// takes the scopes on the dialog URL itself. An app on Facebook
+// Login for Business (the "Manage everything on your Page" use
+// case, for example) cannot: the permissions and the assets they
+// cover are bundled into a Configuration in the app's settings, and
+// the dialog takes the Configuration's id (config_id) instead of
+// scopes — without it the token is granted the scopes yet
+// me/accounts hands back no Page, because no Page asset was ever
+// attached. facebookAuthorizeUrl() therefore switches to the
+// config_id form when FACEBOOK_CONFIG_ID is set. Everything after
+// the approval is identical for both shapes: pages_show_list covers
+// listing the owner's Pages through me/accounts (and with it,
+// receiving the Page access tokens), and pages_read_engagement
+// covers the Page insights and the Page's own published posts,
+// message text included. pages_read_user_content
 // is deliberately NOT requested: it governs content posted by other
 // people on the Page (visitor posts, comments, reviews), which this
 // collection never reads. Facebook redirects the browser back to
@@ -1716,7 +1737,10 @@ const FACEBOOK_AUTHORIZE_URL = 'https://www.facebook.com/v25.0/dialog/oauth';
 // Scopes requested at authorization time, comma-separated as the
 // Facebook dialog expects. A refreshed token keeps the scopes of
 // the original authorization, so widening the scope later requires
-// one fresh authorization run.
+// one fresh authorization run. Only used when FACEBOOK_CONFIG_ID
+// is not set: Facebook Login for Business takes the permissions
+// from the Configuration instead, so the dialog URL carries the
+// config_id and no scope at all.
 const FACEBOOK_OAUTH_SCOPES = 'pages_show_list,pages_read_engagement';
 const FACEBOOK_TOKEN_URL = 'https://graph.facebook.com/v25.0/oauth/access_token';
 
@@ -1739,7 +1763,11 @@ function facebookRedirectUri_() {
 // Editor helper: builds the Facebook authorization URL and logs
 // it. Open the logged URL in a browser and approve; the callback
 // stores the long-lived user token and the Page access token in
-// the Script Properties.
+// the Script Properties. When FACEBOOK_CONFIG_ID names a Facebook
+// Login for Business Configuration, the URL is built in the
+// config_id form (no scope parameter — the Configuration carries
+// the permissions and the Page asset); otherwise the plain
+// scope form is used.
 function facebookAuthorizeUrl() {
   const appId = getScriptProperty_('FACEBOOK_APP_ID');
   if (!appId) {
@@ -1756,14 +1784,15 @@ function facebookAuthorizeUrl() {
     FACEBOOK_OAUTH_STATE_PROPERTY,
     state
   );
+  const configId = getScriptProperty_('FACEBOOK_CONFIG_ID');
   const url =
     FACEBOOK_AUTHORIZE_URL +
     '?client_id=' +
     encodeURIComponent(appId) +
+    (configId ? '&config_id=' + encodeURIComponent(configId) : '') +
     '&redirect_uri=' +
     encodeURIComponent(redirectUri) +
-    '&scope=' +
-    FACEBOOK_OAUTH_SCOPES +
+    (configId ? '' : '&scope=' + FACEBOOK_OAUTH_SCOPES) +
     '&response_type=code&state=' +
     encodeURIComponent(state);
   console.log('Facebook authorize URL: ' + url);
@@ -1793,10 +1822,23 @@ function fetchFacebookPages_(userToken) {
 // Picks the Page the collection should read: the one named by the
 // FACEBOOK_PAGE_ID property when it is set (an id that is not
 // among the managed Pages is an error, never a silent switch to a
-// different Page), otherwise the first managed Page.
+// different Page), otherwise the first managed Page. An empty
+// me/accounts is spelled out rather than left as a bare failure:
+// the token was authorized, but no Page came with it — the classic
+// cause is an authorization that never selected a Page (with
+// Facebook Login for Business, a Configuration that does not
+// include the Page), and no Page token can be stored until a
+// fresh authorization grants one.
 function selectFacebookPage_(pages) {
   if (!pages || !pages.length) {
-    return { page: null, error: 'no managed Pages in me/accounts' };
+    return {
+      page: null,
+      error:
+        'me/accounts returned 0 Pages: no Page was granted by the ' +
+        'authorization — select the Page when authorizing ' +
+        '(with Facebook Login for Business, the Configuration ' +
+        'must include the Page)',
+    };
   }
   const wanted = getScriptProperty_('FACEBOOK_PAGE_ID');
   if (wanted) {
@@ -4109,6 +4151,18 @@ function htmlOut_(html) {
   );
 }
 
+// Escapes a plain-text string for interpolation into one of the
+// htmlOut_ pages. Used for the secret-free OAuth error summaries:
+// they are built from API response bodies, so their text is not
+// markup-safe by construction.
+function escapeHtml_(text) {
+  return String(text == null ? '' : text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 function doGet(e) {
   try {
     const parameter = (e && e.parameter) || {};
@@ -4138,9 +4192,17 @@ function doGet(e) {
           );
         }
         console.log('Facebook OAuth callback failed: ' + result.error);
+        // The failure page carries the same secret-free summary
+        // the log gets: the authorization runs in the owner's
+        // browser, so the likely cause (above all, me/accounts
+        // returning 0 Pages) should be readable on the spot
+        // instead of only in the execution log.
         return htmlOut_(
           '<!DOCTYPE html><html><body>' +
             '<p>Facebook の認可に失敗しました。Apps Script の実行ログを確認してください。</p>' +
+            '<p>' +
+            escapeHtml_(result.error) +
+            '</p>' +
             '</body></html>'
         );
       }
@@ -4401,6 +4463,7 @@ if (typeof exports !== 'undefined') {
   exports.debugFacebook = debugFacebook;
   exports.SNS_COUNTS_INCLUDE_FACEBOOK = SNS_COUNTS_INCLUDE_FACEBOOK;
   exports.htmlOut_ = htmlOut_;
+  exports.escapeHtml_ = escapeHtml_;
   exports.appendSnsHistory_ = appendSnsHistory_;
   exports.buildSnsHistoryResponse_ = buildSnsHistoryResponse_;
   exports.SNS_HISTORY_RESPONSE_COLUMNS = SNS_HISTORY_RESPONSE_COLUMNS;
