@@ -333,7 +333,7 @@ function issueShareToken() {
   console.log('Share URL (expires ' + session.expires_at + '): ' + url);
   return url;
 }
-// --- SNS follower counts (YouTube / Instagram / Threads / Facebook) ---
+// --- SNS follower counts (YouTube / Instagram / Threads) ---
 // collectSnsCounts() runs on a time-driven trigger (see setupSnsTriggers)
 // and stores a snapshot in the Script Property SNS_COUNTS_SNAPSHOT.
 // The action=sns_counts endpoint is public by design: it only ever
@@ -352,7 +352,7 @@ function issueShareToken() {
 //     by refreshMetaTokenIfNeeded_().
 //   META_THREADS_ACCESS_TOKEN (optional): Threads long-lived token, used
 //     for graph.threads.net when set (Threads tokens are issued per app
-//     through the Threads use case, separately from Facebook tokens).
+//     through the Threads use case, separately from the token above).
 //     Falls back to META_ACCESS_TOKEN when unset. When its expiry is
 //     recorded in META_THREADS_TOKEN_EXPIRES_AT, it is refreshed with
 //     th_refresh_token in the same way.
@@ -373,40 +373,6 @@ function issueShareToken() {
 //     running. THREADS_REDIRECT_URI may override the redirect URI
 //     (default: this Web App's own /exec URL); the same URI must be
 //     registered in the Threads app's settings.
-//   FACEBOOK_APP_ID / FACEBOOK_APP_SECRET (optional): credentials of
-//     the Meta app used for the Facebook Page (a separate app from
-//     the Threads one, because the two login products keep separate
-//     settings). When set, the Page's tokens can be obtained
-//     entirely inside GAS, mirroring the Threads flow: run
-//     facebookAuthorizeUrl() in the editor, open the logged URL and
-//     approve; the OAuth callback lands on this Web App's /exec with
-//     action=facebook_callback (see handleFacebookOAuthCallback_)
-//     and stores the long-lived user token in
-//     FACEBOOK_USER_ACCESS_TOKEN (acquisition time in
-//     FACEBOOK_TOKEN_AT, expiry in FACEBOOK_TOKEN_EXPIRES_AT) and
-//     the selected Page's access token and id in
-//     FACEBOOK_PAGE_ACCESS_TOKEN / FACEBOOK_PAGE_ID. The Page is the
-//     one named by FACEBOOK_PAGE_ID when that property is set
-//     beforehand, otherwise the first Page in me/accounts.
-//     refreshFacebookTokenIfNeeded() re-exchanges the user token
-//     once it is close to expiry and re-reads the Page token, so no
-//     manual re-authorization is needed while the collections keep
-//     running. FACEBOOK_REDIRECT_URI may override the redirect URI
-//     (default: this Web App's own /exec URL plus
-//     ?action=facebook_callback); the same URI must be registered
-//     in the Meta app's Facebook Login settings.
-//   FACEBOOK_CONFIG_ID (optional, required for Facebook Login for
-//     Business): the id of the Configuration created in the Meta
-//     app's Facebook Login for Business settings. Apps on that
-//     product (e.g. the "Manage everything on your Page" use case)
-//     do not take scopes on the authorize URL; the Configuration
-//     bundles the permissions (pages_show_list,
-//     pages_read_engagement) and the Page asset they apply to.
-//     When this property is set, facebookAuthorizeUrl() builds the
-//     config_id form of the URL; without it, authorizing through
-//     such an app yields a token whose me/accounts is empty, and no
-//     Page token can be stored. Leave it unset for a plain Facebook
-//     Login app, which uses the scope form.
 //   SNS_HISTORY_SHEET_ID (optional): spreadsheet that receives the
 //     history writes of every collection (see appendSnsHistory_):
 //     one appended row per collection on "account", one upserted
@@ -423,15 +389,6 @@ function issueShareToken() {
 // count — the account metrics and per-post insights described in
 // the Threads detail section below — under the same rule, with
 // threads.detail_error / threads.posts_error as the summaries.
-// The Facebook section follows the same pattern again: the Page's
-// follower count (fan_count) in the snapshot, the account metrics
-// and per-post insights described in the Facebook detail section
-// below, with facebook.detail_error / facebook.posts_error as the
-// summaries and facebook.facebook_error holding the token refresh
-// summary (the threads_error counterpart). One deliberate
-// difference: the public sns_counts projection does NOT include
-// the Facebook follower count yet — see SNS_COUNTS_INCLUDE_FACEBOOK
-// below.
 
 const SNS_SNAPSHOT_PROPERTY = 'SNS_COUNTS_SNAPSHOT';
 const SNS_YOUTUBE_CHANNEL_ID = 'UCbiDZXbr391oT_vsRiqwPFg';
@@ -441,16 +398,6 @@ const SNS_THREADS_USER_ID = '17841462976834295'; // @freddiefujiwara
 const META_GRAPH_BASE = 'https://graph.facebook.com/v25.0/';
 const THREADS_GRAPH_BASE = 'https://graph.threads.net/v1.0/';
 const SNS_TOKEN_REFRESH_WINDOW_MS = 10 * 24 * 60 * 60 * 1000;
-// Whether the public action=sns_counts projection carries the
-// Facebook Page follower count. The snapshot always records it
-// (facebook.followers), and the authenticated sns_detail always
-// serves it; this flag only governs the public projection. It is
-// off for now on purpose: the consumers of sns_counts (the top
-// page) sum the projected sections into the "SNS延べフォロワー数"
-// total, so projecting Facebook would silently change what that
-// total means. Flip to true only when the owner decides Facebook
-// joins the total.
-const SNS_COUNTS_INCLUDE_FACEBOOK = false;
 
 function getSnsCountsSnapshot_() {
   const raw = getScriptProperty_(SNS_SNAPSHOT_PROPERTY);
@@ -473,60 +420,41 @@ function getSnsCountsSnapshot_() {
 function buildSnsCountsResponse_() {
   const snapshot = getSnsCountsSnapshot_();
   if (!snapshot) {
-    return withSnsFacebookProjection_(
-      {
-        ok: true,
-        action: 'sns_counts',
-        collected_at: null,
-        youtube: { subscribers: null },
-        instagram: {
-          freddiefujiwara: null,
-          anemone_cancer: null,
-          media_count: null,
-          views_30d: null,
-          non_follower_pct: null,
-          insights_error: null,
-        },
-        threads: { followers: null },
+    return {
+      ok: true,
+      action: 'sns_counts',
+      collected_at: null,
+      youtube: { subscribers: null },
+      instagram: {
+        freddiefujiwara: null,
+        anemone_cancer: null,
+        media_count: null,
+        views_30d: null,
+        non_follower_pct: null,
+        insights_error: null,
       },
-      null
-    );
+      threads: { followers: null },
+    };
   }
   const youtube = snapshot.youtube || {};
   const instagram = snapshot.instagram || {};
   const threads = snapshot.threads || {};
-  const facebook = snapshot.facebook || {};
-  return withSnsFacebookProjection_(
-    {
-      ok: true,
-      action: 'sns_counts',
-      collected_at: snapshot.collected_at || null,
-      youtube: { subscribers: snsNumberOrNull_(youtube.subscribers) },
-      instagram: {
-        freddiefujiwara: snsNumberOrNull_(instagram.freddiefujiwara),
-        anemone_cancer: snsNumberOrNull_(instagram.anemone_cancer),
-        media_count: snsNumberOrNull_(instagram.media_count),
-        views_30d: snsNumberOrNull_(instagram.views_30d),
-        non_follower_pct: snsNumberOrNull_(instagram.non_follower_pct),
-        insights_error:
-          instagram.insights_error != null ? instagram.insights_error : null,
-      },
-      threads: { followers: snsNumberOrNull_(threads.followers) },
+  return {
+    ok: true,
+    action: 'sns_counts',
+    collected_at: snapshot.collected_at || null,
+    youtube: { subscribers: snsNumberOrNull_(youtube.subscribers) },
+    instagram: {
+      freddiefujiwara: snsNumberOrNull_(instagram.freddiefujiwara),
+      anemone_cancer: snsNumberOrNull_(instagram.anemone_cancer),
+      media_count: snsNumberOrNull_(instagram.media_count),
+      views_30d: snsNumberOrNull_(instagram.views_30d),
+      non_follower_pct: snsNumberOrNull_(instagram.non_follower_pct),
+      insights_error:
+        instagram.insights_error != null ? instagram.insights_error : null,
     },
-    facebook.followers
-  );
-}
-
-// Adds the facebook section to a public sns_counts response when
-// SNS_COUNTS_INCLUDE_FACEBOOK allows it (see the constant). Kept as
-// one small step so the "include Facebook in the public counts (and
-// therefore in the SNS total)" decision stays a single visible
-// switch, separate from the collection itself.
-function withSnsFacebookProjection_(response, followers) {
-  if (SNS_COUNTS_INCLUDE_FACEBOOK) {
-    response.facebook = { followers: snsNumberOrNull_(followers) };
-  }
-  return response;
+    threads: { followers: snsNumberOrNull_(threads.followers) },
+  };
 }
 
 function snsNumberOrNull_(value) {
@@ -585,19 +513,6 @@ function buildEmptySnsDetail_() {
         reposts: null,
         quotes: null,
       },
-      detail_error: null,
-      recent_posts: null,
-      posts_error: null,
-    },
-    facebook: {
-      followers: null,
-      facebook_error: null,
-      views_28d: null,
-      unique_viewers_28d: null,
-      engagement_28d: null,
-      profile_visits_28d: null,
-      new_followers_28d: null,
-      unfollowers_28d: null,
       detail_error: null,
       recent_posts: null,
       posts_error: null,
@@ -1013,378 +928,6 @@ function parseThreadsInsightsByName_(data) {
   return totals;
 }
 
-// --- Facebook Page (followers + detail, mirroring Threads) ------
-// The Facebook Page joins the snapshot the same way Threads did:
-// the follower count is part of every collection, and
-// collectSnsCounts() also gathers, into the snapshot's facebook
-// section (served in full only through the authenticated
-// action=sns_detail; the public projection follows
-// SNS_COUNTS_INCLUDE_FACEBOOK):
-//   - the Page's follower count from the Page node itself
-//     (fan_count, with followers_count as the fallback field);
-//   - account-level totals for the last 28 days from the Page
-//     insights edge (views / unique viewers / engagement / profile
-//     visits / new followers / unfollowers), failures summarised
-//     in facebook.detail_error;
-//   - the newest published posts (id, message, created_time,
-//     permalink) from the Page's published_posts edge, each with
-//     its post insights (views / unique viewers / engagements /
-//     clicks / link clicks), failures summarised in
-//     facebook.posts_error.
-// The access token is the Page access token stored by the OAuth
-// flow below (FACEBOOK_PAGE_ACCESS_TOKEN) — never the shared
-// META_ACCESS_TOKEN, which belongs to the Instagram app and may
-// not even hold Page permissions. Every fetch fails independently,
-// exactly like the other channels: an unobtainable value stays
-// null and the rest of the snapshot is unaffected, and error
-// summaries are built from response status/body only, never from
-// a request URL.
-
-// The two inputs every Facebook fetch needs, resolved the same way
-// everywhere: the Page access token and the Page id, both stored
-// by the OAuth flow (FACEBOOK_PAGE_ID can also be set by hand
-// beforehand to pin which Page the callback selects).
-function facebookPageToken_() {
-  return getScriptProperty_('FACEBOOK_PAGE_ACCESS_TOKEN');
-}
-
-function facebookPageId_() {
-  return getScriptProperty_('FACEBOOK_PAGE_ID');
-}
-
-// Reads the follower count out of a Page node response, or null.
-// fan_count is the long-standing field for a Page's total likes /
-// follows; followers_count is the newer twin. Prefer fan_count.
-function parseFacebookFanCount_(data) {
-  if (!data) {
-    return null;
-  }
-  const fanCount = Number(data.fan_count);
-  if (Number.isFinite(fanCount)) {
-    return fanCount;
-  }
-  const followersCount = Number(data.followers_count);
-  return Number.isFinite(followersCount) ? followersCount : null;
-}
-
-function fetchFacebookFollowers_() {
-  const token = facebookPageToken_();
-  const pageId = facebookPageId_();
-  if (!token || !pageId) {
-    return null;
-  }
-  try {
-    const res = UrlFetchApp.fetch(
-      META_GRAPH_BASE +
-        pageId +
-        '?fields=fan_count,followers_count&access_token=' +
-        encodeURIComponent(token),
-      { muteHttpExceptions: true }
-    );
-    if (res.getResponseCode() !== 200) {
-      return null;
-    }
-    return parseFacebookFanCount_(JSON.parse(res.getContentText()));
-  } catch (err) {
-    return null;
-  }
-}
-
-// --- Facebook detail (account metrics + per-post, sns_detail only)
-
-const SNS_FACEBOOK_RECENT_POSTS_LIMIT = 30;
-// Account metrics cover the last 28 days, the window the Page
-// insights preset (and the facebook-cli check that confirmed the
-// data exists) uses, rather than the 30 days of the other channels.
-const FACEBOOK_INSIGHTS_WINDOW_DAYS = 28;
-
-function facebookInsightsWindow_() {
-  const until = Math.floor(Date.now() / 1000);
-  return { since: until - FACEBOOK_INSIGHTS_WINDOW_DAYS * 24 * 60 * 60, until };
-}
-
-// Page insights metric names per logical metric, tried in order.
-// Meta renamed the Page "impressions" family to the "media view"
-// family, so the current name goes first and the long-standing
-// name stays as the fallback; an insights request for a name the
-// API no longer knows fails on its own and the next candidate is
-// tried. Only when every candidate fails does the logical metric
-// record an error (the last candidate's summary), so a working
-// fallback never pollutes facebook.detail_error. The exact live
-// behaviour is what debugFacebook() is for, mirroring how the
-// Threads metric shapes were pinned down.
-const FACEBOOK_PAGE_INSIGHT_METRICS = {
-  views: ['page_media_view', 'page_impressions'],
-  unique_viewers: ['page_media_view_unique', 'page_impressions_unique'],
-  engagement: ['page_post_engagements', 'page_engaged_users'],
-  profile_visits: ['page_views_total'],
-  new_followers: ['page_fan_adds_unique', 'page_fan_adds'],
-  unfollowers: ['page_fan_removes_unique', 'page_fan_removes'],
-};
-
-// One Page insights request for a single metric over the 28-day
-// window. The URL carries no token; callers append
-// '&access_token=...' themselves.
-function facebookPageInsightsUrl_(pageId, metric, window) {
-  return (
-    META_GRAPH_BASE +
-    pageId +
-    '/insights?metric=' +
-    metric +
-    '&period=day&since=' +
-    window.since +
-    '&until=' +
-    window.until
-  );
-}
-
-// Fetches one account-level Facebook metric as a 28-day total,
-// trying the candidate metric names in order. Returns
-// { value, error } and never throws; the total is read with
-// parseViewsDailyTotal_ (total_value when present, otherwise the
-// sum of the per-day values), the same metric-agnostic reading the
-// Threads account metrics use.
-function fetchFacebookPageInsightTotal_(logicalMetric) {
-  const token = facebookPageToken_();
-  const candidates = FACEBOOK_PAGE_INSIGHT_METRICS[logicalMetric] || [];
-  let lastError = null;
-  for (let i = 0; i < candidates.length; i++) {
-    const res = fetchInsightsJson_(
-      facebookPageInsightsUrl_(
-        facebookPageId_(),
-        candidates[i],
-        facebookInsightsWindow_()
-      ) +
-        '&access_token=' +
-        encodeURIComponent(token)
-    );
-    if (!res.error) {
-      return { value: parseViewsDailyTotal_(res.data), error: null };
-    }
-    lastError = res.error;
-  }
-  return { value: null, error: logicalMetric + ': ' + lastError };
-}
-
-// Account-level detail for the Facebook Page (last 28 days): views,
-// unique viewers, engagement, profile visits and the follower
-// flow. Each metric is a separate request, so one rejected metric
-// nulls only itself.
-function fetchFacebookAccountDetail_() {
-  const result = {
-    views_28d: null,
-    unique_viewers_28d: null,
-    engagement_28d: null,
-    profile_visits_28d: null,
-    new_followers_28d: null,
-    unfollowers_28d: null,
-    detail_error: null,
-  };
-  if (!facebookPageToken_() || !facebookPageId_()) {
-    return result;
-  }
-  const errors = [];
-  const grab = (logicalMetric, key) => {
-    const fetched = fetchFacebookPageInsightTotal_(logicalMetric);
-    if (fetched.error) {
-      errors.push(fetched.error);
-    }
-    result[key] = fetched.value;
-  };
-  grab('views', 'views_28d');
-  grab('unique_viewers', 'unique_viewers_28d');
-  grab('engagement', 'engagement_28d');
-  grab('profile_visits', 'profile_visits_28d');
-  grab('new_followers', 'new_followers_28d');
-  grab('unfollowers', 'unfollowers_28d');
-  result.detail_error = joinSnsErrors_(errors);
-  return result;
-}
-
-// The Page's own published posts (newest first). The URL carries
-// no token; callers append '&access_token=...' themselves so the
-// diagnostic can print the request with the token redacted.
-function facebookPostListUrl_(pageId, limit) {
-  return (
-    META_GRAPH_BASE +
-    pageId +
-    '/published_posts?fields=id,message,created_time,permalink_url&limit=' +
-    limit
-  );
-}
-
-// One snapshot entry for a Facebook post, with the insight values
-// starting null (filled in by fetchFacebookPostInsights_). The
-// message is passed through under the same safety cap as Instagram
-// captions, so the /ga screen can classify it exactly like the
-// other channels' posts.
-function buildFacebookPostEntry_(post) {
-  const message = post && post.message != null ? String(post.message) : '';
-  return {
-    id: post && post.id != null ? String(post.id) : null,
-    posted_at: (post && post.created_time) || null,
-    message: message.slice(0, SNS_CAPTION_MAX_LENGTH),
-    permalink: (post && post.permalink_url) || null,
-    views: null,
-    unique_viewers: null,
-    engagements: null,
-    clicks: null,
-    link_clicks: null,
-    saves: null,
-  };
-}
-
-// Metric sets tried in order for one post's insights, in the same
-// spirit as the Instagram MEDIA_INSIGHTS_ATTEMPTS_*: the current
-// "media view" names first, then the long-standing "impressions"
-// names, then a minimal set. An insights request fails as a whole
-// when one metric name is unknown, so a failure retries with the
-// next set and keeps whatever could be read.
-const FACEBOOK_POST_INSIGHTS_ATTEMPTS = [
-  'post_media_view,post_media_view_unique,post_engaged_users,post_clicks,post_clicks_by_type',
-  'post_impressions,post_impressions_unique,post_engaged_users,post_clicks,post_clicks_by_type',
-  'post_impressions,post_engaged_users',
-];
-
-// Maps one post insights response to the snapshot's key names.
-// Metrics absent from the response stay out of the map, so the
-// caller's nulls remain for them. post_clicks_by_type is the one
-// breakdown-shaped metric: its value is an object keyed by click
-// type, and only the "link clicks" count is lifted out. Page post
-// insights carry no saves metric (that is an Instagram concept),
-// so saves stays null rather than being guessed at.
-function parseFacebookPostInsights_(data) {
-  const values = {};
-  const entries = data && Array.isArray(data.data) ? data.data : [];
-  entries.forEach((entry) => {
-    if (!entry || !entry.name) {
-      return;
-    }
-    let raw = null;
-    if (Array.isArray(entry.values) && entry.values.length) {
-      raw = entry.values[0] && entry.values[0].value;
-    }
-    if (raw == null && entry.total_value) {
-      raw = entry.total_value.value;
-    }
-    if (entry.name === 'post_clicks_by_type') {
-      const linkClicks = Number(raw && raw['link clicks']);
-      if (Number.isFinite(linkClicks)) {
-        values.link_clicks = linkClicks;
-      }
-      return;
-    }
-    const num = Number(raw);
-    if (!Number.isFinite(num)) {
-      return;
-    }
-    switch (entry.name) {
-      case 'post_media_view':
-      case 'post_impressions':
-        values.views = num;
-        break;
-      case 'post_media_view_unique':
-      case 'post_impressions_unique':
-        values.unique_viewers = num;
-        break;
-      case 'post_engaged_users':
-        values.engagements = num;
-        break;
-      case 'post_clicks':
-        values.clicks = num;
-        break;
-      default:
-        break;
-    }
-  });
-  return values;
-}
-
-// Per-post insights for one Facebook post, with shrinking metric
-// sets (see the attempts above). Returns { values, error }: error
-// is set only when every attempt failed.
-function fetchFacebookPostInsights_(post, token) {
-  const empty = {
-    views: null,
-    unique_viewers: null,
-    engagements: null,
-    clicks: null,
-    link_clicks: null,
-    saves: null,
-  };
-  if (!post || post.id == null) {
-    return { values: empty, error: null };
-  }
-  let lastError = null;
-  for (let i = 0; i < FACEBOOK_POST_INSIGHTS_ATTEMPTS.length; i++) {
-    const res = fetchInsightsJson_(
-      META_GRAPH_BASE +
-        post.id +
-        '/insights?metric=' +
-        FACEBOOK_POST_INSIGHTS_ATTEMPTS[i] +
-        '&access_token=' +
-        encodeURIComponent(token)
-    );
-    if (!res.error) {
-      return {
-        values: Object.assign({}, empty, parseFacebookPostInsights_(res.data)),
-        error: null,
-      };
-    }
-    lastError = res.error;
-  }
-  return { values: empty, error: String(post.id) + ': ' + lastError };
-}
-
-// The newest published posts with their per-post insights,
-// mirroring fetchThreadsRecentPosts_: the list fetch failing nulls
-// the whole section, while per-post failures only null that post's
-// numbers and are counted into posts_error.
-function fetchFacebookRecentPosts_() {
-  const token = facebookPageToken_();
-  const pageId = facebookPageId_();
-  if (!token || !pageId) {
-    return { recent_posts: null, posts_error: null };
-  }
-  const listRes = fetchInsightsJson_(
-    facebookPostListUrl_(pageId, SNS_FACEBOOK_RECENT_POSTS_LIMIT) +
-      '&access_token=' +
-      encodeURIComponent(token)
-  );
-  if (listRes.error) {
-    return { recent_posts: null, posts_error: 'posts list: ' + listRes.error };
-  }
-  const items =
-    listRes.data && Array.isArray(listRes.data.data) ? listRes.data.data : null;
-  if (!items) {
-    return {
-      recent_posts: null,
-      posts_error: 'posts list: response had no posts array',
-    };
-  }
-  const failures = [];
-  const posts = items.slice(0, SNS_FACEBOOK_RECENT_POSTS_LIMIT).map((post) => {
-    const entry = buildFacebookPostEntry_(post);
-    const insights = fetchFacebookPostInsights_(post, token);
-    if (insights.error) {
-      failures.push(insights.error);
-    }
-    Object.assign(entry, insights.values);
-    return entry;
-  });
-  return {
-    recent_posts: posts,
-    posts_error: failures.length
-      ? failures.length +
-        ' of ' +
-        posts.length +
-        ' post insights failed (' +
-        failures[0] +
-        ')'
-      : null,
-  };
-}
-
 function fetchYouTubeSubscribers_() {
   // Kept as the narrow accessor; the channel fetch itself lives in
   // fetchYouTubeChannelDetail_() with the rest of the SNS detail.
@@ -1700,307 +1243,6 @@ function refreshThreadsTokenIfNeeded() {
     console.log('Threads token refresh failed: ' + summary);
     return summary;
   }
-}
-
-// --- Facebook OAuth (authorization completed inside GAS) --------
-// The Facebook Page's tokens are obtained exactly like the Threads
-// ones, through the channel's own login product: the owner runs
-// facebookAuthorizeUrl() in the editor, opens the logged URL and
-// approves the pages_show_list and pages_read_engagement scopes.
-// There are two shapes of that approval. A plain Facebook Login app
-// takes the scopes on the dialog URL itself. An app on Facebook
-// Login for Business (the "Manage everything on your Page" use
-// case, for example) cannot: the permissions and the assets they
-// cover are bundled into a Configuration in the app's settings, and
-// the dialog takes the Configuration's id (config_id) instead of
-// scopes — without it the token is granted the scopes yet
-// me/accounts hands back no Page, because no Page asset was ever
-// attached. facebookAuthorizeUrl() therefore switches to the
-// config_id form when FACEBOOK_CONFIG_ID is set. Everything after
-// the approval is identical for both shapes: pages_show_list covers
-// listing the owner's Pages through me/accounts (and with it,
-// receiving the Page access tokens), and pages_read_engagement
-// covers the Page insights and the Page's own published posts,
-// message text included. pages_read_user_content
-// is deliberately NOT requested: it governs content posted by other
-// people on the Page (visitor posts, comments, reviews), which this
-// collection never reads. Facebook redirects the browser back to
-// this Web App's /exec with action=facebook_callback, a code and
-// the state saved below; doGet routes that request to
-// handleFacebookOAuthCallback_, which exchanges the code for a
-// short-lived user token, upgrades it to a long-lived one, and
-// stores the selected Page's access token alongside it.
-// refreshFacebookTokenIfNeeded() then re-exchanges the user token
-// before expiry and re-reads the Page token, so the manual
-// authorization is a one-time setup step.
-
-const FACEBOOK_OAUTH_STATE_PROPERTY = 'FACEBOOK_OAUTH_STATE';
-const FACEBOOK_AUTHORIZE_URL = 'https://www.facebook.com/v25.0/dialog/oauth';
-// Scopes requested at authorization time, comma-separated as the
-// Facebook dialog expects. A refreshed token keeps the scopes of
-// the original authorization, so widening the scope later requires
-// one fresh authorization run. Only used when FACEBOOK_CONFIG_ID
-// is not set: Facebook Login for Business takes the permissions
-// from the Configuration instead, so the dialog URL carries the
-// config_id and no scope at all.
-const FACEBOOK_OAUTH_SCOPES = 'pages_show_list,pages_read_engagement';
-const FACEBOOK_TOKEN_URL = 'https://graph.facebook.com/v25.0/oauth/access_token';
-
-function facebookRedirectUri_() {
-  const override = getScriptProperty_('FACEBOOK_REDIRECT_URI');
-  if (override) {
-    return override;
-  }
-  try {
-    const base = ScriptApp.getService().getUrl() || '';
-    // The action marks the callback as Facebook's, so it can never
-    // be mistaken for the Threads callback (which arrives with only
-    // a code and its own state).
-    return base ? base + '?action=facebook_callback' : '';
-  } catch (err) {
-    return '';
-  }
-}
-
-// Editor helper: builds the Facebook authorization URL and logs
-// it. Open the logged URL in a browser and approve; the callback
-// stores the long-lived user token and the Page access token in
-// the Script Properties. When FACEBOOK_CONFIG_ID names a Facebook
-// Login for Business Configuration, the URL is built in the
-// config_id form (no scope parameter — the Configuration carries
-// the permissions and the Page asset); otherwise the plain
-// scope form is used.
-function facebookAuthorizeUrl() {
-  const appId = getScriptProperty_('FACEBOOK_APP_ID');
-  if (!appId) {
-    console.log('FACEBOOK_APP_ID is not set in Script Properties');
-    return '';
-  }
-  const redirectUri = facebookRedirectUri_();
-  if (!redirectUri) {
-    console.log('Could not determine the Web App URL; set FACEBOOK_REDIRECT_URI');
-    return '';
-  }
-  const state = Utilities.getUuid() + Utilities.getUuid().replace(/-/g, '');
-  PropertiesService.getScriptProperties().setProperty(
-    FACEBOOK_OAUTH_STATE_PROPERTY,
-    state
-  );
-  const configId = getScriptProperty_('FACEBOOK_CONFIG_ID');
-  const url =
-    FACEBOOK_AUTHORIZE_URL +
-    '?client_id=' +
-    encodeURIComponent(appId) +
-    (configId ? '&config_id=' + encodeURIComponent(configId) : '') +
-    '&redirect_uri=' +
-    encodeURIComponent(redirectUri) +
-    (configId ? '' : '&scope=' + FACEBOOK_OAUTH_SCOPES) +
-    '&response_type=code&state=' +
-    encodeURIComponent(state);
-  console.log('Facebook authorize URL: ' + url);
-  return url;
-}
-
-// The Pages the token's owner manages, from me/accounts: the first
-// result page only (the owner manages a single Page; a Page access
-// token arrives with each entry). Returns { pages, error } and
-// never throws.
-function fetchFacebookPages_(userToken) {
-  const res = fetchInsightsJson_(
-    META_GRAPH_BASE +
-      'me/accounts?fields=id,name,access_token&access_token=' +
-      encodeURIComponent(userToken)
-  );
-  if (res.error) {
-    return { pages: null, error: res.error };
-  }
-  const pages = res.data && Array.isArray(res.data.data) ? res.data.data : null;
-  if (!pages) {
-    return { pages: null, error: 'response had no accounts array' };
-  }
-  return { pages, error: null };
-}
-
-// Picks the Page the collection should read: the one named by the
-// FACEBOOK_PAGE_ID property when it is set (an id that is not
-// among the managed Pages is an error, never a silent switch to a
-// different Page), otherwise the first managed Page. An empty
-// me/accounts is spelled out rather than left as a bare failure:
-// the token was authorized, but no Page came with it — the classic
-// cause is an authorization that never selected a Page (with
-// Facebook Login for Business, a Configuration that does not
-// include the Page), and no Page token can be stored until a
-// fresh authorization grants one.
-function selectFacebookPage_(pages) {
-  if (!pages || !pages.length) {
-    return {
-      page: null,
-      error:
-        'me/accounts returned 0 Pages: no Page was granted by the ' +
-        'authorization — select the Page when authorizing ' +
-        '(with Facebook Login for Business, the Configuration ' +
-        'must include the Page)',
-    };
-  }
-  const wanted = getScriptProperty_('FACEBOOK_PAGE_ID');
-  if (wanted) {
-    for (let i = 0; i < pages.length; i++) {
-      if (pages[i] && String(pages[i].id) === String(wanted)) {
-        return { page: pages[i], error: null };
-      }
-    }
-    return {
-      page: null,
-      error: 'FACEBOOK_PAGE_ID was not among the managed Pages',
-    };
-  }
-  return { page: pages[0], error: null };
-}
-
-// Reads the selected Page's access token out of me/accounts and
-// stores it (with the Page id) in the Script Properties. Used by
-// the OAuth callback and by the token refresh: a Page token read
-// with a long-lived user token does not expire on its own, but
-// re-reading it after each user-token renewal keeps the pair in
-// step. Returns { ok, error }.
-function storeFacebookPageToken_(userToken) {
-  const props = PropertiesService.getScriptProperties();
-  const fetched = fetchFacebookPages_(userToken);
-  if (fetched.error) {
-    return { ok: false, error: 'me/accounts: ' + fetched.error };
-  }
-  const selected = selectFacebookPage_(fetched.pages);
-  if (selected.error) {
-    return { ok: false, error: selected.error };
-  }
-  const page = selected.page;
-  if (!page || !page.access_token) {
-    return { ok: false, error: 'selected Page had no access_token' };
-  }
-  props.setProperty('FACEBOOK_PAGE_ACCESS_TOKEN', page.access_token);
-  props.setProperty('FACEBOOK_PAGE_ID', String(page.id));
-  return { ok: true, error: null };
-}
-
-// One Facebook oauth/access_token GET (code exchange and
-// fb_exchange_token share the endpoint). Returns the parsed body
-// on success; on failure, { error } with a secret-free summary —
-// the request URL carries the app secret, so it is never quoted.
-function fetchFacebookTokenExchange_(query) {
-  const res = fetchInsightsJson_(FACEBOOK_TOKEN_URL + '?' + query);
-  if (res.error) {
-    return { data: null, error: res.error };
-  }
-  if (!res.data || !res.data.access_token) {
-    return { data: null, error: 'response had no access_token' };
-  }
-  return { data: res.data, error: null };
-}
-
-// Exchanges an authorization code for the long-lived user token,
-// stores it, then stores the selected Page's access token.
-// Returns { ok, error } with a secret-free error summary on
-// failure.
-function handleFacebookOAuthCallback_(code) {
-  const props = PropertiesService.getScriptProperties();
-  const appId = props.getProperty('FACEBOOK_APP_ID');
-  const appSecret = props.getProperty('FACEBOOK_APP_SECRET');
-  const redirectUri = facebookRedirectUri_();
-  if (!appId || !appSecret) {
-    return { ok: false, error: 'FACEBOOK_APP_ID / FACEBOOK_APP_SECRET are not set' };
-  }
-  if (!redirectUri) {
-    return { ok: false, error: 'redirect URI is not available' };
-  }
-  const appCredentials =
-    'client_id=' +
-    encodeURIComponent(appId) +
-    '&client_secret=' +
-    encodeURIComponent(appSecret);
-  const shortLived = fetchFacebookTokenExchange_(
-    appCredentials +
-      '&redirect_uri=' +
-      encodeURIComponent(redirectUri) +
-      '&code=' +
-      encodeURIComponent(code)
-  );
-  if (shortLived.error) {
-    return { ok: false, error: 'code exchange: ' + shortLived.error };
-  }
-  const longLived = fetchFacebookTokenExchange_(
-    'grant_type=fb_exchange_token&' +
-      appCredentials +
-      '&fb_exchange_token=' +
-      encodeURIComponent(shortLived.data.access_token)
-  );
-  if (longLived.error) {
-    return { ok: false, error: 'long-lived exchange: ' + longLived.error };
-  }
-  storeRefreshedToken_(
-    props,
-    'FACEBOOK_USER_ACCESS_TOKEN',
-    'FACEBOOK_TOKEN_EXPIRES_AT',
-    longLived.data
-  );
-  props.setProperty('FACEBOOK_TOKEN_AT', new Date().toISOString());
-  const pageResult = storeFacebookPageToken_(longLived.data.access_token);
-  if (!pageResult.ok) {
-    return { ok: false, error: 'page token: ' + pageResult.error };
-  }
-  props.deleteProperty(FACEBOOK_OAUTH_STATE_PROPERTY);
-  return { ok: true, error: null };
-}
-
-// Renews the OAuth-obtained Facebook user token once it is close
-// to expiry (the shared 10-day window), then re-reads the Page
-// token with the renewed user token. Returns a secret-free error
-// summary on failure and null otherwise, so collectSnsCounts can
-// surface it as the snapshot's facebook_error. Without app
-// credentials there is nothing to renew with, so it quietly does
-// nothing, like refreshMetaTokenIfNeeded_().
-function refreshFacebookTokenIfNeeded() {
-  const props = PropertiesService.getScriptProperties();
-  const userToken = props.getProperty('FACEBOOK_USER_ACCESS_TOKEN');
-  if (!userToken) {
-    return null;
-  }
-  if (!isTokenRefreshDue_(props.getProperty('FACEBOOK_TOKEN_EXPIRES_AT'))) {
-    return null;
-  }
-  const appId = props.getProperty('FACEBOOK_APP_ID');
-  const appSecret = props.getProperty('FACEBOOK_APP_SECRET');
-  if (!appId || !appSecret) {
-    return null;
-  }
-  const renewed = fetchFacebookTokenExchange_(
-    'grant_type=fb_exchange_token' +
-      '&client_id=' +
-      encodeURIComponent(appId) +
-      '&client_secret=' +
-      encodeURIComponent(appSecret) +
-      '&fb_exchange_token=' +
-      encodeURIComponent(userToken)
-  );
-  if (renewed.error) {
-    const summary = 'refresh: ' + renewed.error;
-    console.log('Facebook token refresh failed: ' + summary);
-    return summary;
-  }
-  storeRefreshedToken_(
-    props,
-    'FACEBOOK_USER_ACCESS_TOKEN',
-    'FACEBOOK_TOKEN_EXPIRES_AT',
-    renewed.data
-  );
-  props.setProperty('FACEBOOK_TOKEN_AT', new Date().toISOString());
-  const pageResult = storeFacebookPageToken_(renewed.data.access_token);
-  if (!pageResult.ok) {
-    const summary = 'refresh: page token: ' + pageResult.error;
-    console.log('Facebook token refresh failed: ' + summary);
-    return summary;
-  }
-  console.log('Facebook token refreshed');
-  return null;
 }
 
 function fetchInstagramMediaCount_() {
@@ -3023,124 +2265,6 @@ function debugThreadsGet_(label, url, token) {
   }
 }
 
-// --- Manual diagnostics: debugFacebook ---------------------------
-// Run by hand from the Apps Script editor after the Facebook
-// authorization is completed, to see the raw shapes the new
-// requests actually return before trusting the parsed snapshot —
-// the same debug-first step debugThreadsPosts provided for
-// Threads. It logs which properties are set (never their values),
-// the Page profile response behind the follower count, the values
-// the production account-detail fetch reads, the published posts
-// list (limit 3, just enough to see the entry shape) and the post
-// insights of the first listed post (raw body plus the parsed
-// values). The stages are independent: a stage that fails or
-// returns nothing usable stops only itself. It is never called
-// from a trigger or from doGet, and it does not touch the snapshot.
-function debugFacebook() {
-  const pageToken = getScriptProperty_('FACEBOOK_PAGE_ACCESS_TOKEN');
-  Logger.log(
-    'FACEBOOK_PAGE_ACCESS_TOKEN is ' + (pageToken ? 'set.' : 'not set.')
-  );
-  const userToken = getScriptProperty_('FACEBOOK_USER_ACCESS_TOKEN');
-  Logger.log(
-    'FACEBOOK_USER_ACCESS_TOKEN is ' + (userToken ? 'set.' : 'not set.')
-  );
-  const pageId = getScriptProperty_('FACEBOOK_PAGE_ID');
-  Logger.log('FACEBOOK_PAGE_ID: ' + (pageId || '(not set)'));
-  Logger.log(
-    'FACEBOOK_TOKEN_EXPIRES_AT: ' +
-      (getScriptProperty_('FACEBOOK_TOKEN_EXPIRES_AT') || '(not set)')
-  );
-  if (!pageToken || !pageId) {
-    Logger.log(
-      'Page token or Page id is missing; run facebookAuthorizeUrl() first.'
-    );
-    return;
-  }
-  const profileData = debugFacebookGet_(
-    'page profile (fan_count)',
-    META_GRAPH_BASE + pageId + '?fields=name,fan_count,followers_count',
-    pageToken
-  );
-  if (profileData) {
-    Logger.log(
-      'parsed fan count: ' +
-        (parseFacebookFanCount_(profileData) === null
-          ? 'null'
-          : parseFacebookFanCount_(profileData))
-    );
-  }
-  Logger.log('=== account detail (production fetch, last 28 days) ===');
-  Logger.log(
-    'parsed account detail: ' + JSON.stringify(fetchFacebookAccountDetail_())
-  );
-  const listData = debugFacebookGet_(
-    'published posts (limit 3)',
-    facebookPostListUrl_(pageId, 3),
-    pageToken
-  );
-  const items =
-    listData && Array.isArray(listData.data) ? listData.data : null;
-  if (!items || !items.length) {
-    Logger.log('no posts in the list response; skipping post insights.');
-    return;
-  }
-  const firstEntry = buildFacebookPostEntry_(items[0]);
-  Logger.log('first post entry: ' + JSON.stringify(firstEntry));
-  if (firstEntry.id == null) {
-    Logger.log('first post has no id; skipping post insights.');
-    return;
-  }
-  const insightsData = debugFacebookGet_(
-    'post insights for the first post (first metric set)',
-    META_GRAPH_BASE +
-      firstEntry.id +
-      '/insights?metric=' +
-      FACEBOOK_POST_INSIGHTS_ATTEMPTS[0],
-    pageToken
-  );
-  if (insightsData) {
-    Logger.log(
-      'parsed post insights: ' +
-        JSON.stringify(parseFacebookPostInsights_(insightsData))
-    );
-  }
-}
-
-// One GET for debugFacebook: logs the label, the request URL with
-// the token redacted, the HTTP status and the scrubbed body
-// (truncated like the other diagnostics), and returns the parsed
-// body on HTTP 200 — null on any failure, so the calling stage can
-// stop without throwing. The token itself is only ever appended to
-// the real request, never to the logged one.
-function debugFacebookGet_(label, url, token) {
-  Logger.log('=== ' + label + ' ===');
-  Logger.log('GET ' + url + '&access_token=<redacted>');
-  let res;
-  try {
-    res = UrlFetchApp.fetch(
-      url + '&access_token=' + encodeURIComponent(token),
-      { muteHttpExceptions: true }
-    );
-  } catch (err) {
-    Logger.log('fetch exception (' + ((err && err.name) || 'Error') + ')');
-    return null;
-  }
-  const status = res.getResponseCode();
-  Logger.log('HTTP ' + status);
-  const bodyText = res.getContentText();
-  Logger.log(debugScrubToken_(bodyText, token).slice(0, SNS_DEBUG_LOG_LIMIT));
-  if (status !== 200) {
-    return null;
-  }
-  try {
-    return JSON.parse(bodyText);
-  } catch (err) {
-    Logger.log('response body is not JSON; nothing parsed.');
-    return null;
-  }
-}
-
 // Reads the follows/unfollows split out of a follows_and_unfollows
 // total_value response. Production diagnostics on 2026-11-09
 // (debugSnsInsights) pinned down the only shape this metric returns
@@ -3615,7 +2739,7 @@ function fetchYouTubeRecentVideos_() {
 //   - "account" is the one time series: one appended row per
 //     collection, the input of the /ga trend charts.
 //   - Every post-shaped tab ("media", "threads_media",
-//     "youtube_media", "facebook_media") and the "daily" tab hold
+//     "youtube_media") and the "daily" tab hold
 //     ONE row per key (media_id / post_id / video_id / date) and
 //     are upserted: the whole tab is read back, the fresh rows are
 //     merged in by key — a fresh value wins, but a null in the
@@ -3655,9 +2779,6 @@ const SNS_HISTORY_ACCOUNT_COLUMNS = [
   'unfollows_30d',
   'yt_total_views',
   'yt_video_count',
-  // Appended at the very end so rows written before the Facebook
-  // collection existed keep aligning with the earlier columns.
-  'facebook_followers',
 ];
 const SNS_HISTORY_MEDIA_COLUMNS = [
   'collected_at',
@@ -3706,20 +2827,6 @@ const SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS = [
   'likes',
   'comments',
 ];
-const SNS_HISTORY_FACEBOOK_MEDIA_COLUMNS = [
-  'collected_at',
-  'post_id',
-  'posted_at',
-  'message',
-  'permalink',
-  'views',
-  'unique_viewers',
-  'engagements',
-  'clicks',
-  'link_clicks',
-  'saves',
-];
-
 // Numbers are written as numbers; anything else (null, undefined,
 // non-finite) becomes an empty cell so the sheet stays sortable.
 function snsHistoryNumCell_(value) {
@@ -3733,17 +2840,12 @@ function snsHistoryTextCell_(value) {
 // One "account" row from a snapshot. total_followers follows the
 // top-page definition — main Instagram + Threads + YouTube — summing
 // only the values that are numbers, and stays empty when all three
-// are null. The Facebook follower count is recorded in its own
-// trailing column but deliberately stays out of total_followers:
-// whether Facebook joins the total is the same open decision as
-// SNS_COUNTS_INCLUDE_FACEBOOK. Null values become empty cells
-// throughout.
+// are null. Null values become empty cells throughout.
 function buildSnsHistoryAccountRow_(snapshot) {
   const snap = snapshot || {};
   const youtube = snap.youtube || {};
   const instagram = snap.instagram || {};
   const threads = snap.threads || {};
-  const facebook = snap.facebook || {};
   const interactions = instagram.interactions_30d || {};
   const totalParts = [
     snsNumberOrNull_(instagram.freddiefujiwara),
@@ -3775,7 +2877,6 @@ function buildSnsHistoryAccountRow_(snapshot) {
     snsHistoryNumCell_(instagram.unfollows_30d),
     snsHistoryNumCell_(youtube.total_views),
     snsHistoryNumCell_(youtube.video_count),
-    snsHistoryNumCell_(facebook.followers),
   ];
 }
 
@@ -3885,33 +2986,6 @@ function buildSnsHistoryYouTubeMediaRows_(snapshot) {
       snsHistoryNumCell_(item.views),
       snsHistoryNumCell_(item.likes),
       snsHistoryNumCell_(item.comments),
-    ];
-  });
-}
-
-// One "facebook_media" row per entry of facebook.recent_posts (an
-// empty list while Facebook is unauthorized or its fetch failed
-// and the snapshot carries null — the tab is then left as it is).
-function buildSnsHistoryFacebookMediaRows_(snapshot) {
-  const snap = snapshot || {};
-  const facebook = snap.facebook || {};
-  const posts = Array.isArray(facebook.recent_posts)
-    ? facebook.recent_posts
-    : [];
-  return posts.map((entry) => {
-    const item = entry || {};
-    return [
-      snsHistoryTextCell_(snap.collected_at),
-      snsHistoryTextCell_(item.id),
-      snsHistoryTextCell_(item.posted_at),
-      snsHistoryTextCell_(item.message),
-      snsHistoryTextCell_(item.permalink),
-      snsHistoryNumCell_(item.views),
-      snsHistoryNumCell_(item.unique_viewers),
-      snsHistoryNumCell_(item.engagements),
-      snsHistoryNumCell_(item.clicks),
-      snsHistoryNumCell_(item.link_clicks),
-      snsHistoryNumCell_(item.saves),
     ];
   });
 }
@@ -4086,13 +3160,6 @@ function appendSnsHistory_(snapshot) {
       1,
       buildSnsHistoryYouTubeMediaRows_(snapshot)
     );
-    upsertSnsHistorySheet_(
-      spreadsheet,
-      'facebook_media',
-      SNS_HISTORY_FACEBOOK_MEDIA_COLUMNS,
-      1,
-      buildSnsHistoryFacebookMediaRows_(snapshot)
-    );
   } catch (err) {
     console.log(
       'SNS history append failed: ' + summarizeSnsHistoryError_(err, sheetId)
@@ -4197,7 +3264,6 @@ function collectSnsCounts() {
   refreshMetaTokenIfNeeded_();
   refreshThreadsTokenIfNeeded_();
   const threadsRefreshError = refreshThreadsTokenIfNeeded();
-  const facebookRefreshError = refreshFacebookTokenIfNeeded();
   const igViews = fetchInstagramViewsInsights_();
   const igDetail = fetchInstagramAccountDetail_();
   const igDemographics = fetchInstagramDemographics_();
@@ -4205,8 +3271,6 @@ function collectSnsCounts() {
   const yt = fetchYouTubeChannelDetail_();
   const thDetail = fetchThreadsAccountDetail_();
   const thPosts = fetchThreadsRecentPosts_();
-  const fbDetail = fetchFacebookAccountDetail_();
-  const fbPosts = fetchFacebookRecentPosts_();
   const snapshot = {
     collected_at: new Date().toISOString(),
     youtube: {
@@ -4247,19 +3311,6 @@ function collectSnsCounts() {
       recent_posts: thPosts.recent_posts,
       posts_error: thPosts.posts_error,
     },
-    facebook: {
-      followers: fetchFacebookFollowers_(),
-      facebook_error: facebookRefreshError,
-      views_28d: fbDetail.views_28d,
-      unique_viewers_28d: fbDetail.unique_viewers_28d,
-      engagement_28d: fbDetail.engagement_28d,
-      profile_visits_28d: fbDetail.profile_visits_28d,
-      new_followers_28d: fbDetail.new_followers_28d,
-      unfollowers_28d: fbDetail.unfollowers_28d,
-      detail_error: fbDetail.detail_error,
-      recent_posts: fbPosts.recent_posts,
-      posts_error: fbPosts.posts_error,
-    },
   };
   if (snapshot.threads.threads_error) {
     console.log('Threads refresh error: ' + snapshot.threads.threads_error);
@@ -4292,15 +3343,6 @@ function collectSnsCounts() {
   }
   if (snapshot.youtube.youtube_error) {
     console.log('YouTube detail error: ' + snapshot.youtube.youtube_error);
-  }
-  if (snapshot.facebook.facebook_error) {
-    console.log('Facebook refresh error: ' + snapshot.facebook.facebook_error);
-  }
-  if (snapshot.facebook.detail_error) {
-    console.log('Facebook detail error: ' + snapshot.facebook.detail_error);
-  }
-  if (snapshot.facebook.posts_error) {
-    console.log('Facebook posts error: ' + snapshot.facebook.posts_error);
   }
   PropertiesService.getScriptProperties().setProperty(
     SNS_SNAPSHOT_PROPERTY,
@@ -4442,67 +3484,9 @@ function htmlOut_(html) {
   );
 }
 
-// Escapes a plain-text string for interpolation into one of the
-// htmlOut_ pages. Used for the secret-free OAuth error summaries:
-// they are built from API response bodies, so their text is not
-// markup-safe by construction.
-function escapeHtml_(text) {
-  return String(text == null ? '' : text)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
 function doGet(e) {
   try {
     const parameter = (e && e.parameter) || {};
-    // Facebook OAuth callback: Facebook redirects the owner's
-    // browser here with action=facebook_callback after
-    // facebookAuthorizeUrl(). The action names the flow (the
-    // Threads callback carries only a code), and the state saved by
-    // that helper is the credential for this one request — the
-    // redirect carries no ID token — so it is handled before every
-    // other route, including the Threads code branch below. A code
-    // whose state does not match the saved one is never treated as
-    // an API action; it just gets a plain page.
-    if (parameter.action === 'facebook_callback') {
-      const expectedState = getScriptProperty_(FACEBOOK_OAUTH_STATE_PROPERTY);
-      if (
-        expectedState &&
-        parameter.state &&
-        parameter.state === expectedState &&
-        parameter.code
-      ) {
-        const result = handleFacebookOAuthCallback_(parameter.code);
-        if (result.ok) {
-          return htmlOut_(
-            '<!DOCTYPE html><html><body>' +
-              '<p>Facebook の認可が完了しました。このタブは閉じて構いません。</p>' +
-              '</body></html>'
-          );
-        }
-        console.log('Facebook OAuth callback failed: ' + result.error);
-        // The failure page carries the same secret-free summary
-        // the log gets: the authorization runs in the owner's
-        // browser, so the likely cause (above all, me/accounts
-        // returning 0 Pages) should be readable on the spot
-        // instead of only in the execution log.
-        return htmlOut_(
-          '<!DOCTYPE html><html><body>' +
-            '<p>Facebook の認可に失敗しました。Apps Script の実行ログを確認してください。</p>' +
-            '<p>' +
-            escapeHtml_(result.error) +
-            '</p>' +
-            '</body></html>'
-        );
-      }
-      return htmlOut_(
-        '<!DOCTYPE html><html><body>' +
-          '<p>Facebook の認可フローが確認できませんでした。facebookAuthorizeUrl() からやり直してください。</p>' +
-          '</body></html>'
-      );
-    }
     // Threads OAuth callback: Threads redirects the owner's browser
     // here with a code after threadsAuthorizeUrl(). The state saved
     // by that helper is the credential for this one request — the
@@ -4731,30 +3715,7 @@ if (typeof exports !== 'undefined') {
   exports.handleThreadsOAuthCallback_ = handleThreadsOAuthCallback_;
   exports.threadsRedirectUri_ = threadsRedirectUri_;
   exports.refreshThreadsTokenIfNeeded = refreshThreadsTokenIfNeeded;
-  exports.facebookPageToken_ = facebookPageToken_;
-  exports.facebookPageId_ = facebookPageId_;
-  exports.parseFacebookFanCount_ = parseFacebookFanCount_;
-  exports.fetchFacebookFollowers_ = fetchFacebookFollowers_;
-  exports.facebookInsightsWindow_ = facebookInsightsWindow_;
-  exports.facebookPageInsightsUrl_ = facebookPageInsightsUrl_;
-  exports.fetchFacebookPageInsightTotal_ = fetchFacebookPageInsightTotal_;
-  exports.fetchFacebookAccountDetail_ = fetchFacebookAccountDetail_;
-  exports.facebookPostListUrl_ = facebookPostListUrl_;
-  exports.buildFacebookPostEntry_ = buildFacebookPostEntry_;
-  exports.parseFacebookPostInsights_ = parseFacebookPostInsights_;
-  exports.fetchFacebookPostInsights_ = fetchFacebookPostInsights_;
-  exports.fetchFacebookRecentPosts_ = fetchFacebookRecentPosts_;
-  exports.facebookAuthorizeUrl = facebookAuthorizeUrl;
-  exports.handleFacebookOAuthCallback_ = handleFacebookOAuthCallback_;
-  exports.facebookRedirectUri_ = facebookRedirectUri_;
-  exports.fetchFacebookPages_ = fetchFacebookPages_;
-  exports.selectFacebookPage_ = selectFacebookPage_;
-  exports.storeFacebookPageToken_ = storeFacebookPageToken_;
-  exports.refreshFacebookTokenIfNeeded = refreshFacebookTokenIfNeeded;
-  exports.debugFacebook = debugFacebook;
-  exports.SNS_COUNTS_INCLUDE_FACEBOOK = SNS_COUNTS_INCLUDE_FACEBOOK;
   exports.htmlOut_ = htmlOut_;
-  exports.escapeHtml_ = escapeHtml_;
   exports.appendSnsHistory_ = appendSnsHistory_;
   exports.buildSnsHistoryResponse_ = buildSnsHistoryResponse_;
   exports.SNS_HISTORY_RESPONSE_COLUMNS = SNS_HISTORY_RESPONSE_COLUMNS;
@@ -4763,7 +3724,6 @@ if (typeof exports !== 'undefined') {
   exports.buildSnsHistoryDailyRows_ = buildSnsHistoryDailyRows_;
   exports.buildSnsHistoryThreadsMediaRows_ = buildSnsHistoryThreadsMediaRows_;
   exports.buildSnsHistoryYouTubeMediaRows_ = buildSnsHistoryYouTubeMediaRows_;
-  exports.buildSnsHistoryFacebookMediaRows_ = buildSnsHistoryFacebookMediaRows_;
   exports.mergeSnsHistoryRows_ = mergeSnsHistoryRows_;
   exports.snsHistoryKeyCell_ = snsHistoryKeyCell_;
   exports.readSnsHistoryRows_ = readSnsHistoryRows_;
@@ -4775,6 +3735,4 @@ if (typeof exports !== 'undefined') {
   exports.SNS_HISTORY_DAILY_COLUMNS = SNS_HISTORY_DAILY_COLUMNS;
   exports.SNS_HISTORY_THREADS_MEDIA_COLUMNS = SNS_HISTORY_THREADS_MEDIA_COLUMNS;
   exports.SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS = SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS;
-  exports.SNS_HISTORY_FACEBOOK_MEDIA_COLUMNS =
-    SNS_HISTORY_FACEBOOK_MEDIA_COLUMNS;
 }

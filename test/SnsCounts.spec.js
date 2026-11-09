@@ -722,7 +722,7 @@ describe('SNS follower counts', () => {
     });
 
     it('prefers the dedicated Threads token when one is set', () => {
-      store.META_ACCESS_TOKEN = 'facebook-token';
+      store.META_ACCESS_TOKEN = 'meta-token';
       store.META_THREADS_ACCESS_TOKEN = 'threads-token';
       let threadsUrl = '';
       fetchHandler = (url) => {
@@ -870,23 +870,6 @@ describe('SNS follower counts', () => {
           },
         ],
       },
-      facebook: {
-        followers: 321,
-        recent_posts: [
-          {
-            id: 'fb-post-1',
-            posted_at: '2026-11-08T10:00:00+0000',
-            message: 'Facebookの投稿',
-            permalink: 'https://www.facebook.com/freddiefujiwara/posts/123',
-            views: 200,
-            unique_viewers: 150,
-            engagements: 9,
-            clicks: 4,
-            link_clicks: 2,
-            saves: null,
-          },
-        ],
-      },
     });
 
     const expectedAccountValues = [
@@ -908,12 +891,9 @@ describe('SNS follower counts', () => {
     });
 
     it('builds the account row from a snapshot fixture', () => {
-      // The trailing cell is the facebook_followers column, appended
-      // after yt_video_count when Facebook joined the snapshot.
       expect(Code.buildSnsHistoryAccountRow_(fixtureSnapshot())).toEqual([
         '2026-11-09T00:00:00.000Z',
         ...expectedAccountValues,
-        321,
       ]);
     });
 
@@ -953,7 +933,7 @@ describe('SNS follower counts', () => {
       ).toEqual([]);
     });
 
-    it('builds one row per Threads post, YouTube video and Facebook post', () => {
+    it('builds one row per Threads post and YouTube video', () => {
       expect(Code.buildSnsHistoryThreadsMediaRows_(fixtureSnapshot())).toEqual([
         [
           '2026-11-09T00:00:00.000Z',
@@ -974,26 +954,11 @@ describe('SNS follower counts', () => {
           500, 20, 3,
         ],
       ]);
-      expect(Code.buildSnsHistoryFacebookMediaRows_(fixtureSnapshot())).toEqual([
-        [
-          '2026-11-09T00:00:00.000Z',
-          'fb-post-1',
-          '2026-11-08T10:00:00+0000',
-          'Facebookの投稿',
-          'https://www.facebook.com/freddiefujiwara/posts/123',
-          200, 150, 9, 4, 2, '',
-        ],
-      ]);
       expect(
         Code.buildSnsHistoryThreadsMediaRows_({ threads: { recent_posts: null } })
       ).toEqual([]);
       expect(
         Code.buildSnsHistoryYouTubeMediaRows_({ youtube: { recent_videos: null } })
-      ).toEqual([]);
-      expect(
-        Code.buildSnsHistoryFacebookMediaRows_({
-          facebook: { recent_posts: null },
-        })
       ).toEqual([]);
     });
 
@@ -1075,11 +1040,8 @@ describe('SNS follower counts', () => {
       expect(openById).toHaveBeenCalledWith('history-sheet-id');
       expect(sheets.account.rows[0]).toEqual(Code.SNS_HISTORY_ACCOUNT_COLUMNS);
       expect(sheets.account.rows).toHaveLength(2);
-      // No Facebook token in this scenario: the trailing
-      // facebook_followers cell stays blank.
       expect(sheets.account.rows[1].slice(1)).toEqual([
         ...expectedAccountValues,
-        '',
       ]);
       expect(sheets.media.rows[0]).toEqual(Code.SNS_HISTORY_MEDIA_COLUMNS);
       expect(sheets.media.rows).toHaveLength(3);
@@ -1096,9 +1058,6 @@ describe('SNS follower counts', () => {
       expect(sheets.daily.rows[0]).toEqual(Code.SNS_HISTORY_DAILY_COLUMNS);
       expect(sheets.threads_media.rows[0]).toEqual(
         Code.SNS_HISTORY_THREADS_MEDIA_COLUMNS
-      );
-      expect(sheets.facebook_media.rows[0]).toEqual(
-        Code.SNS_HISTORY_FACEBOOK_MEDIA_COLUMNS
       );
       expect(sheets.youtube_media.rows[0]).toEqual(
         Code.SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS
@@ -1123,11 +1082,9 @@ describe('SNS follower counts', () => {
       expect(sheets.account.rows[0]).toEqual(Code.SNS_HISTORY_ACCOUNT_COLUMNS);
       expect(sheets.account.rows[1].slice(1)).toEqual([
         ...expectedAccountValues,
-        321,
       ]);
       expect(sheets.account.rows[2].slice(1)).toEqual([
         ...expectedAccountValues,
-        321,
       ]);
       // The key-keyed tabs hold one row per key, however often the
       // same post is collected; headers are written once, on creation.
@@ -1140,7 +1097,6 @@ describe('SNS follower counts', () => {
         Code.SNS_HISTORY_THREADS_MEDIA_COLUMNS
       );
       expect(sheets.youtube_media.rows).toHaveLength(2);
-      expect(sheets.facebook_media.rows).toHaveLength(2);
 
       const headed = makeSheet();
       headed.rows.push(['preset', 'header']);
@@ -1242,16 +1198,6 @@ describe('SNS follower counts', () => {
         ['2026-11-07', 30, 2, '2026-11-09T00:00:00.000Z'],
         // Follows only; the missing side stays blank, never 0.
         ['2026-11-09', 12, '', '2026-11-09T00:00:00.000Z'],
-      ]);
-    });
-
-    it('leaves facebook_media header-only while Facebook is unauthorized', () => {
-      store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
-      const snapshot = fixtureSnapshot();
-      snapshot.facebook = { followers: null, recent_posts: null };
-      Code.appendSnsHistory_(snapshot);
-      expect(sheets.facebook_media.rows).toEqual([
-        Code.SNS_HISTORY_FACEBOOK_MEDIA_COLUMNS,
       ]);
     });
 
