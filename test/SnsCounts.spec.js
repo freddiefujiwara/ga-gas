@@ -174,6 +174,40 @@ describe('SNS follower counts', () => {
     ],
   });
 
+  // The expected daily form for follows_and_unfollows: period=day
+  // values whose value is an object keyed by the follow_type
+  // labels, one row per day bucket, end_time at 08:00 UTC (a
+  // Pacific midnight). The parser dates each bucket by its
+  // midpoint in Asia/Tokyo, which for this offset lands on the
+  // same calendar date as the end_time's UTC date. A label key
+  // missing from a day's object means that side was not reported
+  // (null, not 0).
+  const dailyFollowsBody = () => ({
+    data: [
+      {
+        name: 'follows_and_unfollows',
+        period: 'day',
+        values: [
+          {
+            value: { FOLLOWER: 12, NON_FOLLOWER: 1 },
+            end_time: '2026-11-07T08:00:00+0000',
+          },
+          {
+            value: { FOLLOWER: 20, NON_FOLLOWER: 3 },
+            end_time: '2026-11-08T08:00:00+0000',
+          },
+          { value: { FOLLOWER: 7 }, end_time: '2026-11-09T08:00:00+0000' },
+        ],
+      },
+    ],
+  });
+
+  const DAILY_FOLLOWS_SERIES = [
+    { date: '2026-11-07', follows: 12, unfollows: 1 },
+    { date: '2026-11-08', follows: 20, unfollows: 3 },
+    { date: '2026-11-09', follows: 7, unfollows: null },
+  ];
+
   const demographicsBody = (dims, results) => ({
     data: [
       {
@@ -327,6 +361,13 @@ describe('SNS follower counts', () => {
           );
         }
         throw new Error('unexpected demographics url: ' + url);
+      }
+      if (
+        url.includes('/insights') &&
+        url.includes('metric=follows_and_unfollows') &&
+        !url.includes('metric_type=total_value')
+      ) {
+        return res(200, dailyFollowsBody());
       }
       if (url.includes('/insights') && url.includes('metric=follows_and_unfollows')) {
         return res(200, followsBreakdownBody());
@@ -499,6 +540,8 @@ describe('SNS follower counts', () => {
         profile_links_taps_source: 'total_value',
         follows_30d: 498,
         unfollows_30d: 58,
+        daily_follows: DAILY_FOLLOWS_SERIES,
+        daily_follows_error: null,
         demographics: {
           age_gender: [
             { key: '25-34/F', value: 500 },
@@ -574,6 +617,8 @@ describe('SNS follower counts', () => {
         profile_links_taps_source: null,
         follows_30d: null,
         unfollows_30d: null,
+        daily_follows: null,
+        daily_follows_error: null,
         demographics: { age_gender: null, top_cities: null, top_countries: null },
         detail_error: null,
         recent_media: null,
@@ -1521,6 +1566,14 @@ describe('SNS follower counts', () => {
         (overrides && overrides.totals) || {}
       );
       fetchHandler = (url) => {
+        if (
+          url.includes('metric=follows_and_unfollows') &&
+          !url.includes('metric_type=total_value')
+        ) {
+          return overrides && overrides.daily
+            ? overrides.daily()
+            : res(200, dailyFollowsBody());
+        }
         if (url.includes('metric=follows_and_unfollows')) {
           return overrides && overrides.follows
             ? overrides.follows()
@@ -1552,6 +1605,8 @@ describe('SNS follower counts', () => {
         profile_links_taps_source: 'total_value',
         follows_30d: 498,
         unfollows_30d: 58,
+        daily_follows: DAILY_FOLLOWS_SERIES,
+        daily_follows_error: null,
         detail_error: null,
       });
     });
@@ -1668,6 +1723,41 @@ describe('SNS follower counts', () => {
         'follows_and_unfollows labels: [GAINED, LOST]'
       );
       expect(detail.detail_error).not.toContain('meta-token');
+    });
+
+    it('records a daily failure on daily_follows_error only, leaving the rest of the detail intact', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      detailHandler({
+        daily: () =>
+          res(400, { error: { message: 'daily unsupported', code: 100 } }),
+        follows: () =>
+          res(400, { error: { message: 'totals unsupported', code: 100 } }),
+      });
+      const detail = Code.fetchInstagramAccountDetail_();
+      expect(detail.reach_30d).toBe(5000);
+      expect(detail.daily_follows).toBeNull();
+      expect(detail.daily_follows_error).toContain(
+        'follows_and_unfollows daily: HTTP 400'
+      );
+      expect(detail.daily_follows_error).not.toContain('meta-token');
+      // The daily failure stays off detail_error, which reports
+      // the totals failure on its own.
+      expect(detail.detail_error).toContain('follows_and_unfollows: HTTP 400');
+      expect(detail.detail_error).not.toContain('daily');
+    });
+
+    it('reports no per-day values when both forms answer without daily values', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      detailHandler({
+        daily: () => res(200, followsBreakdownBody()),
+      });
+      const detail = Code.fetchInstagramAccountDetail_();
+      expect(detail.follows_30d).toBe(498);
+      expect(detail.daily_follows).toBeNull();
+      expect(detail.daily_follows_error).toContain(
+        'follows_and_unfollows daily: response had no per-day values'
+      );
+      expect(detail.detail_error).toBeNull();
     });
 
     it('parseInsightsTotalValue_ and parseInsightsDailySum_ read only their own form', () => {
@@ -1788,6 +1878,144 @@ describe('SNS follower counts', () => {
       expect(detail.profile_links_taps_source).toBeNull();
       expect(detail.detail_error).toContain('profile_links_taps: HTTP 400 code=100');
     });
+  });
+
+  describe('Instagram daily follows', () => {
+    it('parseInstagramDailyFollows_ reads label-keyed daily values in ascending date order', () => {
+      // A label key missing from a day's object leaves that side
+      // null (not reported), never 0.
+      expect(Code.parseInstagramDailyFollows_(dailyFollowsBody())).toEqual({
+        series: DAILY_FOLLOWS_SERIES,
+        labels: ['FOLLOWER', 'NON_FOLLOWER'],
+      });
+      expect(Code.parseInstagramDailyFollows_(null)).toEqual({
+        series: null,
+        labels: [],
+      });
+      expect(Code.parseInstagramDailyFollows_({ data: [] })).toEqual({
+        series: null,
+        labels: [],
+      });
+    });
+
+    it('parseInstagramDailyFollows_ reads breakdown results that carry their own end_time', () => {
+      const body = {
+        data: [
+          {
+            name: 'follows_and_unfollows',
+            period: 'day',
+            total_value: {
+              breakdowns: [
+                {
+                  dimension_keys: ['follow_type'],
+                  results: [
+                    {
+                      dimension_values: ['FOLLOWER'],
+                      value: 5,
+                      end_time: '2026-11-08T08:00:00+0000',
+                    },
+                    {
+                      dimension_values: ['NON_FOLLOWER'],
+                      value: 2,
+                      end_time: '2026-11-08T08:00:00+0000',
+                    },
+                    {
+                      dimension_values: ['FOLLOWER'],
+                      value: 9,
+                      end_time: '2026-11-09T08:00:00+0000',
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        ],
+      };
+      expect(Code.parseInstagramDailyFollows_(body)).toEqual({
+        series: [
+          { date: '2026-11-08', follows: 5, unfollows: 2 },
+          { date: '2026-11-09', follows: 9, unfollows: null },
+        ],
+        labels: ['FOLLOWER', 'NON_FOLLOWER'],
+      });
+    });
+
+    it('parseInstagramDailyFollows_ keeps unknown labels observable without guessing', () => {
+      const parsed = Code.parseInstagramDailyFollows_({
+        data: [
+          {
+            values: [
+              {
+                value: { GAINED: 3, LOST: 1 },
+                end_time: '2026-11-09T08:00:00+0000',
+              },
+            ],
+          },
+        ],
+      });
+      expect(parsed.series).toBeNull();
+      expect(parsed.labels).toEqual(['GAINED', 'LOST']);
+    });
+
+    it('insightsDailyDateKey_ dates a bucket by its midpoint in Asia/Tokyo', () => {
+      // Pacific-midnight bucket (end_time 08:00 UTC) for Nov 9.
+      expect(Code.insightsDailyDateKey_('2026-11-09T08:00:00+0000')).toBe(
+        '2026-11-09'
+      );
+      // JST-midnight bucket (end_time 15:00 UTC) for Nov 9.
+      expect(Code.insightsDailyDateKey_('2026-11-09T15:00:00+0000')).toBe(
+        '2026-11-09'
+      );
+      // UTC-midnight bucket (end_time Nov 10 00:00 UTC) for Nov 9.
+      expect(Code.insightsDailyDateKey_('2026-11-10T00:00:00+0000')).toBe(
+        '2026-11-09'
+      );
+      expect(Code.insightsDailyDateKey_('not a date')).toBeNull();
+      expect(Code.insightsDailyDateKey_(null)).toBeNull();
+      expect(Code.insightsDailyDateKey_(undefined)).toBeNull();
+    });
+
+    it('falls back to the total_value form when the plain daily request fails', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      const totals = {
+        reach: 5000,
+        accounts_engaged: 1200,
+        total_interactions: 3000,
+        likes: 2000,
+        comments: 300,
+        shares: 400,
+        saves: 300,
+        profile_links_taps: 46,
+      };
+      fetchHandler = (url) => {
+        if (url.includes('metric=follows_and_unfollows')) {
+          if (url.includes('metric_type=total_value')) {
+            // One body carrying both forms: the totals breakdown
+            // and the per-day values; each reader takes its own.
+            const body = followsBreakdownBody();
+            body.data[0].values = dailyFollowsBody().data[0].values;
+            return res(200, body);
+          }
+          return res(400, {
+            error: { message: 'plain daily unsupported', code: 100 },
+          });
+        }
+        if (url.includes('/insights')) {
+          const metric = metricFromUrl(url);
+          if (metric in totals) {
+            return res(200, totalValueBody(metric, totals[metric]));
+          }
+          throw new Error('unexpected insights metric: ' + metric);
+        }
+        throw new Error('unexpected url: ' + url);
+      };
+      const detail = Code.fetchInstagramAccountDetail_();
+      expect(detail.follows_30d).toBe(498);
+      expect(detail.unfollows_30d).toBe(58);
+      expect(detail.daily_follows).toEqual(DAILY_FOLLOWS_SERIES);
+      expect(detail.daily_follows_error).toBeNull();
+    });
+
   });
 
   describe('Instagram demographics', () => {
