@@ -76,6 +76,51 @@ describe('Code.js', () => {
 
   const lastJson = () => JSON.parse(outputs[outputs.length - 1].text);
 
+  // A readable stand-in for one history-sheet tab: rows are the
+  // raw cell values, header row first.
+  const makeSheet = (rows) => {
+    const sheet = {
+      rows,
+      getLastRow: () => sheet.rows.length,
+      getRange: (row, col, numRows, numCols) => ({
+        getValues: () => {
+          const out = [];
+          for (let i = 0; i < numRows; i++) {
+            const source = sheet.rows[row - 1 + i] || [];
+            out.push(source.slice(col - 1, col - 1 + numCols));
+          }
+          return out;
+        },
+      }),
+    };
+    return sheet;
+  };
+
+  // Points SNS_HISTORY_SHEET_ID at a fake spreadsheet whose
+  // tabs hold the given rows (header included).
+  const mockHistorySheet = (tabs) => {
+    const sheets = {};
+    for (const [name, rows] of Object.entries(tabs)) {
+      sheets[name] = makeSheet(rows);
+    }
+    global.SpreadsheetApp = {
+      openById: vi.fn(() => ({
+        getSheetByName: (name) => sheets[name] || null,
+      })),
+    };
+    store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
+  };
+
+  const BLOG_TOTALS_TAB = [
+    Code.SNS_HISTORY_BLOG_TOTALS_COLUMNS,
+    ['28d', 4925, 241, 900, '2026-11-09T06:00:00.000Z'],
+  ];
+  const BLOG_PAGES_TAB = [
+    Code.SNS_HISTORY_BLOG_PAGES_COLUMNS,
+    ['/blog/1abcdefghijklmnopqrstuvwx', '記事タイトル', 321, '2026-11-09T06:00:00.000Z'],
+    ['/', 'トップ', 123, '2026-11-09T06:00:00.000Z'],
+  ];
+
   describe('doGet', () => {
     it('returns an error when GA4_PROPERTY_ID is not set', () => {
       setProperty(null);
@@ -85,9 +130,9 @@ describe('Code.js', () => {
       expect(json.error).toContain('GA4_PROPERTY_ID');
     });
 
-    it('returns report data with default parameters', () => {
+    it('returns the page ranking from the history sheet with default parameters', () => {
       setProperty(PROPERTY_ID);
-      mockFetch(200, { rowCount: 1, rows: [] });
+      mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
       Code.doGet({ parameter: {} });
       const json = lastJson();
       expect(json.ok).toBe(true);
@@ -96,81 +141,101 @@ describe('Code.js', () => {
       expect(json.endDate).toBe('today');
       expect(json.metrics).toEqual(['screenPageViews', 'activeUsers', 'sessions']);
       expect(json.dimensions).toEqual(['pagePath']);
-      expect(json.data.rowCount).toBe(1);
+      expect(json.data.rowCount).toBe(2);
+      expect(json.data.rows[0]).toEqual({
+        dimensionValues: [{ value: '/blog/1abcdefghijklmnopqrstuvwx' }],
+        metricValues: [{ value: '321' }, { value: '0' }, { value: '0' }],
+      });
+      // The GA4 Data API is not called to render the screen.
+      expect(global.UrlFetchApp).toBeUndefined();
+    });
 
-      const [url, options] = global.UrlFetchApp.fetch.mock.calls[0];
-      expect(url).toBe(
-        'https://analyticsdata.googleapis.com/v1beta/properties/' +
-          PROPERTY_ID +
-          ':runReport'
-      );
-      expect(options.headers.Authorization).toBe('Bearer test-token');
-      const body = JSON.parse(options.payload);
-      expect(body.dateRanges).toEqual([{ startDate: '28daysAgo', endDate: 'today' }]);
-      expect(body.limit).toBe('25');
-      expect(body.orderBys).toEqual([
-        { metric: { metricName: 'screenPageViews' }, desc: true },
+    it('serves the totals shape from blog_totals (the share-validation call)', () => {
+      setProperty(PROPERTY_ID);
+      mockHistorySheet({ blog_totals: BLOG_TOTALS_TAB });
+      Code.doGet({ parameter: { dimensions: '', limit: '1' } });
+      const json = lastJson();
+      expect(json.ok).toBe(true);
+      expect(json.dimensions).toEqual([]);
+      expect(json.data.rows).toEqual([
+        {
+          dimensionValues: [],
+          metricValues: [{ value: '4925' }, { value: '241' }, { value: '900' }],
+        },
       ]);
     });
 
-    it('honours explicit parameters and omits orderBys without dimensions', () => {
+    it('rejects report shapes the sheet cannot answer', () => {
       setProperty(PROPERTY_ID);
-      mockFetch(200, { rows: [] });
+      mockHistorySheet({ blog_pages: BLOG_PAGES_TAB, blog_totals: BLOG_TOTALS_TAB });
+      Code.doGet({ parameter: { dimensions: 'sessionMedium' } });
+      expect(lastJson().ok).toBe(false);
+      expect(lastJson().error).toContain('unsupported report parameters');
+      Code.doGet({ parameter: { dimensions: '', metrics: 'sessions,activeUsers' } });
+      expect(lastJson().ok).toBe(false);
+      expect(lastJson().error).toContain('unsupported report parameters');
       Code.doGet({
-        parameter: {
-          start: '2026-11-01',
-          end: '2026-11-05',
-          metrics: 'sessions, activeUsers',
-          dimensions: '',
-          limit: '5',
-        },
+        parameter: { dimensions: 'date', metrics: 'screenPageViews,activeUsers' },
       });
-      const json = lastJson();
-      expect(json.ok).toBe(true);
-      expect(json.startDate).toBe('2026-11-01');
-      expect(json.endDate).toBe('2026-11-05');
-      expect(json.metrics).toEqual(['sessions', 'activeUsers']);
-      expect(json.dimensions).toEqual([]);
-      const body = JSON.parse(global.UrlFetchApp.fetch.mock.calls[0][1].payload);
-      expect(body.dimensions).toEqual([]);
-      expect(body.limit).toBe('5');
-      expect(body.orderBys).toBeUndefined();
+      expect(lastJson().ok).toBe(false);
     });
 
     it('falls back to the default limit for an invalid limit', () => {
       setProperty(PROPERTY_ID);
-      mockFetch(200, { rows: [] });
+      const rows = [Code.SNS_HISTORY_BLOG_PAGES_COLUMNS];
+      for (let i = 0; i < 30; i++) {
+        rows.push(['/p' + i, '', 100 - i, '2026-11-09T06:00:00.000Z']);
+      }
+      mockHistorySheet({ blog_pages: rows });
       Code.doGet({ parameter: { limit: 'abc' } });
-      const body = JSON.parse(global.UrlFetchApp.fetch.mock.calls[0][1].payload);
-      expect(body.limit).toBe('25');
+      const json = lastJson();
+      expect(json.ok).toBe(true);
+      expect(json.data.rows).toHaveLength(25);
+      expect(json.data.rowCount).toBe(30);
     });
 
-    it('passes through a non-200 API response as an error', () => {
+    it('applies offset and limit to the sheet rows', () => {
       setProperty(PROPERTY_ID);
-      mockFetch(403, { error: { message: 'forbidden' } });
+      mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
+      Code.doGet({ parameter: { offset: '1', limit: '1' } });
+      const json = lastJson();
+      expect(json.ok).toBe(true);
+      expect(json.offset).toBe(1);
+      expect(json.data.rows).toEqual([
+        {
+          dimensionValues: [{ value: '/' }],
+          metricValues: [{ value: '123' }, { value: '0' }, { value: '0' }],
+        },
+      ]);
+      expect(json.data.rowCount).toBe(2);
+    });
+
+    it('answers an error when the sheet holds no blog data yet', () => {
+      setProperty(PROPERTY_ID);
       Code.doGet({ parameter: {} });
       const json = lastJson();
       expect(json.ok).toBe(false);
-      expect(json.status).toBe(403);
-      expect(json.error.error.message).toBe('forbidden');
+      expect(json.error).toContain('has not been collected');
     });
 
-    it('returns an error JSON when fetch throws', () => {
+    it('answers an error (never a live GA4 call) when the sheet read fails', () => {
       setProperty(PROPERTY_ID);
-      global.UrlFetchApp = {
-        fetch: vi.fn(() => {
-          throw new Error('network down');
+      mockFetch(200, { rows: [] });
+      store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
+      global.SpreadsheetApp = {
+        openById: vi.fn(() => {
+          throw new Error('drive exploded');
         }),
       };
       Code.doGet({ parameter: {} });
       const json = lastJson();
       expect(json.ok).toBe(false);
-      expect(json.error).toContain('network down');
+      expect(global.UrlFetchApp.fetch).not.toHaveBeenCalled();
     });
 
     it('works when called without an event object', () => {
       setProperty(PROPERTY_ID);
-      mockFetch(200, { rows: [] });
+      mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
       Code.doGet();
       expect(lastJson().ok).toBe(true);
     });
@@ -343,22 +408,15 @@ describe('Code.js', () => {
   });
 
   describe('doGet with filter and offset', () => {
-    it('passes filter and offset through to the request', () => {
+    it('rejects filtered reports: the sheet serves fixed shapes only', () => {
       setProperty(PROPERTY_ID);
-      mockFetch(200, { rows: [] });
+      mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
       Code.doGet({
         parameter: { filter: 'pagePath:contains:/list-of-stuff/', offset: '50', limit: '10' },
       });
       const json = lastJson();
-      expect(json.ok).toBe(true);
-      expect(json.filters).toEqual([
-        { fieldName: 'pagePath', matchType: 'CONTAINS', value: '/list-of-stuff/' },
-      ]);
-      expect(json.offset).toBe(50);
-      const body = JSON.parse(global.UrlFetchApp.fetch.mock.calls[0][1].payload);
-      expect(body.offset).toBe('50');
-      expect(body.limit).toBe('10');
-      expect(body.dimensionFilter.filter.stringFilter.value).toBe('/list-of-stuff/');
+      expect(json.ok).toBe(false);
+      expect(json.error).toContain('unsupported report parameters');
     });
 
     it('returns an error JSON for an invalid filter clause', () => {
@@ -521,6 +579,7 @@ describe('Code.js', () => {
       setProperty(PROPERTY_ID);
       configureAuth();
       mockAuthFetch({ payload: goodPayload() });
+      mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
       Code.doGet({ parameter: { id_token: 'token' } });
       expect(lastJson().ok).toBe(true);
     });
@@ -540,6 +599,7 @@ describe('Code.js', () => {
       setProperty(PROPERTY_ID);
       configureAuth();
       mockAuthFetch({ payload: goodPayload() });
+      mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
       const token = Code.issueShareSession_().share_token;
       Code.doGet({ parameter: { share_token: token } });
       const json = lastJson();
@@ -565,7 +625,7 @@ describe('Code.js', () => {
 
     it('leaves the gate open while auth is not configured', () => {
       setProperty(PROPERTY_ID);
-      mockFetch(200, { rows: [] });
+      mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
       Code.doGet({ parameter: {} });
       expect(lastJson().ok).toBe(true);
     });

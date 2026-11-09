@@ -1,8 +1,10 @@
 # social-gas
 
-GA4 Data API ブリッジ。Google Apps Script の Web アプリが、所有者の Google アカウント権限で GA4 Data API（runReport）を叩き、結果を JSON で返す。
+GA4 Data API ブリッジ＋SNS 集計。Google Apps Script の Web アプリが、所有者の Google アカウント権限で GA4 Data API（runReport）や各 SNS の API を叩き、結果を JSON で返す。
 
 Muse の API 接続の仕組みは OAuth の入口が単一ドメインのサービス専用で、ドメインが分かれる Google には使えないため、この GAS 経由の形にしている。
+
+データの流れは「1時間ごとの収集（collectSnsCounts）が履歴スプレッドシートに書き、画面の読み取りはシートから組み立てる」形に統一されている（第2段階）。/social の画面表示のために GA4 / Meta / YouTube の API をその場で叩くことはない。GA4 を直接叩くのは収集側と、公開アクション（music_count / top_articles、どちらも CacheService で約1時間キャッシュ）だけ。
 
 ## エンドポイント
 
@@ -22,13 +24,22 @@ Muse の API 接続の仕組みは OAuth の入口が単一ドメインのサー
 
 ## パラメータ
 
-- `start`（既定 28daysAgo）/ `end`（既定 today）：GA4 の日付表現（YYYY-MM-DD も可）
+デフォルトのレポート応答は、履歴スプレッドシートから組み立てて返す（第2段階）。対応する形は /social の画面が使う4形だけ：
+
+- 合計：`dimensions` 空（既定の metrics のまま）
+- 日次：`dimensions=date`、`metrics=screenPageViews`
+- ページランキング：`dimensions=pagePath`（既定）
+- 流入元ランキング：`dimensions=sessionDefaultChannelGroup`
+
+それ以外の寸法・metrics の組み合わせと、`filter` 付きのリクエストは `ok: false`（unsupported report parameters）を返す。応答の封筒（ok / property / startDate / endDate / metrics / dimensions / filters / offset / _share / data）は従来どおりで、data.rows は GA4 と同じ形（dimensionValues / metricValues）にシートの値から合成する。シートにデータがまだ無い場合は `ok: false`（blog data has not been collected into the history sheet yet）。数分間 CacheService にキャッシュする。
+
+- `start`（既定 28daysAgo）/ `end`（既定 today）：日付表現（YYYY-MM-DD も可）。日次形の窓として使う
 - `metrics`（既定 screenPageViews,activeUsers,sessions）：カンマ区切り
 - `dimensions`（既定 pagePath）：カンマ区切り。空にすると合計のみ
 - `limit`（既定 25）
 - `offset`（既定 0）：limit と組み合わせてページングする
-- `filter`：ディメンションの絞り込み。書式は `<ディメンション>:<マッチ種別>:<値>`、マッチ種別は exact / contains / beginsWith / endsWith / regexp。複数条件は `;` 区切りで AND 結合。例：`filter=pagePath:contains:/blog/`
-- `action=music_count`：唯一の公開アクション。サイト共通ヘッダーに出す「川口の歌」の累計再生回数のため、認証なしで呼べる。返すのは music_play イベントの累計 eventCount（2026-11-08以降）と更新日時だけで、他のデータは一切返さない。CacheService で約1時間キャッシュし、GA4 Data API を叩く頻度を抑える
+- `filter`：書式は検証するが、フィルタ付きレポートは提供しない（上記）
+- `action=music_count`：公開アクション。サイト共通ヘッダーに出す「川口の歌」の累計再生回数のため、認証なしで呼べる。返すのは music_play イベントの累計 eventCount（2026-11-08以降）と更新日時だけで、他のデータは一切返さない。CacheService で約1時間キャッシュし、GA4 Data API を叩く頻度を抑える
 
 ## SNSフォロワー数（action=sns_counts）
 
@@ -47,7 +58,11 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 
 ## SNS詳細（action=sns_detail、認証必須）
 
-/social 管理画面用に、`collectSnsCounts` が同じスナップショットへ詳細データも保存する。読み取りは `?action=sns_detail` で、GA4 レポートと同じ認証ゲート（ID トークンまたは一時アクセスリンク）を通る。取得は項目ごとに独立して失敗し、取れない項目は null、失敗の要約はセクションごとのエラーキー（秘密値は含まない）に入る。
+/social 管理画面用。読み取りは `?action=sns_detail` で、レポートと同じ認証ゲート（ID トークンまたは一時アクセスリンク）を通る。
+
+**応答は履歴スプレッドシートから組み立てる**（第2段階）。`account` の最新行を中心に、`media` / `daily` / `threads_media` / `youtube_media` / `ig_demographics` / `threads_account` の各タブから、スナップショットと同形の詳細を再構築する（数分間 CacheService にキャッシュ）。シートが読めない・account に行が無い場合は、従来どおり保存済みスナップショットへフォールバックし、どちらも無ければ全項目 null の空形を返す。シート由来の応答では、収集1回ごとの診断であるエラーキー（`insights_error`、`detail_error`、`media_error` 等）は履歴に保存していないため常に null になり、`daily_follows` は値のある日だけの配列になる（両側 null の日は行自体が無い）。`youtube.recent_videos` の `url` はシートに保存せず video_id から組み立てる。
+
+以下は収集側（スナップショットと履歴シートへの書き込み）の仕様。取得は項目ごとに独立して失敗し、取れない項目は null、失敗の要約はセクションごとのエラーキー（秘密値は含まない）に入る。
 
 - Instagram アカウント全体（過去30日、メインアカウント）：`reach_30d`、`accounts_engaged_30d`、`interactions_30d`（total / likes / comments / shares / saves）、`profile_links_taps_30d`、`follows_30d` / `unfollows_30d`（`follows_and_unfollows` の follow_type 内訳）、`daily_follows`（日次フォロー／フォロー解除系列）。失敗時は `instagram.detail_error`（ただし `daily_follows` の失敗だけは `instagram.daily_follows_error` に分けて記録する）
   - `daily_follows` は `{date, follows, unfollows}`（date は Asia/Tokyo の暦日 \"YYYY-MM-DD\"、日付昇順）の配列で、/social の Instagram タブで日ごとのフォロー・フォロー解除グラフに投稿日を重ねるための系列。投稿ごとのフォロー帰属は Meta のデータに存在しないため、日次系列と投稿日の重ね合わせで代替する。取得方式は2026-11-09 の本番デバッグで確定した：`follows_and_unfollows` は period=day の素の形が HTTP 400 で拒否され、`metric_type=total_value` 形は指定期間全体の合算（follow_type 内訳）しか返さないため、1回のリクエストでは日次系列は作れない。そこで過去30日の各日について、その日の JST ウィンドウ（00:00:00〜23:59:59 を Unix 秒に変換）で total_value＋breakdown=follow_type を取得し、1日ずつ組み立てる。当日分は途中経過の値で、次の収集で更新される。1日の取得が失敗したらその日は両側 null のまま残し、欠けた日数は `daily_follows_missing_days` に記録する（部分的失敗はエラーにしない）。全日失敗のときだけ系列を null にし、`daily_follows_error` に要約を入れる。ラベルが欠けた側は null（未報告）で、0 にはしない。実応答の形はエディタから `debugInstagramDailyFollows()` を手動実行して確認する
@@ -73,13 +88,17 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - `youtube_media` シート（キー `video_id` で upsert）：`youtube.recent_videos` の動画ごとに1行。列は collected_at、video_id、published_at、title、views、likes、comments。動画ごとの数値はもともと毎回の収集でアップロード一覧から取得していた分（最大10件）で、履歴のために追加の取得はしていない
 - `ig_demographics` シート（キー `breakdown_key` で upsert）：Instagram のフォロワー属性。列は breakdown_key、breakdown、key、value、collected_at。breakdown は age_gender（年代×性別、key は `25-34/F` の形）、city（上位の市）、country（上位の国）の3種で、キーで1行にまとめる。取得に失敗した breakdown は行を作らず、既存行も消さない
 - `threads_account` シート（キー `metric` で upsert）：Threads のアカウント指標（過去30日）。列は metric、value、collected_at。metric は views_30d、interactions_total / likes / replies / reposts / quotes。数値が取れた metric だけ行を作る
-- `blog_daily` シート（キー `date` で upsert）：ブログの日次 KPI を GA4 から取得して書く（スナップショット経由ではない）。列は date、views、users、sessions、avg_speed_ms、music_plays、collected_at。対象は前日（確定）と当日（途中経過、次の収集で上書き）。avg_speed_ms は `wv_lcp` イベントの平均値（eventValue / eventCount、ミリ秒）で、表示スピードの指標。music_plays はその日の `music_play` イベント件数
+- `blog_daily` シート（キー `date` で upsert）：ブログの日次 KPI を GA4 から取得して書く（スナップショット経由ではない）。列は date、views、users、sessions、avg_speed_ms、music_plays、collected_at。対象は表示窓の全日（28daysAgo〜today の29日）で、毎回の収集で窓全体を取り直して上書きする（GA4 側の後日修正も次の収集で反映される。当日分は途中経過）。avg_speed_ms は `wv_lcp` イベントの平均値（eventValue / eventCount、ミリ秒）で、表示スピードの指標。music_plays はその日の `music_play` イベント件数
 - `blog_posts` シート（キー `path` で upsert）：ブログの記事ごとに1行。列は path、title、views_28d、collected_at。path は `/<id>` と `/blog/<id>` を一本化した正規形 `/blog/<id>`（フロントのランキングと同じ合算ルール、記事IDの判定は `action=top_articles` と同じ）。views_28d は直近28日の表示回数、title は GA4 の pageTitle
-- ブログの2タブは `SNS_HISTORY_SHEET_ID` と `GA4_PROPERTY_ID` の両方が設定されているときだけ書く。GA4 の取得に失敗したタブはスキップし、実行ログに1行出して収集自体は成功として扱う（SNS 側の書き込みとは独立）
+- `blog_pages` シート（キー `path` で upsert）：blog_posts と同じ取得を記事以外にも広げたもの。列は path、title、views_28d、collected_at。記事は正規形に合算し、それ以外のパス（トップやアプリのページ）はそのままのパスがキー。画面のページレンキング（記事とアプリページが混ざる）用
+- `blog_totals` シート（キー `window` で upsert）：表示窓の合計1行だけ。列は window（固定で `28d`）、views、users、sessions、collected_at。28日間のユーザー数は日次 users の単純合計と一致しない（期間内で重複排除される）ため、寸法なしレポートの合計をそのまま収集する
+- `blog_sources` シート（キー `channel` で upsert）：流入元ごとの表示回数。列は channel、views_28d、collected_at。channel は `sessionDefaultChannelGroup`
+- ブログの5タブは `SNS_HISTORY_SHEET_ID` と `GA4_PROPERTY_ID` の両方が設定されているときだけ書く。GA4 の取得に失敗したタブはスキップし、実行ログに1行出して収集自体は成功として扱う（SNS 側の書き込みとは独立）
 - upsert の方式：収集のたびにタブ全体を読み、キーでマージして（新しい取得値が勝つ。ただし新しい値が null の項目は空欄として扱い、既存値を残す＝null で潰さない）、ヘッダー＋1キー1行で書き戻し、余った行は削除する。この方式により、追記方式だった頃に貯まった `media` の重複行（30投稿×収集回数分）も、次回収集で自動的に1投稿1行へ整理される
 - どのシートも無ければ自動作成し、1行目が空（シートが空）のときだけヘッダー行を書く。既存のヘッダー行は upsert でも書き換えない
 - 書き込みに失敗しても取得自体は成功として扱い、実行ログに `SNS history append failed: <要約>` が1行出る（要約に秘密値・URL は含めない）
 - 読み取りは `?action=sns_history`（認証必須、sns_detail と同じゲート）で、/social の推移グラフ用。`account` シートの行を collected_at 昇順で最大直近2400行返し（1時間ごとの収集で約100日分）、項目は collected_at、ig_followers、threads_followers、youtube_subscribers、total_followers、media_count、views_30d、non_follower_pct、reach_30d、interactions_total、follows_30d、unfollows_30d、yt_total_views の13項目に絞る（空欄は null）。プロパティ未設定・シートが無い／空の場合はエラーにせず `rows: []` を返す
+- 第2段階の読み取り：`action=sns_detail` とデフォルトのレポート応答もシートから組み立てる（詳細は各節）。`blog_pages` / `blog_sources` は「窓のスナップショット」なので、読み取りでは最新の collected_at のバッチの行だけを使う（古い窓の行の凍結した views_28d をランキングに出さないため）。`blog_daily` は日付キーで窓に絞る
 
 ## 診断関数 `debugSnsInsights`（手動実行専用）
 

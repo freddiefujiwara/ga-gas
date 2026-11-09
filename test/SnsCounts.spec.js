@@ -1372,7 +1372,8 @@ describe('SNS follower counts', () => {
 
     // Routes the GA4 runReport calls of the blog history by the
     // request body: the by-date totals, the music_play counts,
-    // the wv_lcp speed aggregates and the per-path article views.
+    // the wv_lcp speed aggregates, the per-path page views, the
+    // dimension-less range totals and the channel split.
     const mockGa4Blog = (overrides = {}) => {
       const bodies = {
         totals: [
@@ -1391,6 +1392,11 @@ describe('SNS follower counts', () => {
           ga4Row(['/', 'トップ'], [999]),
           ga4Row(['/blog/', 'ブログトップ'], [50]),
         ],
+        rangeTotals: [ga4Row([], [1000, 300, 500])],
+        sources: [
+          ga4Row(['Organic Search'], [800]),
+          ga4Row(['Direct'], [300]),
+        ],
       };
       Object.assign(bodies, overrides);
       fetchHandler = (url, options) => {
@@ -1403,6 +1409,12 @@ describe('SNS follower counts', () => {
         const filterText = JSON.stringify(body.dimensionFilter || {});
         if (dimensions.includes('pagePath')) {
           return res(200, { rows: bodies.posts });
+        }
+        if (dimensions.includes('sessionDefaultChannelGroup')) {
+          return res(200, { rows: bodies.sources });
+        }
+        if (dimensions.length === 0) {
+          return res(200, { rows: bodies.rangeTotals });
         }
         if (filterText.includes('music_play')) {
           return res(200, { rows: bodies.music });
@@ -1442,7 +1454,7 @@ describe('SNS follower counts', () => {
       expect(Code.ga4DateKey_('')).toBe('');
     });
 
-    it('fetches yesterday and today and merges the three reports by date', () => {
+    it('fetches the display window and merges the three reports by date', () => {
       mockGa4Blog();
       const byDate = Code.fetchBlogDailyData_('561730442');
       expect(byDate).toEqual({
@@ -1461,12 +1473,14 @@ describe('SNS follower counts', () => {
           music_plays: null,
         },
       });
-      // The totals report asks for exactly yesterday..today (JST).
+      // The totals report asks for the whole display window
+      // (28daysAgo..today in JST), so the sheet holds every day
+      // the blog tab's daily chart can ask for.
       const totalsBody = ga4Requests.find((body) =>
         (body.metrics || []).some((m) => m.name === 'screenPageViews')
       );
       expect(totalsBody.dateRanges).toEqual([
-        { startDate: '2026-11-08', endDate: '2026-11-09' },
+        { startDate: '2026-10-12', endDate: '2026-11-09' },
       ]);
     });
 
@@ -1561,12 +1575,74 @@ describe('SNS follower counts', () => {
       ]);
     });
 
+    it('keeps every page path for blog_pages, articles merged, the rest as-is', () => {
+      mockGa4Blog();
+      const pages = Code.fetchBlogPagesData_('561730442');
+      expect(pages).toEqual([
+        { path: '/', title: 'トップ', views_28d: 999 },
+        { path: '/blog/', title: 'ブログトップ', views_28d: 50 },
+        {
+          path: '/blog/1abcdefghijklmnopqrstuvwx',
+          title: '記事タイトルA',
+          views_28d: 15,
+        },
+        { path: '/blog/2abcdefghijklmnopqrstuvwx', title: '', views_28d: 3 },
+      ]);
+      expect(
+        Code.buildBlogPagesRows_(pages, '2026-11-09T03:00:00.000Z')
+      ).toEqual([
+        ['/', 'トップ', 999, '2026-11-09T03:00:00.000Z'],
+        ['/blog/', 'ブログトップ', 50, '2026-11-09T03:00:00.000Z'],
+        [
+          '/blog/1abcdefghijklmnopqrstuvwx',
+          '記事タイトルA',
+          15,
+          '2026-11-09T03:00:00.000Z',
+        ],
+        ['/blog/2abcdefghijklmnopqrstuvwx', '', 3, '2026-11-09T03:00:00.000Z'],
+      ]);
+      expect(Code.canonicalBlogPath_('/1abcdefghijklmnopqrstuvwx')).toBe(
+        '/blog/1abcdefghijklmnopqrstuvwx'
+      );
+      expect(Code.canonicalBlogPath_('/list-of-stuff/')).toBe(
+        '/list-of-stuff/'
+      );
+    });
+
+    it('reads the range totals and the channel split', () => {
+      mockGa4Blog();
+      const totals = Code.fetchBlogTotalsData_('561730442');
+      expect(totals).toEqual({ views: 1000, users: 300, sessions: 500 });
+      expect(Code.buildBlogTotalsRows_(totals, '2026-11-09T03:00:00.000Z')).toEqual(
+        [['28d', 1000, 300, 500, '2026-11-09T03:00:00.000Z']]
+      );
+      expect(Code.buildBlogTotalsRows_(null, 't')).toEqual([]);
+      const sources = Code.fetchBlogSourcesData_('561730442');
+      expect(sources).toEqual([
+        { channel: 'Organic Search', views_28d: 800 },
+        { channel: 'Direct', views_28d: 300 },
+      ]);
+      expect(
+        Code.buildBlogSourcesRows_(sources, '2026-11-09T03:00:00.000Z')
+      ).toEqual([
+        ['Organic Search', 800, '2026-11-09T03:00:00.000Z'],
+        ['Direct', 300, '2026-11-09T03:00:00.000Z'],
+      ]);
+    });
+
+    it('returns null for the pages/totals/sources data when the report fails', () => {
+      fetchHandler = () => res(500, { error: { message: 'boom' } });
+      expect(Code.fetchBlogPagesData_('561730442')).toBeNull();
+      expect(Code.fetchBlogTotalsData_('561730442')).toBeNull();
+      expect(Code.fetchBlogSourcesData_('561730442')).toBeNull();
+    });
+
     it('returns null for the posts data when the report fails', () => {
       fetchHandler = () => res(500, { error: { message: 'boom' } });
       expect(Code.fetchBlogPostsData_('561730442')).toBeNull();
     });
 
-    it('writes both blog tabs end to end and upserts on the next run', () => {
+    it('writes the blog tabs end to end and upserts on the next run', () => {
       mockGa4Blog();
       Code.appendBlogHistory_();
       expect(openById).toHaveBeenCalledWith('history-sheet-id');
@@ -1594,11 +1670,39 @@ describe('SNS follower counts', () => {
         Code.SNS_HISTORY_BLOG_POSTS_COLUMNS
       );
       expect(sheets.blog_posts.rows).toHaveLength(3);
+      // blog_pages keeps every path: header + the four canonical
+      // paths of the fixture.
+      expect(sheets.blog_pages.rows[0]).toEqual(
+        Code.SNS_HISTORY_BLOG_PAGES_COLUMNS
+      );
+      expect(sheets.blog_pages.rows).toHaveLength(5);
+      expect(sheets.blog_pages.rows[1].slice(0, 3)).toEqual([
+        '/',
+        'トップ',
+        999,
+      ]);
+      // blog_totals holds the single window row.
+      expect(sheets.blog_totals.rows).toHaveLength(2);
+      expect(sheets.blog_totals.rows[1].slice(0, 4)).toEqual([
+        '28d',
+        1000,
+        300,
+        500,
+      ]);
+      // blog_sources holds one row per channel.
+      expect(sheets.blog_sources.rows).toHaveLength(3);
+      expect(sheets.blog_sources.rows[1].slice(0, 2)).toEqual([
+        'Organic Search',
+        800,
+      ]);
 
       Code.appendBlogHistory_();
       // Still one row per key after a second collection.
       expect(sheets.blog_daily.rows).toHaveLength(3);
       expect(sheets.blog_posts.rows).toHaveLength(3);
+      expect(sheets.blog_pages.rows).toHaveLength(5);
+      expect(sheets.blog_totals.rows).toHaveLength(2);
+      expect(sheets.blog_sources.rows).toHaveLength(3);
       expect(sheets.account).toBeUndefined();
     });
 
@@ -1650,6 +1754,9 @@ describe('SNS follower counts', () => {
 
       expect(sheets.blog_daily.rows).toHaveLength(3);
       expect(sheets.blog_posts.rows).toHaveLength(3);
+      expect(sheets.blog_pages.rows).toHaveLength(5);
+      expect(sheets.blog_totals.rows).toHaveLength(2);
+      expect(sheets.blog_sources.rows).toHaveLength(3);
       expect(sheets.account.rows).toHaveLength(2);
     });
   });

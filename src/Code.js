@@ -16,6 +16,14 @@
  *                exact / contains / beginsWith / endsWith / regexp.
  *                Multiple clauses are combined with AND. Example:
  *                filter=pagePath:contains:/blog/;sessionDefaultChannelGroup:exact:Organic Search
+ *                (Filters are parsed and validated, but filtered reports
+ *                are not served: see below.)
+ *
+ * The default report is served from the history spreadsheet the
+ * hourly collection writes (stage 2), in the fixed shapes the
+ * /social screen uses — totals, daily views, page ranking,
+ * channel ranking — and no longer calls the GA4 Data API.
+ * Unsupported parameter combinations answer ok:false.
  *
  * Actions:
  *   action=music_count - a public action: returns only the
@@ -522,15 +530,60 @@ function buildEmptySnsDetail_() {
   };
 }
 
-// action=sns_detail (authenticated): the full stored snapshot for
-// the /ga admin screen. Before the first collection it serves the
-// empty shape above.
+// action=sns_detail (authenticated): the detail for the
+// /social admin screen, assembled from the history spreadsheet
+// (stage 2: the screen's reads come from the sheet, never from
+// a live API call — see buildSnsDetailFromSheet_ below). The
+// stored snapshot is the fallback: when the sheet cannot be
+// read (or holds no account row yet), the snapshot is served
+// exactly as before, and before the first collection the empty
+// shape above is served. The assembled detail is cached for a
+// few minutes so repeated screen loads do not re-read every
+// tab.
 function buildSnsDetailResponse_() {
-  const snapshot = getSnsCountsSnapshot_();
-  if (!snapshot) {
-    return Object.assign({ ok: true, action: 'sns_detail' }, buildEmptySnsDetail_());
+  const cache = sheetReadCache_();
+  if (cache) {
+    const hit = cache.get(SNS_DETAIL_CACHE_KEY);
+    if (hit) {
+      try {
+        return Object.assign(
+          { ok: true, action: 'sns_detail' },
+          JSON.parse(hit)
+        );
+      } catch (err) {
+        // A corrupt cache entry is ignored; the detail is rebuilt.
+      }
+    }
   }
-  return Object.assign({ ok: true, action: 'sns_detail' }, snapshot);
+  let detail = null;
+  try {
+    detail = buildSnsDetailFromSheet_();
+  } catch (err) {
+    console.log(
+      'SNS detail from sheet failed: ' +
+        summarizeSnsHistoryError_(
+          err,
+          getScriptProperty_(SNS_HISTORY_SHEET_ID_PROPERTY)
+        )
+    );
+    detail = null;
+  }
+  if (!detail) {
+    detail = getSnsCountsSnapshot_() || buildEmptySnsDetail_();
+  }
+  if (cache) {
+    try {
+      cache.put(
+        SNS_DETAIL_CACHE_KEY,
+        JSON.stringify(detail),
+        SNS_DETAIL_CACHE_SECONDS
+      );
+    } catch (err) {
+      // An oversized detail (CacheService caps values at
+      // 100KB) simply goes uncached.
+    }
+  }
+  return Object.assign({ ok: true, action: 'sns_detail' }, detail);
 }
 
 function fetchGraphFollowersCount_(url) {
@@ -2870,6 +2923,35 @@ const SNS_HISTORY_BLOG_POSTS_COLUMNS = [
   'views_28d',
   'collected_at',
 ];
+// Stage 2 (the read side serves the blog tab from the sheet)
+// added three more blog tabs to the same workbook:
+// "blog_pages" mirrors "blog_posts" but keeps EVERY page path,
+// not just articles — the screen's top-pages ranking mixes
+// articles with the app pages. "blog_totals" holds the window
+// totals (the daily users cannot be summed into a 28-day user
+// count, so the range totals are collected as their own row).
+// "blog_sources" holds the traffic-channel split.
+const SNS_HISTORY_BLOG_PAGES_COLUMNS = [
+  'path',
+  'title',
+  'views_28d',
+  'collected_at',
+];
+const SNS_HISTORY_BLOG_TOTALS_COLUMNS = [
+  'window',
+  'views',
+  'users',
+  'sessions',
+  'collected_at',
+];
+// The single blog_totals row's key: the totals always cover the
+// fixed 28daysAgo..today window the screen's totals report reads.
+const BLOG_TOTALS_WINDOW_KEY = '28d';
+const SNS_HISTORY_BLOG_SOURCES_COLUMNS = [
+  'channel',
+  'views_28d',
+  'collected_at',
+];
 // Numbers are written as numbers; anything else (null, undefined,
 // non-finite) becomes an empty cell so the sheet stays sortable.
 function snsHistoryNumCell_(value) {
@@ -3291,17 +3373,19 @@ function appendSnsHistory_(snapshot) {
 }
 
 // --- Blog history (GA4 -> the same history spreadsheet) ---
-// Stage 1 of serving /ga from the spreadsheet: the blog's numbers
-// join the SNS history in the same workbook, so the collection
-// side is complete before any read side switches over.
+// Stage 1 of serving /social from the spreadsheet: the blog's
+// numbers join the SNS history in the same workbook, so the
+// collection side is complete before any read side switches
+// over. Stage 2 (below) reads them back for the screen.
 // collectSnsCounts() calls appendBlogHistory_() right after the
-// SNS writes; it pulls the blog's GA4 numbers through the same
-// runReport bridge the /ga screen's live reads use
-// (buildReportRequest_ / fetchReport_ with GA4_PROPERTY_ID) and
-// upserts two tabs:
-//   - "blog_daily" (key: date): one row per calendar day —
-//     yesterday (final) and today (still in progress; the next
-//     collection overwrites it). views / users / sessions are the
+// SNS writes; it pulls the blog's GA4 numbers through the
+// runReport bridge (buildReportRequest_ / fetchReport_ with
+// GA4_PROPERTY_ID) and upserts five tabs:
+//   - "blog_daily" (key: date): one row per calendar day over
+//     the whole display window (28daysAgo..today, 29 days).
+//     Every run re-fetches the full window, so a day GA4 later
+//     restates is overwritten with the corrected value on the
+//     next run. views / users / sessions are the
 //     day's GA4 totals. avg_speed_ms is the day's average wv_lcp
 //     value: the blog sends each Core Web Vital as its own event
 //     (wv_lcp, wv_inp, ...) with the measured value in the
@@ -3311,18 +3395,28 @@ function appendSnsHistory_(snapshot) {
 //     metric of that set. music_plays is the day's music_play
 //     eventCount.
 //   - "blog_posts" (key: path): one row per article, carrying its
-//     views over the last 28 days — the window the /ga blog tab
-//     reads. Article paths arrive split as /<id> and /blog/<id>;
-//     both merge under the canonical /blog/<id>, the merge rule
-//     the frontend's page ranking applies (and the same article-id
-//     test as action=top_articles). The title is GA4's pageTitle
-//     on the article's most-viewed path form.
+//     views over the last 28 days — the window the /social blog
+//     tab reads. Article paths arrive split as /<id> and
+//     /blog/<id>; both merge under the canonical /blog/<id>, the
+//     merge rule the frontend's page ranking applies (and the
+//     same article-id test as action=top_articles). The title is
+//     GA4's pageTitle on the article's most-viewed path form.
+//   - "blog_pages" (key: path): the same fetch with no article
+//     filter — every page path under its canonical key — for the
+//     top-pages ranking, which mixes articles and app pages.
+//   - "blog_totals" (key: window): the window's totals row. The
+//     28-day user count deduplicates across days, so it cannot
+//     be summed out of blog_daily; it is collected as-is.
+//   - "blog_sources" (key: channel): the window's views split
+//     by sessionDefaultChannelGroup, for the sources ranking.
 // Both writes are best-effort in the same way as the SNS history:
 // gated on SNS_HISTORY_SHEET_ID and GA4_PROPERTY_ID, and a failure
 // logs one line instead of failing the collection.
 
 const BLOG_POSTS_WINDOW_DAYS = 28;
 const BLOG_POSTS_FETCH_LIMIT = 1000;
+const BLOG_DAILY_FETCH_LIMIT = 40;
+const BLOG_SOURCES_FETCH_LIMIT = 100;
 const BLOG_SPEED_EVENT_NAME = 'wv_lcp';
 const BLOG_MUSIC_EVENT_NAME = 'music_play';
 
@@ -3363,16 +3457,17 @@ function blogReportMetric_(row, index) {
   return Number.isFinite(num) ? num : null;
 }
 
-// Yesterday's and today's blog numbers from GA4, keyed by ISO
-// date: { views, users, sessions, avg_speed_ms, music_plays },
-// each field null when its report carried no value for that day.
+// The blog's daily numbers over the display window
+// (28daysAgo..today, 29 days), keyed by ISO date:
+// { views, users, sessions, avg_speed_ms, music_plays }, each
+// field null when its report carried no value for that day.
 // Returns null when the totals report itself failed — without it
 // there is no day to key the rows by. The music and speed reports
 // fail independently of it: their fields just stay null.
 function fetchBlogDailyData_(propertyId) {
   const nowMs = Date.now();
   const range = {
-    startDate: jstDateKey_(nowMs - SNS_DAY_MS),
+    startDate: jstDateKey_(nowMs - BLOG_POSTS_WINDOW_DAYS * SNS_DAY_MS),
     endDate: jstDateKey_(nowMs),
   };
   const totals = fetchBlogReportRows_(
@@ -3380,7 +3475,7 @@ function fetchBlogDailyData_(propertyId) {
     Object.assign({}, range, {
       metrics: ['screenPageViews', 'activeUsers', 'sessions'],
       dimensions: ['date'],
-      limit: 10,
+      limit: BLOG_DAILY_FETCH_LIMIT,
       offset: 0,
       filters: [],
     })
@@ -3416,7 +3511,7 @@ function fetchBlogDailyData_(propertyId) {
     Object.assign({}, range, {
       metrics: ['eventCount'],
       dimensions: ['date'],
-      limit: 10,
+      limit: BLOG_DAILY_FETCH_LIMIT,
       offset: 0,
       filters: parseFilterClauses_(
         'eventName:exact:' + BLOG_MUSIC_EVENT_NAME
@@ -3436,7 +3531,7 @@ function fetchBlogDailyData_(propertyId) {
     Object.assign({}, range, {
       metrics: ['eventValue', 'eventCount'],
       dimensions: ['date'],
-      limit: 10,
+      limit: BLOG_DAILY_FETCH_LIMIT,
       offset: 0,
       filters: parseFilterClauses_(
         'eventName:exact:' + BLOG_SPEED_EVENT_NAME
@@ -3480,12 +3575,11 @@ function buildBlogDailyRows_(byDate, collectedAt) {
     });
 }
 
-// The blog's per-article views over the last 28 days, merged
-// under the canonical /blog/<id> path as described above. Returns
-// null when the report failed. Entries come back sorted by views
-// descending; the upsert keeps stored rows in place regardless.
-function fetchBlogPostsData_(propertyId) {
-  const rows = fetchBlogReportRows_(propertyId, {
+// The one pagePath x pageTitle fetch behind both blog_posts
+// and blog_pages: the raw report rows, or null when the API did
+// not answer 200 (or the fetch itself failed).
+function fetchBlogPathRows_(propertyId) {
+  return fetchBlogReportRows_(propertyId, {
     startDate: BLOG_POSTS_WINDOW_DAYS + 'daysAgo',
     endDate: 'today',
     metrics: ['screenPageViews'],
@@ -3494,19 +3588,21 @@ function fetchBlogPostsData_(propertyId) {
     offset: 0,
     filters: [],
   });
-  if (!rows) {
-    return null;
-  }
+}
+
+// Merges pagePath report rows under the key keyOf(rawPath)
+// computes (an empty key drops the row): split path forms of
+// one page are summed, and the title comes from the most-viewed
+// form. Entries come back sorted by views descending; the
+// upsert keeps stored rows in place regardless.
+function mergeBlogPathRows_(rows, keyOf) {
   const byPath = {};
-  rows.forEach((row) => {
+  (rows || []).forEach((row) => {
     const dimensionValues = (row && row.dimensionValues) || [];
-    const id = articleIdFromPath_(
-      dimensionValues[0] && dimensionValues[0].value
-    );
-    if (!id) {
+    const path = keyOf(dimensionValues[0] && dimensionValues[0].value);
+    if (!path) {
       return;
     }
-    const path = '/blog/' + id;
     const views = blogReportMetric_(row, 0) || 0;
     const rawTitle = String(
       (dimensionValues[1] && dimensionValues[1].value) || ''
@@ -3533,6 +3629,96 @@ function fetchBlogPostsData_(propertyId) {
     }));
 }
 
+// The canonical key a pagePath counts under in the sheet and in
+// the screen's page ranking: an article's split forms merge
+// under /blog/<id>; every other path is its own key.
+function canonicalBlogPath_(path) {
+  const id = articleIdFromPath_(path);
+  return id ? '/blog/' + id : String(path || '');
+}
+
+// The blog's per-article views over the last 28 days, merged
+// under the canonical /blog/<id> path as described above.
+// Returns null when the report failed.
+function fetchBlogPostsData_(propertyId) {
+  const rows = fetchBlogPathRows_(propertyId);
+  if (!rows) {
+    return null;
+  }
+  return mergeBlogPathRows_(rows, (path) => {
+    const id = articleIdFromPath_(path);
+    return id ? '/blog/' + id : '';
+  });
+}
+
+// The same fetch with no article filter: every page path under
+// its canonical key, for the screen's top-pages ranking (which
+// mixes articles with the app pages). Returns null when the
+// report failed.
+function fetchBlogPagesData_(propertyId) {
+  const rows = fetchBlogPathRows_(propertyId);
+  if (!rows) {
+    return null;
+  }
+  return mergeBlogPathRows_(rows, canonicalBlogPath_);
+}
+
+// The window's blog totals as GA4 reports them with no
+// dimension. The range-wide user count deduplicates across
+// days, so it cannot be summed out of blog_daily — it rides
+// its own tab. Returns null when the report failed; a window
+// GA4 answers with no rows at all reads as all-null fields.
+function fetchBlogTotalsData_(propertyId) {
+  const rows = fetchBlogReportRows_(propertyId, {
+    startDate: BLOG_POSTS_WINDOW_DAYS + 'daysAgo',
+    endDate: 'today',
+    metrics: ['screenPageViews', 'activeUsers', 'sessions'],
+    dimensions: [],
+    limit: 1,
+    offset: 0,
+    filters: [],
+  });
+  if (!rows) {
+    return null;
+  }
+  const row = rows[0] || null;
+  return {
+    views: row ? blogReportMetric_(row, 0) : null,
+    users: row ? blogReportMetric_(row, 1) : null,
+    sessions: row ? blogReportMetric_(row, 2) : null,
+  };
+}
+
+// The window's views split by traffic channel
+// (sessionDefaultChannelGroup), for the screen's sources
+// ranking. Returns null when the report failed.
+function fetchBlogSourcesData_(propertyId) {
+  const rows = fetchBlogReportRows_(propertyId, {
+    startDate: BLOG_POSTS_WINDOW_DAYS + 'daysAgo',
+    endDate: 'today',
+    metrics: ['screenPageViews'],
+    dimensions: ['sessionDefaultChannelGroup'],
+    limit: BLOG_SOURCES_FETCH_LIMIT,
+    offset: 0,
+    filters: [],
+  });
+  if (!rows) {
+    return null;
+  }
+  return rows
+    .map((row) => {
+      const dimensionValues = (row && row.dimensionValues) || [];
+      return {
+        channel: String(
+          (dimensionValues[0] && dimensionValues[0].value) || ''
+        ),
+        views_28d: blogReportMetric_(row, 0) || 0,
+      };
+    })
+    .filter((entry) => entry.channel)
+    .sort((a, b) => b.views_28d - a.views_28d);
+}
+
 // One "blog_posts" row per entry of fetchBlogPostsData_.
 function buildBlogPostsRows_(entries, collectedAt) {
   return (entries || []).map((entry) => {
@@ -3546,7 +3732,44 @@ function buildBlogPostsRows_(entries, collectedAt) {
   });
 }
 
-// Writes the blog's two history tabs into the SNS history
+// One "blog_pages" row per entry of fetchBlogPagesData_ — the
+// same row shape as blog_posts over the wider net.
+function buildBlogPagesRows_(entries, collectedAt) {
+  return buildBlogPostsRows_(entries, collectedAt);
+}
+
+// The single "blog_totals" row. A null totals object (the
+// report failed) never reaches this builder — the caller skips
+// the tab — while null fields become empty cells, which the
+// upsert merge reads as "keep the stored value".
+function buildBlogTotalsRows_(totals, collectedAt) {
+  if (!totals) {
+    return [];
+  }
+  return [
+    [
+      BLOG_TOTALS_WINDOW_KEY,
+      snsHistoryNumCell_(totals.views),
+      snsHistoryNumCell_(totals.users),
+      snsHistoryNumCell_(totals.sessions),
+      snsHistoryTextCell_(collectedAt),
+    ],
+  ];
+}
+
+// One "blog_sources" row per entry of fetchBlogSourcesData_.
+function buildBlogSourcesRows_(entries, collectedAt) {
+  return (entries || []).map((entry) => {
+    const item = entry || {};
+    return [
+      snsHistoryTextCell_(item.channel),
+      snsHistoryNumCell_(item.views_28d),
+      snsHistoryTextCell_(collectedAt),
+    ];
+  });
+}
+
+// Writes the blog's history tabs into the SNS history
 // spreadsheet. No-op unless SNS_HISTORY_SHEET_ID and
 // GA4_PROPERTY_ID are both set (SpreadsheetApp is not touched and
 // GA4 is not queried then). Never throws, in the same way as
@@ -3587,6 +3810,42 @@ function appendBlogHistory_() {
       );
     } else {
       console.log('Blog history: posts report failed, blog_posts skipped');
+    }
+    const pages = fetchBlogPagesData_(propertyId);
+    if (pages) {
+      upsertSnsHistorySheet_(
+        spreadsheet,
+        'blog_pages',
+        SNS_HISTORY_BLOG_PAGES_COLUMNS,
+        0,
+        buildBlogPagesRows_(pages, collectedAt)
+      );
+    } else {
+      console.log('Blog history: pages report failed, blog_pages skipped');
+    }
+    const totals = fetchBlogTotalsData_(propertyId);
+    if (totals) {
+      upsertSnsHistorySheet_(
+        spreadsheet,
+        'blog_totals',
+        SNS_HISTORY_BLOG_TOTALS_COLUMNS,
+        0,
+        buildBlogTotalsRows_(totals, collectedAt)
+      );
+    } else {
+      console.log('Blog history: totals report failed, blog_totals skipped');
+    }
+    const sources = fetchBlogSourcesData_(propertyId);
+    if (sources) {
+      upsertSnsHistorySheet_(
+        spreadsheet,
+        'blog_sources',
+        SNS_HISTORY_BLOG_SOURCES_COLUMNS,
+        0,
+        buildBlogSourcesRows_(sources, collectedAt)
+      );
+    } else {
+      console.log('Blog history: sources report failed, blog_sources skipped');
     }
   } catch (err) {
     console.log(
@@ -3684,6 +3943,638 @@ function buildSnsHistoryResponse_() {
     ok: true,
     action: 'sns_history',
     rows: rows.slice(-SNS_HISTORY_MAX_ROWS),
+  };
+}
+
+// --- Sheet-backed read side (stage 2) ---
+// The /social screen's reads are assembled from the history
+// spreadsheet, so rendering the screen never calls the Meta /
+// GA4 / YouTube APIs: the hourly collection is the only API
+// client, and the builders below only read sheets. Reads are
+// cached in CacheService for a few minutes (the numbers are at
+// most one collection — an hour — old anyway; that trade is
+// the design). A sheet that cannot be read degrades to the
+// stored snapshot (SNS detail) or to an explicit "not
+// collected yet" error (blog reports), never to a live API
+// call made for the screen.
+
+const SNS_DETAIL_CACHE_KEY = 'sns_detail_sheet_v1';
+const SNS_DETAIL_CACHE_SECONDS = 300;
+const BLOG_REPORT_CACHE_KEY_PREFIX = 'blog_report_sheet_v1_';
+const BLOG_REPORT_CACHE_SECONDS = 300;
+
+// The script cache, or null when CacheService is unavailable
+// (unit tests, a bare editor run) — caching is always optional
+// on the read side.
+function sheetReadCache_() {
+  try {
+    return typeof CacheService !== 'undefined'
+      ? CacheService.getScriptCache()
+      : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// Opens the history spreadsheet, or null when the property is
+// unset. Throws only when the open itself fails; callers treat
+// that as "sheet unavailable".
+function openHistorySpreadsheet_() {
+  const sheetId = getScriptProperty_(SNS_HISTORY_SHEET_ID_PROPERTY);
+  if (!sheetId) {
+    return null;
+  }
+  return SpreadsheetApp.openById(sheetId);
+}
+
+// Reads one history tab as row objects keyed by column name.
+// Returns null when the tab does not exist, [] when it exists
+// but holds no data rows. Cell values keep the types Sheets
+// hands back (numbers as numbers, timestamps as Dates or ISO
+// strings, untouched cells as '').
+function readHistoryTabObjects_(spreadsheet, name, columns) {
+  const sheet = spreadsheet.getSheetByName(name);
+  if (!sheet) {
+    return null;
+  }
+  return readSnsHistoryRows_(sheet, columns).map((cells) => {
+    const row = {};
+    columns.forEach((column, index) => {
+      row[column] = cells[index];
+    });
+    return row;
+  });
+}
+
+// A text cell as a string, or null when it holds nothing.
+function historyTextOrNull_(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  return String(value);
+}
+
+// A timestamp cell (a Date, or an ISO string Sheets left alone)
+// as an ISO string, or null.
+function historyTimestampOrNull_(value) {
+  return snsHistoryTimestampCell_(value);
+}
+
+// Newest-first ordering for the stored timestamps
+// (posted_at / published_at): parsed instants when both sides
+// parse, the ISO strings themselves otherwise.
+function compareTimestampDesc_(a, b) {
+  const ta = Date.parse(a || '');
+  const tb = Date.parse(b || '');
+  if (Number.isFinite(ta) && Number.isFinite(tb)) {
+    return tb - ta;
+  }
+  const x = String(a || '');
+  const y = String(b || '');
+  return x < y ? 1 : x > y ? -1 : 0;
+}
+
+// The account row with the newest collected_at, as
+// { row, collected_at }, or null when no row carries a
+// timestamp. The account tab is the one appended time series,
+// so its newest row is the "current" state the SNS detail is
+// built around.
+function latestAccountRow_(rows) {
+  let latest = null;
+  (rows || []).forEach((row) => {
+    const at = historyTimestampOrNull_(row.collected_at);
+    if (at && (!latest || at > latest.collected_at)) {
+      latest = { row, collected_at: at };
+    }
+  });
+  return latest;
+}
+
+// Only the rows stamped with the newest collected_at of the
+// set. The blog window tabs (blog_pages / blog_sources) are
+// snapshots of a moving 28-day window: a row the newest
+// collection did not refresh belongs to an older window, and
+// its frozen views_28d must not leak into the ranking.
+function latestBatchRows_(rows) {
+  const list = rows || [];
+  let max = null;
+  list.forEach((row) => {
+    const at = historyTimestampOrNull_(row.collected_at);
+    if (at && (!max || at > max)) {
+      max = at;
+    }
+  });
+  if (!max) {
+    return list.slice();
+  }
+  return list.filter(
+    (row) => historyTimestampOrNull_(row.collected_at) === max
+  );
+}
+
+// The sns_detail payload assembled from the history sheet, in
+// exactly the snapshot's shape (buildEmptySnsDetail_ is the
+// skeleton). Returns null when the sheet is unconfigured or
+// holds no usable account row — the caller falls back to the
+// stored snapshot then. What the sheet deliberately does not
+// hold stays null: the per-collection error notes
+// (insights_error, detail_error, media_error, ...) are the
+// diagnostics of one fetch, not history, so a sheet-built
+// detail never carries them; and daily_follows lists only the
+// days that carry a value (days null on both sides were never
+// written), so daily_follows_missing_days stays null too.
+function buildSnsDetailFromSheet_() {
+  const spreadsheet = openHistorySpreadsheet_();
+  if (!spreadsheet) {
+    return null;
+  }
+  const accountRows = readHistoryTabObjects_(
+    spreadsheet,
+    'account',
+    SNS_HISTORY_ACCOUNT_COLUMNS
+  );
+  if (!accountRows || !accountRows.length) {
+    return null;
+  }
+  const latest = latestAccountRow_(accountRows);
+  if (!latest) {
+    return null;
+  }
+  const account = latest.row;
+  const num = snsHistoryNumberCell_;
+  const detail = buildEmptySnsDetail_();
+  detail.collected_at = latest.collected_at;
+
+  detail.youtube.subscribers = num(account.youtube_subscribers);
+  detail.youtube.total_views = num(account.yt_total_views);
+  detail.youtube.video_count = num(account.yt_video_count);
+  const videoRows = readHistoryTabObjects_(
+    spreadsheet,
+    'youtube_media',
+    SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS
+  );
+  if (videoRows) {
+    detail.youtube.recent_videos = videoRows
+      .map((row) => {
+        const id = historyTextOrNull_(row.video_id);
+        return {
+          id,
+          title: historyTextOrNull_(row.title),
+          published_at: historyTimestampOrNull_(row.published_at),
+          views: num(row.views),
+          likes: num(row.likes),
+          comments: num(row.comments),
+          // The sheet does not store the watch URL (stage 1's
+          // call: it is derivable), so it is rebuilt from the
+          // video id here.
+          url: id ? 'https://www.youtube.com/watch?v=' + id : null,
+        };
+      })
+      .filter((video) => video.id)
+      .sort((a, b) => compareTimestampDesc_(a.published_at, b.published_at))
+      .slice(0, SNS_RECENT_VIDEO_LIMIT);
+  }
+
+  const ig = detail.instagram;
+  ig.freddiefujiwara = num(account.ig_followers);
+  ig.anemone_cancer = num(account.ig_anemone_followers);
+  ig.media_count = num(account.media_count);
+  ig.views_30d = num(account.views_30d);
+  ig.non_follower_pct = num(account.non_follower_pct);
+  ig.reach_30d = num(account.reach_30d);
+  ig.accounts_engaged_30d = num(account.accounts_engaged_30d);
+  ig.interactions_30d = {
+    total: num(account.interactions_total),
+    likes: num(account.interactions_likes),
+    comments: num(account.interactions_comments),
+    shares: num(account.interactions_shares),
+    saves: num(account.interactions_saves),
+  };
+  ig.profile_links_taps_30d = num(account.profile_links_taps_30d);
+  ig.profile_links_taps_source = historyTextOrNull_(
+    account.profile_links_taps_source
+  );
+  ig.follows_30d = num(account.follows_30d);
+  ig.unfollows_30d = num(account.unfollows_30d);
+
+  const dailyRows = readHistoryTabObjects_(
+    spreadsheet,
+    'daily',
+    SNS_HISTORY_DAILY_COLUMNS
+  );
+  if (dailyRows) {
+    ig.daily_follows = dailyRows
+      .map((row) => ({
+        date: snsHistoryKeyCell_(row.date),
+        follows: num(row.follows),
+        unfollows: num(row.unfollows),
+      }))
+      .filter((entry) => entry.date)
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  }
+
+  const demoRows = readHistoryTabObjects_(
+    spreadsheet,
+    'ig_demographics',
+    SNS_HISTORY_DEMOGRAPHICS_COLUMNS
+  );
+  if (demoRows) {
+    const groups = { age_gender: [], city: [], country: [] };
+    demoRows.forEach((row) => {
+      const breakdown = historyTextOrNull_(row.breakdown);
+      const key = historyTextOrNull_(row.key);
+      const value = num(row.value);
+      if (!breakdown || !key || value === null || !groups[breakdown]) {
+        return;
+      }
+      groups[breakdown].push({ key, value });
+    });
+    const byValueDesc = (a, b) => b.value - a.value;
+    ig.demographics = {
+      age_gender: groups.age_gender.sort(byValueDesc),
+      top_cities: groups.city
+        .sort(byValueDesc)
+        .slice(0, SNS_DEMOGRAPHICS_TOP_LIMIT),
+      top_countries: groups.country
+        .sort(byValueDesc)
+        .slice(0, SNS_DEMOGRAPHICS_TOP_LIMIT),
+    };
+  }
+
+  const mediaRows = readHistoryTabObjects_(
+    spreadsheet,
+    'media',
+    SNS_HISTORY_MEDIA_COLUMNS
+  );
+  if (mediaRows) {
+    ig.recent_media = mediaRows
+      .map((row) => ({
+        id: historyTextOrNull_(row.media_id),
+        type: historyTextOrNull_(row.type),
+        posted_at: historyTimestampOrNull_(row.posted_at),
+        caption: historyTextOrNull_(row.caption),
+        permalink: historyTextOrNull_(row.permalink),
+        views: num(row.views),
+        reach: num(row.reach),
+        likes: num(row.likes),
+        comments: num(row.comments),
+        shares: num(row.shares),
+        saves: num(row.saves),
+        avg_watch_sec: num(row.avg_watch_sec),
+        total_watch_sec: num(row.total_watch_sec),
+      }))
+      .filter((entry) => entry.id)
+      .sort((a, b) => compareTimestampDesc_(a.posted_at, b.posted_at))
+      .slice(0, SNS_RECENT_MEDIA_LIMIT);
+  }
+
+  const th = detail.threads;
+  th.followers = num(account.threads_followers);
+  const thAccountRows = readHistoryTabObjects_(
+    spreadsheet,
+    'threads_account',
+    SNS_HISTORY_THREADS_ACCOUNT_COLUMNS
+  );
+  if (thAccountRows) {
+    const byMetric = {};
+    thAccountRows.forEach((row) => {
+      const metric = historyTextOrNull_(row.metric);
+      const value = num(row.value);
+      if (metric && value !== null) {
+        byMetric[metric] = value;
+      }
+    });
+    const metricOrNull = (name) =>
+      Object.prototype.hasOwnProperty.call(byMetric, name)
+        ? byMetric[name]
+        : null;
+    th.views_30d = metricOrNull('views_30d');
+    th.interactions_30d = {
+      total: metricOrNull('interactions_total'),
+      likes: metricOrNull('interactions_likes'),
+      replies: metricOrNull('interactions_replies'),
+      reposts: metricOrNull('interactions_reposts'),
+      quotes: metricOrNull('interactions_quotes'),
+    };
+  }
+  const postRows = readHistoryTabObjects_(
+    spreadsheet,
+    'threads_media',
+    SNS_HISTORY_THREADS_MEDIA_COLUMNS
+  );
+  if (postRows) {
+    th.recent_posts = postRows
+      .map((row) => ({
+        id: historyTextOrNull_(row.post_id),
+        type: historyTextOrNull_(row.type),
+        posted_at: historyTimestampOrNull_(row.posted_at),
+        text: historyTextOrNull_(row.text),
+        permalink: historyTextOrNull_(row.permalink),
+        views: num(row.views),
+        likes: num(row.likes),
+        replies: num(row.replies),
+        reposts: num(row.reposts),
+        quotes: num(row.quotes),
+      }))
+      .filter((entry) => entry.id)
+      .sort((a, b) => compareTimestampDesc_(a.posted_at, b.posted_at))
+      .slice(0, SNS_THREADS_RECENT_POSTS_LIMIT);
+  }
+  return detail;
+}
+
+// The fixed report shapes the /social screen asks for, mapped
+// to the sheet construction that answers them. Anything else
+// (other dimensions, dimension filters, other metric sets) is
+// not served: the endpoint no longer runs live GA4 reports
+// for the screen, and an unanswerable shape must say so
+// instead of inventing numbers.
+function blogReportShape_(params) {
+  if (!params || (params.filters && params.filters.length)) {
+    return null;
+  }
+  const dims = params.dimensions || [];
+  const metrics = params.metrics || [];
+  if (dims.length === 0) {
+    return metrics.join(',') === 'screenPageViews,activeUsers,sessions'
+      ? 'totals'
+      : null;
+  }
+  if (dims.length !== 1 || metrics[0] !== 'screenPageViews') {
+    return null;
+  }
+  if (dims[0] === 'date') {
+    return metrics.length === 1 ? 'daily' : null;
+  }
+  if (dims[0] === 'pagePath') {
+    return 'pages';
+  }
+  if (dims[0] === 'sessionDefaultChannelGroup') {
+    return 'sources';
+  }
+  return null;
+}
+
+// A GA4-shaped report row: the screen's shaping helpers read
+// only data.rows' dimensionValues[0] and metricValues[i], so
+// the synthesized data carries exactly those.
+function blogReportRow_(dimensionValue, metricValues) {
+  return {
+    dimensionValues:
+      dimensionValue === null || dimensionValue === undefined
+        ? []
+        : [{ value: String(dimensionValue) }],
+    metricValues: (metricValues || []).map((value) => ({
+      value: String(value === null || value === undefined ? 0 : value),
+    })),
+  };
+}
+
+// Metric values for a row whose first metric is a view count.
+// The per-page users/sessions of the old live pages report
+// were never collected into the sheet, and the screen reads
+// only metricValues[0] on those reports, so the remaining
+// slots ride as 0.
+function blogViewsMetricValues_(views, metricCount) {
+  const values = [views === null || views === undefined ? 0 : views];
+  while (values.length < Math.max(1, metricCount || 1)) {
+    values.push(0);
+  }
+  return values;
+}
+
+function blogTotalsData_(spreadsheet) {
+  const rows = readHistoryTabObjects_(
+    spreadsheet,
+    'blog_totals',
+    SNS_HISTORY_BLOG_TOTALS_COLUMNS
+  );
+  if (!rows) {
+    return null;
+  }
+  const row = rows.filter(
+    (entry) => historyTextOrNull_(entry.window) === BLOG_TOTALS_WINDOW_KEY
+  )[0];
+  if (!row) {
+    return null;
+  }
+  return {
+    rows: [
+      blogReportRow_(null, [
+        snsHistoryNumberCell_(row.views),
+        snsHistoryNumberCell_(row.users),
+        snsHistoryNumberCell_(row.sessions),
+      ]),
+    ],
+    rowCount: 1,
+  };
+}
+
+// A report date parameter ('today', '28daysAgo',
+// 'YYYY-MM-DD') resolved to the JST calendar key the sheet
+// keys days by, or null for anything else.
+function resolveBlogDateKey_(value, nowMs) {
+  const raw = String(value || '');
+  if (raw === 'today') {
+    return jstDateKey_(nowMs);
+  }
+  const daysAgo = /^(\d+)daysAgo$/.exec(raw);
+  if (daysAgo) {
+    return jstDateKey_(nowMs - Number(daysAgo[1]) * SNS_DAY_MS);
+  }
+  return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : null;
+}
+
+function blogDailyData_(spreadsheet, startKey, endKey) {
+  const rows = readHistoryTabObjects_(
+    spreadsheet,
+    'blog_daily',
+    SNS_HISTORY_BLOG_DAILY_COLUMNS
+  );
+  if (!rows) {
+    return null;
+  }
+  const viewsByDate = {};
+  rows.forEach((row) => {
+    const date = snsHistoryKeyCell_(row.date);
+    if (date && date >= startKey && date <= endKey) {
+      viewsByDate[date] = snsHistoryNumberCell_(row.views);
+    }
+  });
+  const dates = Object.keys(viewsByDate).sort();
+  return {
+    rows: dates.map((date) =>
+      blogReportRow_(date.replace(/-/g, ''), [viewsByDate[date]])
+    ),
+    rowCount: dates.length,
+  };
+}
+
+function blogPagesData_(spreadsheet, params) {
+  const rows = readHistoryTabObjects_(
+    spreadsheet,
+    'blog_pages',
+    SNS_HISTORY_BLOG_PAGES_COLUMNS
+  );
+  if (!rows) {
+    return null;
+  }
+  const entries = latestBatchRows_(rows)
+    .map((row) => ({
+      path: historyTextOrNull_(row.path),
+      views: snsHistoryNumberCell_(row.views_28d),
+    }))
+    .filter((entry) => entry.path)
+    .sort((a, b) => (b.views || 0) - (a.views || 0));
+  return {
+    rows: entries.map((entry) =>
+      blogReportRow_(
+        entry.path,
+        blogViewsMetricValues_(entry.views, params.metrics.length)
+      )
+    ),
+    rowCount: entries.length,
+  };
+}
+
+function blogSourcesData_(spreadsheet, params) {
+  const rows = readHistoryTabObjects_(
+    spreadsheet,
+    'blog_sources',
+    SNS_HISTORY_BLOG_SOURCES_COLUMNS
+  );
+  if (!rows) {
+    return null;
+  }
+  const entries = latestBatchRows_(rows)
+    .map((row) => ({
+      channel: historyTextOrNull_(row.channel),
+      views: snsHistoryNumberCell_(row.views_28d),
+    }))
+    .filter((entry) => entry.channel)
+    .sort((a, b) => (b.views || 0) - (a.views || 0));
+  return {
+    rows: entries.map((entry) =>
+      blogReportRow_(
+        entry.channel,
+        blogViewsMetricValues_(entry.views, params.metrics.length)
+      )
+    ),
+    rowCount: entries.length,
+  };
+}
+
+// The report response for the screen's fixed blog reports,
+// assembled from the history sheet. The envelope matches the
+// old live bridge's exactly (including _share, which share
+// link validation rides on), but data.rows are synthesized in
+// the GA4 shape from the sheet tabs — the Data API is not
+// called. Unsupported parameter combinations, and a sheet
+// that holds no data yet, answer ok:false instead of falling
+// back to a live call. The full (unsliced) payload is cached
+// per shape for a few minutes; the limit/offset slicing
+// happens per request, after the cache.
+function buildBlogReportResponse_(params, shareSession) {
+  const shape = blogReportShape_(params);
+  if (!shape) {
+    return {
+      ok: false,
+      error:
+        "unsupported report parameters: the /social screen's reports are served from the history sheet in fixed shapes only",
+    };
+  }
+  let startKey = null;
+  let endKey = null;
+  if (shape === 'daily') {
+    const nowMs = Date.now();
+    startKey = resolveBlogDateKey_(params.startDate, nowMs);
+    endKey = resolveBlogDateKey_(params.endDate, nowMs);
+    if (!startKey || !endKey) {
+      return {
+        ok: false,
+        error:
+          'unsupported report date range: ' +
+          params.startDate +
+          '..' +
+          params.endDate,
+      };
+    }
+  }
+  const cache = sheetReadCache_();
+  const cacheKey =
+    BLOG_REPORT_CACHE_KEY_PREFIX +
+    shape +
+    '_' +
+    params.metrics.length +
+    (shape === 'daily' ? '_' + startKey + '_' + endKey : '');
+  let data = null;
+  if (cache) {
+    const hit = cache.get(cacheKey);
+    if (hit) {
+      try {
+        data = JSON.parse(hit);
+      } catch (err) {
+        data = null;
+      }
+    }
+  }
+  if (!data) {
+    try {
+      const spreadsheet = openHistorySpreadsheet_();
+      if (spreadsheet) {
+        if (shape === 'totals') {
+          data = blogTotalsData_(spreadsheet);
+        } else if (shape === 'daily') {
+          data = blogDailyData_(spreadsheet, startKey, endKey);
+        } else if (shape === 'pages') {
+          data = blogPagesData_(spreadsheet, params);
+        } else if (shape === 'sources') {
+          data = blogSourcesData_(spreadsheet, params);
+        }
+      }
+    } catch (err) {
+      console.log(
+        'Blog report from sheet failed: ' +
+          summarizeSnsHistoryError_(
+            err,
+            getScriptProperty_(SNS_HISTORY_SHEET_ID_PROPERTY)
+          )
+      );
+      data = null;
+    }
+    if (data && cache) {
+      try {
+        cache.put(
+          cacheKey,
+          JSON.stringify(data),
+          BLOG_REPORT_CACHE_SECONDS
+        );
+      } catch (err) {
+        // Oversized payloads simply go uncached.
+      }
+    }
+  }
+  if (!data) {
+    return {
+      ok: false,
+      error: 'blog data has not been collected into the history sheet yet',
+    };
+  }
+  const offset = params.offset || 0;
+  const limited = Object.assign({}, data, {
+    rows: data.rows.slice(offset, offset + params.limit),
+  });
+  return {
+    ok: true,
+    property: getScriptProperty_('GA4_PROPERTY_ID'),
+    startDate: params.startDate,
+    endDate: params.endDate,
+    metrics: params.metrics,
+    dimensions: params.dimensions,
+    filters: params.filters,
+    offset: params.offset,
+    _share: shareSession ? { expires_at: shareSession.expires_at } : undefined,
+    data: limited,
   };
 }
 
@@ -4040,24 +4931,13 @@ function doGet(e) {
     if (parameter.action === 'sns_history') {
       return jsonOut_(buildSnsHistoryResponse_());
     }
+    // The screen's blog reports are served from the history
+    // sheet (stage 2): the GA4 Data API is no longer called to
+    // render the screen. buildReportRequest_ / fetchReport_
+    // remain as the collection side's bridge (the blog history
+    // writes, music_count, top_articles).
     const params = parseRunParams_(parameter);
-    const body = buildReportRequest_(params);
-    const result = fetchReport_(propertyId, body);
-    if (result.status !== 200) {
-      return jsonOut_({ ok: false, status: result.status, error: result.data });
-    }
-    return jsonOut_({
-      ok: true,
-      property: propertyId,
-      startDate: params.startDate,
-      endDate: params.endDate,
-      metrics: params.metrics,
-      dimensions: params.dimensions,
-      filters: params.filters,
-      offset: params.offset,
-      _share: shareSession ? { expires_at: shareSession.expires_at } : undefined,
-      data: result.data,
-    });
+    return jsonOut_(buildBlogReportResponse_(params, shareSession));
   } catch (err) {
     return jsonOut_({ ok: false, error: String(err) });
   }
@@ -4163,6 +5043,22 @@ if (typeof exports !== 'undefined') {
   exports.buildBlogDailyRows_ = buildBlogDailyRows_;
   exports.fetchBlogPostsData_ = fetchBlogPostsData_;
   exports.buildBlogPostsRows_ = buildBlogPostsRows_;
+  exports.fetchBlogPathRows_ = fetchBlogPathRows_;
+  exports.mergeBlogPathRows_ = mergeBlogPathRows_;
+  exports.canonicalBlogPath_ = canonicalBlogPath_;
+  exports.fetchBlogPagesData_ = fetchBlogPagesData_;
+  exports.buildBlogPagesRows_ = buildBlogPagesRows_;
+  exports.fetchBlogTotalsData_ = fetchBlogTotalsData_;
+  exports.buildBlogTotalsRows_ = buildBlogTotalsRows_;
+  exports.fetchBlogSourcesData_ = fetchBlogSourcesData_;
+  exports.buildBlogSourcesRows_ = buildBlogSourcesRows_;
+  exports.openHistorySpreadsheet_ = openHistorySpreadsheet_;
+  exports.readHistoryTabObjects_ = readHistoryTabObjects_;
+  exports.latestAccountRow_ = latestAccountRow_;
+  exports.latestBatchRows_ = latestBatchRows_;
+  exports.buildSnsDetailFromSheet_ = buildSnsDetailFromSheet_;
+  exports.blogReportShape_ = blogReportShape_;
+  exports.buildBlogReportResponse_ = buildBlogReportResponse_;
   exports.ga4DateKey_ = ga4DateKey_;
   exports.mergeSnsHistoryRows_ = mergeSnsHistoryRows_;
   exports.snsHistoryKeyCell_ = snsHistoryKeyCell_;
@@ -4179,4 +5075,7 @@ if (typeof exports !== 'undefined') {
   exports.SNS_HISTORY_THREADS_ACCOUNT_COLUMNS = SNS_HISTORY_THREADS_ACCOUNT_COLUMNS;
   exports.SNS_HISTORY_BLOG_DAILY_COLUMNS = SNS_HISTORY_BLOG_DAILY_COLUMNS;
   exports.SNS_HISTORY_BLOG_POSTS_COLUMNS = SNS_HISTORY_BLOG_POSTS_COLUMNS;
+  exports.SNS_HISTORY_BLOG_PAGES_COLUMNS = SNS_HISTORY_BLOG_PAGES_COLUMNS;
+  exports.SNS_HISTORY_BLOG_TOTALS_COLUMNS = SNS_HISTORY_BLOG_TOTALS_COLUMNS;
+  exports.SNS_HISTORY_BLOG_SOURCES_COLUMNS = SNS_HISTORY_BLOG_SOURCES_COLUMNS;
 }
