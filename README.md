@@ -34,7 +34,7 @@ Muse の API 接続の仕組みは OAuth の入口が単一ドメインのサー
 
 YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得し、保存済みスナップショットだけを認証なしで返す。
 
-- 取得：`collectSnsCounts` を時間主導型トリガー（6時間ごと）で実行。トリガーはデプロイでは入らないため、エディタで `setupSnsTriggers` を1回実行して設置する
+- 取得：`collectSnsCounts` を時間主導型トリガー（1時間ごと）で実行。トリガーはデプロイでは入らないため、エディタで `setupSnsTriggers` を1回実行して設置する
 - 保存先：スクリプトプロパティ `SNS_COUNTS_SNAPSHOT`（各SNSの数値＋取得日時 collected_at）
 - 読み取り：`?action=sns_counts`。返すのはスナップショットのみで、トークンや GA4 データは含まない
 - YouTube：高度なサービス（YouTube Data API v3）で登録者数を取得。GCP プロジェクト側で YouTube Data API v3 の有効化が必要
@@ -79,7 +79,7 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - upsert の方式：収集のたびにタブ全体を読み、キーでマージして（新しい取得値が勝つ。ただし新しい値が null の項目は空欄として扱い、既存値を残す＝null で潰さない）、ヘッダー＋1キー1行で書き戻し、余った行は削除する。この方式により、追記方式だった頃に貯まった `media` の重複行（30投稿×収集回数分）も、次回収集で自動的に1投稿1行へ整理される
 - どのシートも無ければ自動作成し、1行目が空（シートが空）のときだけヘッダー行を書く。既存のヘッダー行は upsert でも書き換えない
 - 書き込みに失敗しても取得自体は成功として扱い、実行ログに `SNS history append failed: <要約>` が1行出る（要約に秘密値・URL は含めない）
-- 読み取りは `?action=sns_history`（認証必須、sns_detail と同じゲート）で、/ga の推移グラフ用。`account` シートの行を collected_at 昇順で最大直近400行返し、項目は collected_at、ig_followers、threads_followers、youtube_subscribers、total_followers、media_count、views_30d、non_follower_pct、reach_30d、interactions_total、follows_30d、unfollows_30d、yt_total_views の13項目に絞る（空欄は null）。プロパティ未設定・シートが無い／空の場合はエラーにせず `rows: []` を返す
+- 読み取りは `?action=sns_history`（認証必須、sns_detail と同じゲート）で、/ga の推移グラフ用。`account` シートの行を collected_at 昇順で最大直近2400行返し（1時間ごとの収集で約100日分）、項目は collected_at、ig_followers、threads_followers、youtube_subscribers、total_followers、media_count、views_30d、non_follower_pct、reach_30d、interactions_total、follows_30d、unfollows_30d、yt_total_views の13項目に絞る（空欄は null）。プロパティ未設定・シートが無い／空の場合はエラーにせず `rows: []` を返す
 
 ## 診断関数 `debugSnsInsights`（手動実行専用）
 

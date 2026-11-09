@@ -1766,16 +1766,16 @@ describe('SNS follower counts', () => {
       expect(json.rows.map((row) => row.ig_followers)).toEqual([1988, 2000]);
     });
 
-    it('caps the response at the newest 400 rows', () => {
+    it('caps the response at the newest 2400 rows', () => {
       const rows = [HEADER];
-      for (let i = 0; i < 405; i += 1) {
-        const at = new Date(Date.UTC(2026, 0, 1) + i * 6 * 3600 * 1000);
+      for (let i = 0; i < 2405; i += 1) {
+        const at = new Date(Date.UTC(2026, 0, 1) + i * 3600 * 1000);
         rows.push(dataRow({ collected_at: at.toISOString(), ig_followers: i }));
       }
       const json = serveHistory(makeReadableSheet(rows));
-      expect(json.rows).toHaveLength(400);
+      expect(json.rows).toHaveLength(2400);
       expect(json.rows[0].ig_followers).toBe(5);
-      expect(json.rows[399].ig_followers).toBe(404);
+      expect(json.rows[2399].ig_followers).toBe(2404);
     });
 
     it('rejects anonymous calls while authentication is configured', () => {
@@ -3377,14 +3377,14 @@ describe('SNS follower counts', () => {
   });
 
   describe('setupSnsTriggers', () => {
-    it('replaces existing collectSnsCounts triggers with one 6-hour trigger', () => {
+    it('replaces existing collectSnsCounts triggers with one hourly trigger', () => {
       const mine = { getHandlerFunction: () => 'collectSnsCounts' };
       const other = { getHandlerFunction: () => 'somethingElse' };
       triggers = [mine, other];
       Code.setupSnsTriggers();
       expect(global.ScriptApp.deleteTrigger).toHaveBeenCalledTimes(1);
       expect(global.ScriptApp.deleteTrigger).toHaveBeenCalledWith(mine);
-      expect(createdTriggers).toEqual([{ handler: 'collectSnsCounts', hours: 6 }]);
+      expect(createdTriggers).toEqual([{ handler: 'collectSnsCounts', hours: 1 }]);
     });
   });
 });

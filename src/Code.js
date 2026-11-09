@@ -3599,8 +3599,10 @@ function appendBlogHistory_() {
 // The authenticated counterpart of the append above: the /ga
 // trend charts read the "account" sheet back through this action.
 // Only the columns the charts need are served, and the response is
-// capped at the newest 400 rows (about 100 days at four collections
-// a day). An unset property or a missing/empty sheet is not an
+// capped at the newest 2400 rows (about 100 days at hourly
+// collections — the cap counts rows, so it grew with the move from
+// 6-hourly to hourly collection to keep the same window). An
+// unset property or a missing/empty sheet is not an
 // error: the history simply has not started yet, so rows is [].
 
 const SNS_HISTORY_RESPONSE_COLUMNS = [
@@ -3618,7 +3620,7 @@ const SNS_HISTORY_RESPONSE_COLUMNS = [
   'unfollows_30d',
   'yt_total_views',
 ];
-const SNS_HISTORY_MAX_ROWS = 400;
+const SNS_HISTORY_MAX_ROWS = 2400;
 
 // Sheets hands date cells back as Date objects and numbers as
 // numbers, while untouched cells come back as ''. Normalize to the
@@ -3782,14 +3784,14 @@ function collectSnsCounts() {
   return snapshot;
 }
 
-// Editor helper: (re)install the 6-hour time-driven trigger for
+// Editor helper: (re)install the hourly time-driven trigger for
 // collectSnsCounts. Run once from the editor after deployment; triggers
 // are not part of the deployed code.
 function setupSnsTriggers() {
   ScriptApp.getProjectTriggers()
     .filter((trigger) => trigger.getHandlerFunction() === 'collectSnsCounts')
     .forEach((trigger) => ScriptApp.deleteTrigger(trigger));
-  ScriptApp.newTrigger('collectSnsCounts').timeBased().everyHours(6).create();
+  ScriptApp.newTrigger('collectSnsCounts').timeBased().everyHours(1).create();
 }
 
 const DEFAULT_START = '28daysAgo';
