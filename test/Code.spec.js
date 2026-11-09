@@ -418,7 +418,7 @@ describe('Code.js', () => {
 
     it('issueShareToken logs a #share= frontend URL', () => {
       const url = Code.issueShareToken();
-      expect(url).toMatch(/^https:\/\/freddiefujiwara\.com\/ga\/#share=[0-9a-f]{64}$/);
+      expect(url).toMatch(/^https:\/\/freddiefujiwara\.com\/social\/#share=[0-9a-f]{64}$/);
     });
 
     it('hashShareToken_ produces a SHA-256 hex digest', () => {
