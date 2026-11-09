@@ -444,11 +444,13 @@ function buildSnsCountsResponse_() {
         insights_error: null,
       },
       threads: { followers: null },
+      x: { followers: null },
     };
   }
   const youtube = snapshot.youtube || {};
   const instagram = snapshot.instagram || {};
   const threads = snapshot.threads || {};
+  const x = snapshot.x || {};
   return {
     ok: true,
     action: 'sns_counts',
@@ -464,6 +466,7 @@ function buildSnsCountsResponse_() {
         instagram.insights_error != null ? instagram.insights_error : null,
     },
     threads: { followers: snsNumberOrNull_(threads.followers) },
+    x: { followers: snsNumberOrNull_(x.followers) },
   };
 }
 
@@ -524,6 +527,13 @@ function buildEmptySnsDetail_() {
         quotes: null,
       },
       detail_error: null,
+      recent_posts: null,
+      posts_error: null,
+    },
+    x: {
+      followers: null,
+      username: null,
+      x_error: null,
       recent_posts: null,
       posts_error: null,
     },
@@ -987,6 +997,123 @@ function fetchYouTubeSubscribers_() {
   // Kept as the narrow accessor; the channel fetch itself lives in
   // fetchYouTubeChannelDetail_() with the rest of the SNS detail.
   return fetchYouTubeChannelDetail_().subscribers;
+}
+
+// --- X detail (via tweet-gas, GAS-to-GAS sync) ---------------------
+// X's API keys live only in tweet-gas (the project that posts to
+// X); this project never holds them. The hourly collection POSTs
+// { action: 'sns_snapshot', sync_token } to tweet-gas's web app
+// and receives the follower count plus the newest posts with
+// their public metrics. That is the same machine sync-token
+// pattern alarm-gas and time-table-gas use: the caller holds
+// TWEET_GAS_EXEC_URL (the other app's /exec URL) and
+// TWEET_GAS_SYNC_TOKEN, the same value as tweet-gas's SYNC_TOKEN
+// property. While either property is unset the section reads as
+// all nulls with no error — X simply is not connected yet. A
+// failed call reports the same summary on x_error and
+// posts_error (the two halves travel in one call here, unlike
+// the per-edge fetches of the other networks), without touching
+// the rest of the collection.
+
+const SNS_X_RECENT_POSTS_LIMIT = 50;
+
+// A wire value from the tweet-gas response as a number, or null
+// when it did not arrive as one.
+function xWireNumberOrNull_(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+// One snapshot entry for an X post, normalized from the wire
+// entry tweet-gas sends. The text is capped under the same limit
+// as Instagram captions and Threads texts; the post URL is not
+// on the wire (it is derivable), so it is rebuilt from the post
+// id here — the same call the read side makes for YouTube videos.
+function buildXPostEntry_(post) {
+  const item = post || {};
+  const id = item.id != null ? String(item.id) : null;
+  const text = item.text != null ? String(item.text) : '';
+  return {
+    id,
+    posted_at: item.posted_at || null,
+    text: text.slice(0, SNS_CAPTION_MAX_LENGTH),
+    url: id ? 'https://x.com/i/web/status/' + id : null,
+    views: xWireNumberOrNull_(item.views),
+    likes: xWireNumberOrNull_(item.likes),
+    reposts: xWireNumberOrNull_(item.reposts),
+    replies: xWireNumberOrNull_(item.replies),
+  };
+}
+
+// The whole X section from one POST to tweet-gas. Never throws:
+// every failure mode (unconfigured, HTTP error, malformed or
+// not-ok body) lands in the error fields with the values null.
+function fetchXDetail_() {
+  const result = {
+    followers: null,
+    username: null,
+    recent_posts: null,
+    x_error: null,
+    posts_error: null,
+  };
+  const url = getScriptProperty_('TWEET_GAS_EXEC_URL');
+  const token = getScriptProperty_('TWEET_GAS_SYNC_TOKEN');
+  if (!url || !token) {
+    return result;
+  }
+  const fail = (message) => {
+    result.x_error = message;
+    result.posts_error = message;
+    return result;
+  };
+  let res;
+  try {
+    res = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'text/plain',
+      payload: JSON.stringify({ action: 'sns_snapshot', sync_token: token }),
+      muteHttpExceptions: true,
+    });
+  } catch (err) {
+    return fail(
+      'tweet-gas fetch exception (' + ((err && err.name) || 'Error') + ')'
+    );
+  }
+  if (res.getResponseCode() !== 200) {
+    return fail('tweet-gas HTTP ' + res.getResponseCode());
+  }
+  let data = null;
+  try {
+    data = JSON.parse(res.getContentText());
+  } catch (err) {
+    data = null;
+  }
+  if (!data || data.ok !== true) {
+    const reason =
+      data && data.error
+        ? String(data.error).slice(0, 200)
+        : 'response was not ok JSON';
+    return fail('tweet-gas: ' + reason);
+  }
+  const x = data.x || {};
+  result.followers = xWireNumberOrNull_(x.followers);
+  result.username = x.username != null ? String(x.username) : null;
+  result.x_error =
+    typeof data.x_error === 'string' && data.x_error ? data.x_error : null;
+  result.posts_error =
+    typeof data.posts_error === 'string' && data.posts_error
+      ? data.posts_error
+      : null;
+  if (Array.isArray(x.recent_posts)) {
+    result.recent_posts = x.recent_posts
+      .map(buildXPostEntry_)
+      .filter((entry) => entry.id)
+      .slice(0, SNS_X_RECENT_POSTS_LIMIT);
+  }
+  return result;
 }
 
 function isTokenRefreshDue_(expiresAtIso) {
@@ -2838,6 +2965,12 @@ const SNS_HISTORY_ACCOUNT_COLUMNS = [
   'unfollows_30d',
   'yt_total_views',
   'yt_video_count',
+  // Appended last on purpose: the production "account" tab was
+  // created with the columns above, and rows are read positionally
+  // against this list, so a new column may only ever join at the
+  // end. (buildSnsHistoryResponse_ additionally falls back to this
+  // canonical position for a column the stored header predates.)
+  'x_followers',
 ];
 const SNS_HISTORY_MEDIA_COLUMNS = [
   'collected_at',
@@ -2885,6 +3018,19 @@ const SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS = [
   'views',
   'likes',
   'comments',
+];
+// "x_media" mirrors the other post tabs (collected_at first, the
+// post id as the upsert key). The post URL is not stored — it is
+// derived from the id on the read side, like youtube_media.
+const SNS_HISTORY_X_MEDIA_COLUMNS = [
+  'collected_at',
+  'post_id',
+  'posted_at',
+  'text',
+  'views',
+  'likes',
+  'reposts',
+  'replies',
 ];
 // "ig_demographics" is keyed by its first column, the breakdown
 // and segment joined ("age_gender|25-34/F", "city|Kawaguchi",
@@ -2962,20 +3108,23 @@ function snsHistoryTextCell_(value) {
   return value === null || value === undefined ? '' : String(value);
 }
 
-// One "account" row from a snapshot. total_followers follows the
-// top-page definition — main Instagram + Threads + YouTube — summing
-// only the values that are numbers, and stays empty when all three
-// are null. Null values become empty cells throughout.
+// One "account" row from a snapshot. total_followers is the
+// combined follower total the screens chart — main Instagram +
+// Threads + YouTube + X — summing only the values that are
+// numbers, and stays empty when all four are null. Null values
+// become empty cells throughout.
 function buildSnsHistoryAccountRow_(snapshot) {
   const snap = snapshot || {};
   const youtube = snap.youtube || {};
   const instagram = snap.instagram || {};
   const threads = snap.threads || {};
+  const x = snap.x || {};
   const interactions = instagram.interactions_30d || {};
   const totalParts = [
     snsNumberOrNull_(instagram.freddiefujiwara),
     snsNumberOrNull_(threads.followers),
     snsNumberOrNull_(youtube.subscribers),
+    snsNumberOrNull_(x.followers),
   ].filter((value) => value !== null);
   return [
     snsHistoryTextCell_(snap.collected_at),
@@ -3002,6 +3151,7 @@ function buildSnsHistoryAccountRow_(snapshot) {
     snsHistoryNumCell_(instagram.unfollows_30d),
     snsHistoryNumCell_(youtube.total_views),
     snsHistoryNumCell_(youtube.video_count),
+    snsHistoryNumCell_(x.followers),
   ];
 }
 
@@ -3111,6 +3261,28 @@ function buildSnsHistoryYouTubeMediaRows_(snapshot) {
       snsHistoryNumCell_(item.views),
       snsHistoryNumCell_(item.likes),
       snsHistoryNumCell_(item.comments),
+    ];
+  });
+}
+
+// One "x_media" row per entry of x.recent_posts (an empty list
+// while X is unconfigured or its fetch failed and the snapshot
+// carries null).
+function buildSnsHistoryXMediaRows_(snapshot) {
+  const snap = snapshot || {};
+  const x = snap.x || {};
+  const posts = Array.isArray(x.recent_posts) ? x.recent_posts : [];
+  return posts.map((entry) => {
+    const item = entry || {};
+    return [
+      snsHistoryTextCell_(snap.collected_at),
+      snsHistoryTextCell_(item.id),
+      snsHistoryTextCell_(item.posted_at),
+      snsHistoryTextCell_(item.text),
+      snsHistoryNumCell_(item.views),
+      snsHistoryNumCell_(item.likes),
+      snsHistoryNumCell_(item.reposts),
+      snsHistoryNumCell_(item.replies),
     ];
   });
 }
@@ -3350,6 +3522,13 @@ function appendSnsHistory_(snapshot) {
       SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS,
       1,
       buildSnsHistoryYouTubeMediaRows_(snapshot)
+    );
+    upsertSnsHistorySheet_(
+      spreadsheet,
+      'x_media',
+      SNS_HISTORY_X_MEDIA_COLUMNS,
+      1,
+      buildSnsHistoryXMediaRows_(snapshot)
     );
     upsertSnsHistorySheet_(
       spreadsheet,
@@ -3878,6 +4057,7 @@ const SNS_HISTORY_RESPONSE_COLUMNS = [
   'follows_30d',
   'unfollows_30d',
   'yt_total_views',
+  'x_followers',
 ];
 const SNS_HISTORY_MAX_ROWS = 2400;
 
@@ -3917,7 +4097,13 @@ function buildSnsHistoryResponse_() {
   const header = values[0].map((cell) => String(cell));
   const columnIndex = {};
   SNS_HISTORY_RESPONSE_COLUMNS.forEach((column) => {
-    columnIndex[column] = header.indexOf(column);
+    const index = header.indexOf(column);
+    // A column added after the sheet was created (x_followers)
+    // is missing from the stored header until someone extends
+    // it; its cells still sit at the canonical position of
+    // SNS_HISTORY_ACCOUNT_COLUMNS, so fall back to that.
+    columnIndex[column] =
+      index >= 0 ? index : SNS_HISTORY_ACCOUNT_COLUMNS.indexOf(column);
   });
   const rows = values
     .slice(1)
@@ -4280,6 +4466,37 @@ function buildSnsDetailFromSheet_() {
       .sort((a, b) => compareTimestampDesc_(a.posted_at, b.posted_at))
       .slice(0, SNS_THREADS_RECENT_POSTS_LIMIT);
   }
+
+  // X: the follower count rides the account row; the posts ride
+  // x_media. The username is not stored in the sheet (it never
+  // changes and no screen needs it), so a sheet-built detail
+  // leaves it null — the stored-snapshot fallback carries it.
+  const x = detail.x;
+  x.followers = num(account.x_followers);
+  const xRows = readHistoryTabObjects_(
+    spreadsheet,
+    'x_media',
+    SNS_HISTORY_X_MEDIA_COLUMNS
+  );
+  if (xRows) {
+    x.recent_posts = xRows
+      .map((row) => {
+        const id = historyTextOrNull_(row.post_id);
+        return {
+          id,
+          posted_at: historyTimestampOrNull_(row.posted_at),
+          text: historyTextOrNull_(row.text),
+          url: id ? 'https://x.com/i/web/status/' + id : null,
+          views: num(row.views),
+          likes: num(row.likes),
+          reposts: num(row.reposts),
+          replies: num(row.replies),
+        };
+      })
+      .filter((entry) => entry.id)
+      .sort((a, b) => compareTimestampDesc_(a.posted_at, b.posted_at))
+      .slice(0, SNS_X_RECENT_POSTS_LIMIT);
+  }
   return detail;
 }
 
@@ -4592,6 +4809,7 @@ function collectSnsCounts() {
   const yt = fetchYouTubeChannelDetail_();
   const thDetail = fetchThreadsAccountDetail_();
   const thPosts = fetchThreadsRecentPosts_();
+  const xDetail = fetchXDetail_();
   const snapshot = {
     collected_at: new Date().toISOString(),
     youtube: {
@@ -4632,6 +4850,13 @@ function collectSnsCounts() {
       recent_posts: thPosts.recent_posts,
       posts_error: thPosts.posts_error,
     },
+    x: {
+      followers: xDetail.followers,
+      username: xDetail.username,
+      x_error: xDetail.x_error,
+      recent_posts: xDetail.recent_posts,
+      posts_error: xDetail.posts_error,
+    },
   };
   if (snapshot.threads.threads_error) {
     console.log('Threads refresh error: ' + snapshot.threads.threads_error);
@@ -4664,6 +4889,12 @@ function collectSnsCounts() {
   }
   if (snapshot.youtube.youtube_error) {
     console.log('YouTube detail error: ' + snapshot.youtube.youtube_error);
+  }
+  if (snapshot.x.x_error) {
+    console.log('X detail error: ' + snapshot.x.x_error);
+  }
+  if (snapshot.x.posts_error && snapshot.x.posts_error !== snapshot.x.x_error) {
+    console.log('X posts error: ' + snapshot.x.posts_error);
   }
   PropertiesService.getScriptProperties().setProperty(
     SNS_SNAPSHOT_PROPERTY,
@@ -5019,6 +5250,9 @@ if (typeof exports !== 'undefined') {
   exports.fetchYouTubeChannelDetail_ = fetchYouTubeChannelDetail_;
   exports.fetchYouTubeRecentVideos_ = fetchYouTubeRecentVideos_;
   exports.summarizeYouTubeError_ = summarizeYouTubeError_;
+  exports.fetchXDetail_ = fetchXDetail_;
+  exports.buildXPostEntry_ = buildXPostEntry_;
+  exports.xWireNumberOrNull_ = xWireNumberOrNull_;
   exports.isTokenRefreshDue_ = isTokenRefreshDue_;
   exports.refreshMetaTokenIfNeeded_ = refreshMetaTokenIfNeeded_;
   exports.refreshThreadsTokenIfNeeded_ = refreshThreadsTokenIfNeeded_;
@@ -5035,6 +5269,7 @@ if (typeof exports !== 'undefined') {
   exports.buildSnsHistoryDailyRows_ = buildSnsHistoryDailyRows_;
   exports.buildSnsHistoryThreadsMediaRows_ = buildSnsHistoryThreadsMediaRows_;
   exports.buildSnsHistoryYouTubeMediaRows_ = buildSnsHistoryYouTubeMediaRows_;
+  exports.buildSnsHistoryXMediaRows_ = buildSnsHistoryXMediaRows_;
   exports.buildSnsHistoryDemographicsRows_ = buildSnsHistoryDemographicsRows_;
   exports.buildSnsHistoryThreadsAccountRows_ = buildSnsHistoryThreadsAccountRows_;
   exports.appendBlogHistory_ = appendBlogHistory_;
@@ -5071,6 +5306,7 @@ if (typeof exports !== 'undefined') {
   exports.SNS_HISTORY_DAILY_COLUMNS = SNS_HISTORY_DAILY_COLUMNS;
   exports.SNS_HISTORY_THREADS_MEDIA_COLUMNS = SNS_HISTORY_THREADS_MEDIA_COLUMNS;
   exports.SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS = SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS;
+  exports.SNS_HISTORY_X_MEDIA_COLUMNS = SNS_HISTORY_X_MEDIA_COLUMNS;
   exports.SNS_HISTORY_DEMOGRAPHICS_COLUMNS = SNS_HISTORY_DEMOGRAPHICS_COLUMNS;
   exports.SNS_HISTORY_THREADS_ACCOUNT_COLUMNS = SNS_HISTORY_THREADS_ACCOUNT_COLUMNS;
   exports.SNS_HISTORY_BLOG_DAILY_COLUMNS = SNS_HISTORY_BLOG_DAILY_COLUMNS;
