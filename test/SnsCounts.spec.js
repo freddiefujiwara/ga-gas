@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as Code from '../src/Code.js';
 
 const MAIN_IG_ID = '17841401041540002';
@@ -174,39 +174,88 @@ describe('SNS follower counts', () => {
     ],
   });
 
-  // The expected daily form for follows_and_unfollows: period=day
-  // values whose value is an object keyed by the follow_type
-  // labels, one row per day bucket, end_time at 08:00 UTC (a
-  // Pacific midnight). The parser dates each bucket by its
-  // midpoint in Asia/Tokyo, which for this offset lands on the
-  // same calendar date as the end_time's UTC date. A label key
-  // missing from a day's object means that side was not reported
-  // (null, not 0).
-  const dailyFollowsBody = () => ({
-    data: [
-      {
-        name: 'follows_and_unfollows',
-        period: 'day',
-        values: [
-          {
-            value: { FOLLOWER: 12, NON_FOLLOWER: 1 },
-            end_time: '2026-11-07T08:00:00+0000',
-          },
-          {
-            value: { FOLLOWER: 20, NON_FOLLOWER: 3 },
-            end_time: '2026-11-08T08:00:00+0000',
-          },
-          { value: { FOLLOWER: 7 }, end_time: '2026-11-09T08:00:00+0000' },
-        ],
-      },
-    ],
-  });
+  // Per-day follows responses. Production debugging on
+  // 2026-11-09 settled the only form that can yield a day
+  // series: follows_and_unfollows rejects the plain period=day
+  // form and answers metric_type=total_value only as a
+  // whole-window split, so the collector asks once per JST
+  // calendar day with that day's since/until window and reads
+  // the same follow_type breakdown shape as the totals. The
+  // values below are keyed by JST date; unlisted days report
+  // 0/0, and a null side means the day's response does not
+  // report that side (it stays null, never 0).
+  const DAILY_FOLLOWS_BY_DATE = {
+    '2026-11-07': { follows: 12, unfollows: 1 },
+    '2026-11-08': { follows: 20, unfollows: 3 },
+    '2026-11-09': { follows: 7, unfollows: null },
+  };
 
-  const DAILY_FOLLOWS_SERIES = [
-    { date: '2026-11-07', follows: 12, unfollows: 1 },
-    { date: '2026-11-08', follows: 20, unfollows: 3 },
-    { date: '2026-11-09', follows: 7, unfollows: null },
-  ];
+  const followsDayBody = (entry) => {
+    const results = [];
+    if (entry.follows !== null && entry.follows !== undefined) {
+      results.push({ dimension_values: ['FOLLOWER'], value: entry.follows });
+    }
+    if (entry.unfollows !== null && entry.unfollows !== undefined) {
+      results.push({
+        dimension_values: ['NON_FOLLOWER'],
+        value: entry.unfollows,
+      });
+    }
+    return {
+      data: [
+        {
+          name: 'follows_and_unfollows',
+          period: 'day',
+          total_value: {
+            breakdowns: [{ dimension_keys: ['follow_type'], results }],
+          },
+        },
+      ],
+    };
+  };
+
+  // Tells a one-day insights window from the 30-day totals
+  // window by the span between a request's since and until.
+  const isDayWindowUrl = (url) => {
+    const since = Number((String(url).match(/[?&]since=(\d+)/) || [])[1]);
+    const until = Number((String(url).match(/[?&]until=(\d+)/) || [])[1]);
+    return until - since < 2 * 24 * 60 * 60;
+  };
+
+  // The JST date a one-day request is for: its since is the
+  // day's 00:00 JST, so shifting by the JST offset and reading
+  // the UTC date gives the key.
+  const jstDateOfUrl = (url) => {
+    const since = Number((String(url).match(/[?&]since=(\d+)/) || [])[1]);
+    return new Date((since + 9 * 60 * 60) * 1000).toISOString().slice(0, 10);
+  };
+
+  const dailyFollowsBodyForUrl = (url) =>
+    followsDayBody(
+      DAILY_FOLLOWS_BY_DATE[jstDateOfUrl(url)] || { follows: 0, unfollows: 0 }
+    );
+
+  // The series the per-day mock yields with the clock frozen at
+  // 2026-11-09 12:00 JST: the 30 JST days 2026-10-11 ..
+  // 2026-11-09, ascending.
+  const DAILY_FOLLOWS_SERIES = (() => {
+    const series = [];
+    for (let day = 11; day <= 31; day++) {
+      series.push({ date: '2026-10-' + day, follows: 0, unfollows: 0 });
+    }
+    for (let day = 1; day <= 9; day++) {
+      const date = '2026-11-0' + day;
+      const entry = DAILY_FOLLOWS_BY_DATE[date] || { follows: 0, unfollows: 0 };
+      series.push({ date, follows: entry.follows, unfollows: entry.unfollows });
+    }
+    return series;
+  })();
+
+  // Pins Date.now() so the per-day follows series (keyed by the
+  // JST calendar days ending today) has a stable "today":
+  // 2026-11-09 12:00 JST.
+  const freezeNowAtNov9 = () =>
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-09T03:00:00.000Z'));
 
   const demographicsBody = (dims, results) => ({
     data: [
@@ -362,15 +411,10 @@ describe('SNS follower counts', () => {
         }
         throw new Error('unexpected demographics url: ' + url);
       }
-      if (
-        url.includes('/insights') &&
-        url.includes('metric=follows_and_unfollows') &&
-        !url.includes('metric_type=total_value')
-      ) {
-        return res(200, dailyFollowsBody());
-      }
       if (url.includes('/insights') && url.includes('metric=follows_and_unfollows')) {
-        return res(200, followsBreakdownBody());
+        return isDayWindowUrl(url)
+          ? res(200, dailyFollowsBodyForUrl(url))
+          : res(200, followsBreakdownBody());
       }
       if (url.includes('/insights') && url.includes('breakdown=follow_type')) {
         return res(200, insightsBreakdownBody(370, 9630, 10000));
@@ -503,6 +547,14 @@ describe('SNS follower counts', () => {
   });
 
   describe('collectSnsCounts', () => {
+    let nowSpy;
+    beforeEach(() => {
+      nowSpy = freezeNowAtNov9();
+    });
+    afterEach(() => {
+      nowSpy.mockRestore();
+    });
+
     it('collects all services and stores the snapshot', () => {
       store.META_ACCESS_TOKEN = 'meta-token';
       mockGraphSuccess();
@@ -541,6 +593,7 @@ describe('SNS follower counts', () => {
         follows_30d: 498,
         unfollows_30d: 58,
         daily_follows: DAILY_FOLLOWS_SERIES,
+        daily_follows_missing_days: 0,
         daily_follows_error: null,
         demographics: {
           age_gender: [
@@ -618,6 +671,7 @@ describe('SNS follower counts', () => {
         follows_30d: null,
         unfollows_30d: null,
         daily_follows: null,
+        daily_follows_missing_days: null,
         daily_follows_error: null,
         demographics: { age_gender: null, top_cities: null, top_countries: null },
         detail_error: null,
@@ -1551,6 +1605,14 @@ describe('SNS follower counts', () => {
   });
 
   describe('Instagram account detail', () => {
+    let nowSpy;
+    beforeEach(() => {
+      nowSpy = freezeNowAtNov9();
+    });
+    afterEach(() => {
+      nowSpy.mockRestore();
+    });
+
     const detailHandler = (overrides) => {
       const totals = Object.assign(
         {
@@ -1566,13 +1628,10 @@ describe('SNS follower counts', () => {
         (overrides && overrides.totals) || {}
       );
       fetchHandler = (url) => {
-        if (
-          url.includes('metric=follows_and_unfollows') &&
-          !url.includes('metric_type=total_value')
-        ) {
+        if (url.includes('metric=follows_and_unfollows') && isDayWindowUrl(url)) {
           return overrides && overrides.daily
-            ? overrides.daily()
-            : res(200, dailyFollowsBody());
+            ? overrides.daily(url)
+            : res(200, dailyFollowsBodyForUrl(url));
         }
         if (url.includes('metric=follows_and_unfollows')) {
           return overrides && overrides.follows
@@ -1606,6 +1665,7 @@ describe('SNS follower counts', () => {
         follows_30d: 498,
         unfollows_30d: 58,
         daily_follows: DAILY_FOLLOWS_SERIES,
+        daily_follows_missing_days: 0,
         daily_follows_error: null,
         detail_error: null,
       });
@@ -1736,9 +1796,11 @@ describe('SNS follower counts', () => {
       const detail = Code.fetchInstagramAccountDetail_();
       expect(detail.reach_30d).toBe(5000);
       expect(detail.daily_follows).toBeNull();
+      expect(detail.daily_follows_missing_days).toBe(30);
       expect(detail.daily_follows_error).toContain(
-        'follows_and_unfollows daily: HTTP 400'
+        'follows_and_unfollows daily: all 30 days failed'
       );
+      expect(detail.daily_follows_error).toContain('HTTP 400');
       expect(detail.daily_follows_error).not.toContain('meta-token');
       // The daily failure stays off detail_error, which reports
       // the totals failure on its own.
@@ -1746,17 +1808,48 @@ describe('SNS follower counts', () => {
       expect(detail.detail_error).not.toContain('daily');
     });
 
-    it('reports no per-day values when both forms answer without daily values', () => {
+    it('keeps the series and counts the missing day when only one day fails', () => {
       store.META_ACCESS_TOKEN = 'meta-token';
       detailHandler({
-        daily: () => res(200, followsBreakdownBody()),
+        daily: (url) =>
+          jstDateOfUrl(url) === '2026-11-08'
+            ? res(500, { error: { message: 'boom', code: 1 } })
+            : res(200, dailyFollowsBodyForUrl(url)),
+      });
+      const detail = Code.fetchInstagramAccountDetail_();
+      expect(detail.daily_follows).toHaveLength(30);
+      expect(detail.daily_follows[0]).toEqual({
+        date: '2026-10-11',
+        follows: 0,
+        unfollows: 0,
+      });
+      expect(detail.daily_follows[28]).toEqual({
+        date: '2026-11-08',
+        follows: null,
+        unfollows: null,
+      });
+      expect(detail.daily_follows[29]).toEqual({
+        date: '2026-11-09',
+        follows: 7,
+        unfollows: null,
+      });
+      expect(detail.daily_follows_missing_days).toBe(1);
+      expect(detail.daily_follows_error).toBeNull();
+      expect(detail.detail_error).toBeNull();
+    });
+
+    it('reports the missing breakdown when every day answers without one', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      detailHandler({
+        daily: () => res(200, totalValueBody('follows_and_unfollows', 5)),
       });
       const detail = Code.fetchInstagramAccountDetail_();
       expect(detail.follows_30d).toBe(498);
       expect(detail.daily_follows).toBeNull();
-      expect(detail.daily_follows_error).toContain(
-        'follows_and_unfollows daily: response had no per-day values'
-      );
+      expect(detail.daily_follows_missing_days).toBe(30);
+      expect(detail.daily_follows_error).toContain('all 30 days failed');
+      expect(detail.daily_follows_error).toContain('no follow_type breakdown');
+      expect(detail.daily_follows_error).not.toContain('meta-token');
       expect(detail.detail_error).toBeNull();
     });
 
@@ -1881,141 +1974,166 @@ describe('SNS follower counts', () => {
   });
 
   describe('Instagram daily follows', () => {
-    it('parseInstagramDailyFollows_ reads label-keyed daily values in ascending date order', () => {
-      // A label key missing from a day's object leaves that side
-      // null (not reported), never 0.
-      expect(Code.parseInstagramDailyFollows_(dailyFollowsBody())).toEqual({
-        series: DAILY_FOLLOWS_SERIES,
-        labels: ['FOLLOWER', 'NON_FOLLOWER'],
-      });
-      expect(Code.parseInstagramDailyFollows_(null)).toEqual({
-        series: null,
-        labels: [],
-      });
-      expect(Code.parseInstagramDailyFollows_({ data: [] })).toEqual({
-        series: null,
-        labels: [],
-      });
+    let nowSpy;
+    beforeEach(() => {
+      nowSpy = freezeNowAtNov9();
+    });
+    afterEach(() => {
+      nowSpy.mockRestore();
     });
 
-    it('parseInstagramDailyFollows_ reads breakdown results that carry their own end_time', () => {
-      const body = {
-        data: [
-          {
-            name: 'follows_and_unfollows',
-            period: 'day',
-            total_value: {
-              breakdowns: [
-                {
-                  dimension_keys: ['follow_type'],
-                  results: [
-                    {
-                      dimension_values: ['FOLLOWER'],
-                      value: 5,
-                      end_time: '2026-11-08T08:00:00+0000',
-                    },
-                    {
-                      dimension_values: ['NON_FOLLOWER'],
-                      value: 2,
-                      end_time: '2026-11-08T08:00:00+0000',
-                    },
-                    {
-                      dimension_values: ['FOLLOWER'],
-                      value: 9,
-                      end_time: '2026-11-09T08:00:00+0000',
-                    },
-                  ],
-                },
-              ],
-            },
-          },
-        ],
-      };
-      expect(Code.parseInstagramDailyFollows_(body)).toEqual({
-        series: [
-          { date: '2026-11-08', follows: 5, unfollows: 2 },
-          { date: '2026-11-09', follows: 9, unfollows: null },
-        ],
-        labels: ['FOLLOWER', 'NON_FOLLOWER'],
-      });
-    });
-
-    it('parseInstagramDailyFollows_ keeps unknown labels observable without guessing', () => {
-      const parsed = Code.parseInstagramDailyFollows_({
-        data: [
-          {
-            values: [
-              {
-                value: { GAINED: 3, LOST: 1 },
-                end_time: '2026-11-09T08:00:00+0000',
-              },
-            ],
-          },
-        ],
-      });
-      expect(parsed.series).toBeNull();
-      expect(parsed.labels).toEqual(['GAINED', 'LOST']);
-    });
-
-    it('insightsDailyDateKey_ dates a bucket by its midpoint in Asia/Tokyo', () => {
-      // Pacific-midnight bucket (end_time 08:00 UTC) for Nov 9.
-      expect(Code.insightsDailyDateKey_('2026-11-09T08:00:00+0000')).toBe(
-        '2026-11-09'
-      );
-      // JST-midnight bucket (end_time 15:00 UTC) for Nov 9.
-      expect(Code.insightsDailyDateKey_('2026-11-09T15:00:00+0000')).toBe(
-        '2026-11-09'
-      );
-      // UTC-midnight bucket (end_time Nov 10 00:00 UTC) for Nov 9.
-      expect(Code.insightsDailyDateKey_('2026-11-10T00:00:00+0000')).toBe(
-        '2026-11-09'
-      );
-      expect(Code.insightsDailyDateKey_('not a date')).toBeNull();
-      expect(Code.insightsDailyDateKey_(null)).toBeNull();
-      expect(Code.insightsDailyDateKey_(undefined)).toBeNull();
-    });
-
-    it('falls back to the total_value form when the plain daily request fails', () => {
-      store.META_ACCESS_TOKEN = 'meta-token';
-      const totals = {
-        reach: 5000,
-        accounts_engaged: 1200,
-        total_interactions: 3000,
-        likes: 2000,
-        comments: 300,
-        shares: 400,
-        saves: 300,
-        profile_links_taps: 46,
-      };
+    // Routes only the follows insights URLs: one-day windows get
+    // the per-day mock (or the given override), the 30-day totals
+    // window gets the totals breakdown.
+    const dailyHandler = (dayOverride) => {
       fetchHandler = (url) => {
         if (url.includes('metric=follows_and_unfollows')) {
-          if (url.includes('metric_type=total_value')) {
-            // One body carrying both forms: the totals breakdown
-            // and the per-day values; each reader takes its own.
-            const body = followsBreakdownBody();
-            body.data[0].values = dailyFollowsBody().data[0].values;
-            return res(200, body);
+          if (isDayWindowUrl(url)) {
+            return dayOverride
+              ? dayOverride(url)
+              : res(200, dailyFollowsBodyForUrl(url));
           }
-          return res(400, {
-            error: { message: 'plain daily unsupported', code: 100 },
-          });
-        }
-        if (url.includes('/insights')) {
-          const metric = metricFromUrl(url);
-          if (metric in totals) {
-            return res(200, totalValueBody(metric, totals[metric]));
-          }
-          throw new Error('unexpected insights metric: ' + metric);
+          return res(200, followsBreakdownBody());
         }
         throw new Error('unexpected url: ' + url);
       };
-      const detail = Code.fetchInstagramAccountDetail_();
-      expect(detail.follows_30d).toBe(498);
-      expect(detail.unfollows_30d).toBe(58);
-      expect(detail.daily_follows).toEqual(DAILY_FOLLOWS_SERIES);
-      expect(detail.daily_follows_error).toBeNull();
+    };
+
+    it('jstDateKey_ reads the Asia/Tokyo calendar date of an instant', () => {
+      // 2026-11-09 12:00 JST.
+      expect(Code.jstDateKey_(Date.parse('2026-11-09T03:00:00.000Z'))).toBe(
+        '2026-11-09'
+      );
+      // 2026-11-09 23:59:59 JST is still the 9th; one second
+      // later the JST date rolls over.
+      expect(Code.jstDateKey_(Date.parse('2026-11-09T14:59:59.000Z'))).toBe(
+        '2026-11-09'
+      );
+      expect(Code.jstDateKey_(Date.parse('2026-11-09T15:00:00.000Z'))).toBe(
+        '2026-11-10'
+      );
     });
 
+    it('jstDayWindowSec_ spans exactly one JST calendar day', () => {
+      const startSec = Date.parse('2026-11-09T00:00:00+09:00') / 1000;
+      expect(Code.jstDayWindowSec_('2026-11-09')).toEqual({
+        since: startSec,
+        until: startSec + 24 * 60 * 60 - 1,
+      });
+      expect(Code.jstDayWindowSec_('not-a-date')).toBeNull();
+    });
+
+    it('dailyFollowsDateKeys_ lists the 30 JST days ending today, ascending', () => {
+      const keys = Code.dailyFollowsDateKeys_(
+        Date.parse('2026-11-09T03:00:00.000Z')
+      );
+      expect(keys).toHaveLength(30);
+      expect(keys[0]).toBe('2026-10-11');
+      expect(keys[29]).toBe('2026-11-09');
+      expect(keys).toEqual(keys.slice().sort());
+    });
+
+    it('fetchInstagramDailyFollowsDay_ reads one day and asks for its JST window', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      const urls = [];
+      fetchHandler = (url) => {
+        urls.push(url);
+        return res(200, followsDayBody({ follows: 12, unfollows: 1 }));
+      };
+      const day = Code.fetchInstagramDailyFollowsDay_(
+        '2026-11-08',
+        'meta-token'
+      );
+      expect(day).toEqual({ follows: 12, unfollows: 1, error: null });
+      expect(urls).toHaveLength(1);
+      expect(urls[0]).toContain('metric=follows_and_unfollows');
+      expect(urls[0]).toContain('metric_type=total_value');
+      expect(urls[0]).toContain('breakdown=follow_type');
+      expect(urls[0]).toContain(
+        'since=' + Date.parse('2026-11-08T00:00:00+09:00') / 1000
+      );
+      expect(urls[0]).toContain(
+        'until=' + (Date.parse('2026-11-08T00:00:00+09:00') / 1000 + 86399)
+      );
+    });
+
+    it('fetchInstagramDailyFollowsDay_ keeps an unreported side null and summarises failures', () => {
+      fetchHandler = () =>
+        res(200, followsDayBody({ follows: 7, unfollows: null }));
+      expect(Code.fetchInstagramDailyFollowsDay_('2026-11-09', 'meta-token')).toEqual({
+        follows: 7,
+        unfollows: null,
+        error: null,
+      });
+      fetchHandler = () =>
+        res(400, { error: { message: 'daily unsupported', code: 100 } });
+      const failed = Code.fetchInstagramDailyFollowsDay_(
+        '2026-11-09',
+        'meta-token'
+      );
+      expect(failed.follows).toBeNull();
+      expect(failed.unfollows).toBeNull();
+      expect(failed.error).toContain('HTTP 400 code=100');
+      expect(failed.error).not.toContain('meta-token');
+    });
+
+    it('fetchInstagramDailyFollows_ builds the 30-day series one day at a time', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      let dayRequests = 0;
+      dailyHandler((url) => {
+        dayRequests += 1;
+        return res(200, dailyFollowsBodyForUrl(url));
+      });
+      const fetched = Code.fetchInstagramDailyFollows_();
+      expect(dayRequests).toBe(30);
+      expect(fetched).toEqual({
+        series: DAILY_FOLLOWS_SERIES,
+        missing_days: 0,
+        error: null,
+      });
+    });
+
+    it('fetchInstagramDailyFollows_ counts a failed day as missing without failing the series', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      dailyHandler((url) =>
+        jstDateOfUrl(url) === '2026-11-05'
+          ? res(500, { error: { message: 'boom', code: 1 } })
+          : res(200, dailyFollowsBodyForUrl(url))
+      );
+      const fetched = Code.fetchInstagramDailyFollows_();
+      expect(fetched.error).toBeNull();
+      expect(fetched.missing_days).toBe(1);
+      expect(fetched.series).toHaveLength(30);
+      expect(fetched.series[25]).toEqual({
+        date: '2026-11-05',
+        follows: null,
+        unfollows: null,
+      });
+      expect(fetched.series[29]).toEqual({
+        date: '2026-11-09',
+        follows: 7,
+        unfollows: null,
+      });
+    });
+
+    it('fetchInstagramDailyFollows_ gives up only when every day fails', () => {
+      store.META_ACCESS_TOKEN = 'meta-token';
+      dailyHandler(() =>
+        res(500, { error: { message: 'boom', code: 1 } })
+      );
+      const fetched = Code.fetchInstagramDailyFollows_();
+      expect(fetched.series).toBeNull();
+      expect(fetched.missing_days).toBe(30);
+      expect(fetched.error).toContain('all 30 days failed');
+      expect(fetched.error).toContain('HTTP 500');
+      expect(fetched.error).not.toContain('meta-token');
+    });
+
+    it('fetchInstagramDailyFollows_ stays silent without a token', () => {
+      const fetched = Code.fetchInstagramDailyFollows_();
+      expect(fetched).toEqual({ series: null, missing_days: 0, error: null });
+      expect(global.UrlFetchApp.fetch).not.toHaveBeenCalled();
+    });
   });
 
   describe('Instagram demographics', () => {
