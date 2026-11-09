@@ -407,8 +407,10 @@ function issueShareToken() {
 //     such an app yields a token whose me/accounts is empty, and no
 //     Page token can be stored. Leave it unset for a plain Facebook
 //     Login app, which uses the scope form.
-//   SNS_HISTORY_SHEET_ID (optional): spreadsheet that receives one
-//     history row per collection (see appendSnsHistory_). Unset means
+//   SNS_HISTORY_SHEET_ID (optional): spreadsheet that receives the
+//     history writes of every collection (see appendSnsHistory_):
+//     one appended row per collection on "account", one upserted
+//     row per post / video / day on the other tabs. Unset means
 //     no history is written.
 // The Instagram snapshot also carries account KPIs for the main
 // account: media_count (post count, available with instagram_basic)
@@ -3608,14 +3610,26 @@ function fetchYouTubeRecentVideos_() {
 // --- SNS snapshot history (Google Sheets) ---
 // The snapshot above is overwritten on every collection, so the
 // trend would be lost. When the Script Property SNS_HISTORY_SHEET_ID
-// names a spreadsheet, collectSnsCounts() also appends the snapshot
-// to it: one row per collection on the "account" sheet and one row
-// per recent post on the "media" sheet. Both sheets are created when
-// missing and get their header row when still empty. The sheet ID is
-// only ever read from the Script Property, never written in code.
-// Unset (the default) means no history is written at all, and a
-// failed append never fails the collection itself: it is logged as
-// one secret-free summary line instead.
+// names a spreadsheet, collectSnsCounts() also writes the snapshot
+// to it, in two different shapes:
+//   - "account" is the one time series: one appended row per
+//     collection, the input of the /ga trend charts.
+//   - Every post-shaped tab ("media", "threads_media",
+//     "youtube_media", "facebook_media") and the "daily" tab hold
+//     ONE row per key (media_id / post_id / video_id / date) and
+//     are upserted: the whole tab is read back, the fresh rows are
+//     merged in by key — a fresh value wins, but a null in the
+//     fresh fetch becomes an empty cell and never erases the
+//     stored value — and the tab is rewritten as header + one row
+//     per key. That also folds duplicates written by earlier
+//     append-only collections into a single row per post on the
+//     next run.
+// All sheets are created when missing and get their header row
+// when still empty. The sheet ID is only ever read from the Script
+// Property, never written in code. Unset (the default) means no
+// history is written at all, and a failed write never fails the
+// collection itself: it is logged as one secret-free summary line
+// instead.
 
 const SNS_HISTORY_SHEET_ID_PROPERTY = 'SNS_HISTORY_SHEET_ID';
 const SNS_HISTORY_ACCOUNT_COLUMNS = [
@@ -3660,6 +3674,50 @@ const SNS_HISTORY_MEDIA_COLUMNS = [
   'saves',
   'avg_watch_sec',
   'total_watch_sec',
+];
+// The upserted tabs. "daily" is keyed by its first column (date);
+// the post tabs are keyed by their second column (the id), right
+// after collected_at, mirroring "media".
+const SNS_HISTORY_DAILY_COLUMNS = [
+  'date',
+  'follows',
+  'unfollows',
+  'collected_at',
+];
+const SNS_HISTORY_THREADS_MEDIA_COLUMNS = [
+  'collected_at',
+  'post_id',
+  'posted_at',
+  'type',
+  'text',
+  'permalink',
+  'views',
+  'likes',
+  'replies',
+  'reposts',
+  'quotes',
+];
+const SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS = [
+  'collected_at',
+  'video_id',
+  'published_at',
+  'title',
+  'views',
+  'likes',
+  'comments',
+];
+const SNS_HISTORY_FACEBOOK_MEDIA_COLUMNS = [
+  'collected_at',
+  'post_id',
+  'posted_at',
+  'message',
+  'permalink',
+  'views',
+  'unique_viewers',
+  'engagements',
+  'clicks',
+  'link_clicks',
+  'saves',
 ];
 
 // Numbers are written as numbers; anything else (null, undefined,
@@ -3752,6 +3810,112 @@ function buildSnsHistoryMediaRows_(snapshot) {
   });
 }
 
+// One "daily" row per day of instagram.daily_follows that carries
+// at least one value. Days whose fetch came back null on both
+// sides are skipped entirely: they record nothing, and (through
+// the upsert) never erase a value an earlier collection stored
+// for the same date.
+function buildSnsHistoryDailyRows_(snapshot) {
+  const snap = snapshot || {};
+  const instagram = snap.instagram || {};
+  const series = Array.isArray(instagram.daily_follows)
+    ? instagram.daily_follows
+    : [];
+  return series
+    .filter((entry) => {
+      const item = entry || {};
+      return (
+        item.date !== null &&
+        item.date !== undefined &&
+        item.date !== '' &&
+        (snsNumberOrNull_(item.follows) !== null ||
+          snsNumberOrNull_(item.unfollows) !== null)
+      );
+    })
+    .map((entry) => [
+      snsHistoryTextCell_(entry.date),
+      snsHistoryNumCell_(entry.follows),
+      snsHistoryNumCell_(entry.unfollows),
+      snsHistoryTextCell_(snap.collected_at),
+    ]);
+}
+
+// One "threads_media" row per entry of threads.recent_posts (an
+// empty list while Threads is unconfigured or its fetch failed
+// and the snapshot carries null).
+function buildSnsHistoryThreadsMediaRows_(snapshot) {
+  const snap = snapshot || {};
+  const threads = snap.threads || {};
+  const posts = Array.isArray(threads.recent_posts) ? threads.recent_posts : [];
+  return posts.map((entry) => {
+    const item = entry || {};
+    return [
+      snsHistoryTextCell_(snap.collected_at),
+      snsHistoryTextCell_(item.id),
+      snsHistoryTextCell_(item.posted_at),
+      snsHistoryTextCell_(item.type),
+      snsHistoryTextCell_(item.text),
+      snsHistoryTextCell_(item.permalink),
+      snsHistoryNumCell_(item.views),
+      snsHistoryNumCell_(item.likes),
+      snsHistoryNumCell_(item.replies),
+      snsHistoryNumCell_(item.reposts),
+      snsHistoryNumCell_(item.quotes),
+    ];
+  });
+}
+
+// One "youtube_media" row per entry of youtube.recent_videos. The
+// per-video numbers already ride every collection via the uploads
+// playlist fetch (SNS_RECENT_VIDEO_LIMIT videos), so nothing extra
+// is fetched for the history.
+function buildSnsHistoryYouTubeMediaRows_(snapshot) {
+  const snap = snapshot || {};
+  const youtube = snap.youtube || {};
+  const videos = Array.isArray(youtube.recent_videos)
+    ? youtube.recent_videos
+    : [];
+  return videos.map((entry) => {
+    const item = entry || {};
+    return [
+      snsHistoryTextCell_(snap.collected_at),
+      snsHistoryTextCell_(item.id),
+      snsHistoryTextCell_(item.published_at),
+      snsHistoryTextCell_(item.title),
+      snsHistoryNumCell_(item.views),
+      snsHistoryNumCell_(item.likes),
+      snsHistoryNumCell_(item.comments),
+    ];
+  });
+}
+
+// One "facebook_media" row per entry of facebook.recent_posts (an
+// empty list while Facebook is unauthorized or its fetch failed
+// and the snapshot carries null — the tab is then left as it is).
+function buildSnsHistoryFacebookMediaRows_(snapshot) {
+  const snap = snapshot || {};
+  const facebook = snap.facebook || {};
+  const posts = Array.isArray(facebook.recent_posts)
+    ? facebook.recent_posts
+    : [];
+  return posts.map((entry) => {
+    const item = entry || {};
+    return [
+      snsHistoryTextCell_(snap.collected_at),
+      snsHistoryTextCell_(item.id),
+      snsHistoryTextCell_(item.posted_at),
+      snsHistoryTextCell_(item.message),
+      snsHistoryTextCell_(item.permalink),
+      snsHistoryNumCell_(item.views),
+      snsHistoryNumCell_(item.unique_viewers),
+      snsHistoryNumCell_(item.engagements),
+      snsHistoryNumCell_(item.clicks),
+      snsHistoryNumCell_(item.link_clicks),
+      snsHistoryNumCell_(item.saves),
+    ];
+  });
+}
+
 // Returns the named sheet, creating it when missing, and writes the
 // header row only when the sheet is still empty (an existing header
 // — or any existing data — is left untouched).
@@ -3762,6 +3926,104 @@ function ensureSnsHistorySheet_(spreadsheet, name, columns) {
   }
   if (sheet.getLastRow() === 0) {
     sheet.getRange(1, 1, 1, columns.length).setValues([columns]);
+  }
+  return sheet;
+}
+
+// Normalizes a key cell read back from a sheet into the string the
+// upsert matches on. Sheets coerces a "YYYY-MM-DD" string into a
+// Date, so a stored daily key is formatted back in Asia/Tokyo —
+// the timezone every daily key is written in — by shifting the
+// instant nine hours ahead and reading the UTC fields.
+function snsHistoryKeyCell_(value) {
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      return '';
+    }
+    const jst = new Date(value.getTime() + 9 * 60 * 60 * 1000);
+    const pad = (num) => String(num).padStart(2, '0');
+    return (
+      jst.getUTCFullYear() +
+      '-' +
+      pad(jst.getUTCMonth() + 1) +
+      '-' +
+      pad(jst.getUTCDate())
+    );
+  }
+  if (value === null || value === undefined) {
+    return '';
+  }
+  return String(value).trim();
+}
+
+// Reads the data rows (everything under the header) of a history
+// sheet, padded out to the column count. Row values keep the types
+// Sheets hands back (numbers as numbers, timestamps as Dates).
+function readSnsHistoryRows_(sheet, columns) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    return [];
+  }
+  return sheet
+    .getRange(2, 1, lastRow - 1, columns.length)
+    .getValues()
+    .map((row) => {
+      const cells = (row || []).slice(0, columns.length);
+      while (cells.length < columns.length) {
+        cells.push('');
+      }
+      return cells;
+    });
+}
+
+// Merges fresh rows into the stored ones by key: one output row
+// per key, in first-seen order, where a fresh row's non-empty
+// cells win and its empty cells (the nulls of the fresh fetch)
+// leave the stored values untouched. Rows without a key are
+// dropped on both sides.
+function mergeSnsHistoryRows_(existingRows, newRows, keyIndex) {
+  const merged = [];
+  const indexByKey = {};
+  const absorb = (row) => {
+    const key = snsHistoryKeyCell_(row[keyIndex]);
+    if (!key) {
+      return;
+    }
+    if (!(key in indexByKey)) {
+      indexByKey[key] = merged.length;
+      merged.push(row.slice());
+      return;
+    }
+    const target = merged[indexByKey[key]];
+    row.forEach((cell, index) => {
+      if (cell !== '' && cell !== null && cell !== undefined) {
+        target[index] = cell;
+      }
+    });
+  };
+  (existingRows || []).forEach(absorb);
+  (newRows || []).forEach(absorb);
+  return merged;
+}
+
+// Upserts the fresh rows of one key-keyed history tab: ensures the
+// sheet, merges stored + fresh rows by key, writes the merged data
+// rows under the (untouched) header, and deletes any surplus rows
+// the append-only era left behind, so the tab always holds the
+// header plus exactly one row per key.
+function upsertSnsHistorySheet_(spreadsheet, name, columns, keyIndex, newRows) {
+  const sheet = ensureSnsHistorySheet_(spreadsheet, name, columns);
+  const merged = mergeSnsHistoryRows_(
+    readSnsHistoryRows_(sheet, columns),
+    newRows,
+    keyIndex
+  );
+  if (merged.length) {
+    sheet.getRange(2, 1, merged.length, columns.length).setValues(merged);
+  }
+  const surplus = sheet.getLastRow() - (merged.length + 1);
+  if (surplus > 0) {
+    sheet.deleteRows(merged.length + 2, surplus);
   }
   return sheet;
 }
@@ -3777,10 +4039,12 @@ function summarizeSnsHistoryError_(err, sheetId) {
   return message.slice(0, 200);
 }
 
-// Appends the snapshot to the history spreadsheet. No-op unless
+// Writes the snapshot to the history spreadsheet. No-op unless
 // SNS_HISTORY_SHEET_ID is set (SpreadsheetApp is not even touched
-// then). Never throws: any failure is logged as one line and the
-// collection that produced the snapshot still counts as a success.
+// then). The "account" tab is appended to, one row per collection;
+// every other tab is upserted by its key. Never throws: any
+// failure is logged as one line and the collection that produced
+// the snapshot still counts as a success.
 function appendSnsHistory_(snapshot) {
   const sheetId = getScriptProperty_(SNS_HISTORY_SHEET_ID_PROPERTY);
   if (!sheetId) {
@@ -3794,13 +4058,40 @@ function appendSnsHistory_(snapshot) {
       SNS_HISTORY_ACCOUNT_COLUMNS
     );
     accountSheet.appendRow(buildSnsHistoryAccountRow_(snapshot));
-    const mediaSheet = ensureSnsHistorySheet_(
+    upsertSnsHistorySheet_(
       spreadsheet,
       'media',
-      SNS_HISTORY_MEDIA_COLUMNS
+      SNS_HISTORY_MEDIA_COLUMNS,
+      1,
+      buildSnsHistoryMediaRows_(snapshot)
     );
-    buildSnsHistoryMediaRows_(snapshot).forEach((row) =>
-      mediaSheet.appendRow(row)
+    upsertSnsHistorySheet_(
+      spreadsheet,
+      'daily',
+      SNS_HISTORY_DAILY_COLUMNS,
+      0,
+      buildSnsHistoryDailyRows_(snapshot)
+    );
+    upsertSnsHistorySheet_(
+      spreadsheet,
+      'threads_media',
+      SNS_HISTORY_THREADS_MEDIA_COLUMNS,
+      1,
+      buildSnsHistoryThreadsMediaRows_(snapshot)
+    );
+    upsertSnsHistorySheet_(
+      spreadsheet,
+      'youtube_media',
+      SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS,
+      1,
+      buildSnsHistoryYouTubeMediaRows_(snapshot)
+    );
+    upsertSnsHistorySheet_(
+      spreadsheet,
+      'facebook_media',
+      SNS_HISTORY_FACEBOOK_MEDIA_COLUMNS,
+      1,
+      buildSnsHistoryFacebookMediaRows_(snapshot)
     );
   } catch (err) {
     console.log(
@@ -4469,8 +4760,21 @@ if (typeof exports !== 'undefined') {
   exports.SNS_HISTORY_RESPONSE_COLUMNS = SNS_HISTORY_RESPONSE_COLUMNS;
   exports.buildSnsHistoryAccountRow_ = buildSnsHistoryAccountRow_;
   exports.buildSnsHistoryMediaRows_ = buildSnsHistoryMediaRows_;
+  exports.buildSnsHistoryDailyRows_ = buildSnsHistoryDailyRows_;
+  exports.buildSnsHistoryThreadsMediaRows_ = buildSnsHistoryThreadsMediaRows_;
+  exports.buildSnsHistoryYouTubeMediaRows_ = buildSnsHistoryYouTubeMediaRows_;
+  exports.buildSnsHistoryFacebookMediaRows_ = buildSnsHistoryFacebookMediaRows_;
+  exports.mergeSnsHistoryRows_ = mergeSnsHistoryRows_;
+  exports.snsHistoryKeyCell_ = snsHistoryKeyCell_;
+  exports.readSnsHistoryRows_ = readSnsHistoryRows_;
+  exports.upsertSnsHistorySheet_ = upsertSnsHistorySheet_;
   exports.ensureSnsHistorySheet_ = ensureSnsHistorySheet_;
   exports.summarizeSnsHistoryError_ = summarizeSnsHistoryError_;
   exports.SNS_HISTORY_ACCOUNT_COLUMNS = SNS_HISTORY_ACCOUNT_COLUMNS;
   exports.SNS_HISTORY_MEDIA_COLUMNS = SNS_HISTORY_MEDIA_COLUMNS;
+  exports.SNS_HISTORY_DAILY_COLUMNS = SNS_HISTORY_DAILY_COLUMNS;
+  exports.SNS_HISTORY_THREADS_MEDIA_COLUMNS = SNS_HISTORY_THREADS_MEDIA_COLUMNS;
+  exports.SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS = SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS;
+  exports.SNS_HISTORY_FACEBOOK_MEDIA_COLUMNS =
+    SNS_HISTORY_FACEBOOK_MEDIA_COLUMNS;
 }

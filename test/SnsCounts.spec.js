@@ -750,17 +750,28 @@ describe('SNS follower counts', () => {
         getLastRow() {
           return sheet.rows.length;
         },
-        getRange(row, col, numRows) {
+        getRange(row, col, numRows, numCols) {
           return {
             setValues: (values) => {
               values.forEach((valueRow, i) => {
                 sheet.rows[row - 1 + i] = valueRow.slice();
               });
             },
+            getValues: () => {
+              const out = [];
+              for (let i = 0; i < numRows; i++) {
+                const source = sheet.rows[row - 1 + i] || [];
+                out.push(source.slice(col - 1, col - 1 + (numCols || source.length)));
+              }
+              return out;
+            },
           };
         },
         appendRow(row) {
           sheet.rows.push(row.slice());
+        },
+        deleteRows(position, count) {
+          sheet.rows.splice(position - 1, count);
         },
       };
       return sheet;
@@ -772,7 +783,17 @@ describe('SNS follower counts', () => {
         subscribers: 8,
         total_views: 123456,
         video_count: 42,
-        recent_videos: [],
+        recent_videos: [
+          {
+            id: 'vid1',
+            title: '川口の歌',
+            published_at: '2026-11-08T00:00:00Z',
+            views: 500,
+            likes: 20,
+            comments: 3,
+            url: 'https://www.youtube.com/watch?v=vid1',
+          },
+        ],
         youtube_error: null,
       },
       instagram: {
@@ -789,6 +810,13 @@ describe('SNS follower counts', () => {
         profile_links_taps_source: 'total_value',
         follows_30d: 498,
         unfollows_30d: 58,
+        daily_follows: [
+          { date: '2026-11-07', follows: 30, unfollows: 2 },
+          { date: '2026-11-08', follows: null, unfollows: null },
+          { date: '2026-11-09', follows: 12, unfollows: null },
+        ],
+        daily_follows_missing_days: 1,
+        daily_follows_error: null,
         demographics: { age_gender: [], top_cities: [], top_countries: [] },
         detail_error: null,
         recent_media: [
@@ -825,8 +853,40 @@ describe('SNS follower counts', () => {
         ],
         media_error: null,
       },
-      threads: { followers: 252 },
-      facebook: { followers: 321 },
+      threads: {
+        followers: 252,
+        recent_posts: [
+          {
+            id: 'th-post-1',
+            type: 'TEXT_POST',
+            posted_at: '2026-11-08T12:00:00Z',
+            text: 'スレッズの投稿',
+            permalink: 'https://www.threads.net/@freddiefujiwara/post/XYZ/',
+            views: 100,
+            likes: 10,
+            replies: 2,
+            reposts: 1,
+            quotes: 0,
+          },
+        ],
+      },
+      facebook: {
+        followers: 321,
+        recent_posts: [
+          {
+            id: 'fb-post-1',
+            posted_at: '2026-11-08T10:00:00+0000',
+            message: 'Facebookの投稿',
+            permalink: 'https://www.facebook.com/freddiefujiwara/posts/123',
+            views: 200,
+            unique_viewers: 150,
+            engagements: 9,
+            clicks: 4,
+            link_clicks: 2,
+            saves: null,
+          },
+        ],
+      },
     });
 
     const expectedAccountValues = [
@@ -878,6 +938,97 @@ describe('SNS follower counts', () => {
           100, 90, 10, 1, 0, 2, '', '',
         ],
       ]);
+    });
+
+    it('builds daily rows only for days that carry a value', () => {
+      // 2026-11-08 is null on both sides in the fixture: it records
+      // nothing and is skipped, so the upsert cannot erase a stored
+      // value for that date either.
+      expect(Code.buildSnsHistoryDailyRows_(fixtureSnapshot())).toEqual([
+        ['2026-11-07', 30, 2, '2026-11-09T00:00:00.000Z'],
+        ['2026-11-09', 12, '', '2026-11-09T00:00:00.000Z'],
+      ]);
+      expect(
+        Code.buildSnsHistoryDailyRows_({ instagram: { daily_follows: null } })
+      ).toEqual([]);
+    });
+
+    it('builds one row per Threads post, YouTube video and Facebook post', () => {
+      expect(Code.buildSnsHistoryThreadsMediaRows_(fixtureSnapshot())).toEqual([
+        [
+          '2026-11-09T00:00:00.000Z',
+          'th-post-1',
+          '2026-11-08T12:00:00Z',
+          'TEXT_POST',
+          'スレッズの投稿',
+          'https://www.threads.net/@freddiefujiwara/post/XYZ/',
+          100, 10, 2, 1, 0,
+        ],
+      ]);
+      expect(Code.buildSnsHistoryYouTubeMediaRows_(fixtureSnapshot())).toEqual([
+        [
+          '2026-11-09T00:00:00.000Z',
+          'vid1',
+          '2026-11-08T00:00:00Z',
+          '川口の歌',
+          500, 20, 3,
+        ],
+      ]);
+      expect(Code.buildSnsHistoryFacebookMediaRows_(fixtureSnapshot())).toEqual([
+        [
+          '2026-11-09T00:00:00.000Z',
+          'fb-post-1',
+          '2026-11-08T10:00:00+0000',
+          'Facebookの投稿',
+          'https://www.facebook.com/freddiefujiwara/posts/123',
+          200, 150, 9, 4, 2, '',
+        ],
+      ]);
+      expect(
+        Code.buildSnsHistoryThreadsMediaRows_({ threads: { recent_posts: null } })
+      ).toEqual([]);
+      expect(
+        Code.buildSnsHistoryYouTubeMediaRows_({ youtube: { recent_videos: null } })
+      ).toEqual([]);
+      expect(
+        Code.buildSnsHistoryFacebookMediaRows_({
+          facebook: { recent_posts: null },
+        })
+      ).toEqual([]);
+    });
+
+    it('merges rows by key: fresh values win, fresh blanks keep stored values', () => {
+      const merged = Code.mergeSnsHistoryRows_(
+        [
+          ['t1', 'post-1', 100, 5],
+          ['t2', 'post-1', 150, ''],
+          ['t1', 'post-2', 40, 1],
+          ['t0', '', 999, 999],
+        ],
+        [
+          ['t3', 'post-2', '', 7],
+          ['t3', 'post-3', 10, 0],
+        ],
+        1
+      );
+      expect(merged).toEqual([
+        ['t2', 'post-1', 150, 5],
+        ['t3', 'post-2', 40, 7],
+        ['t3', 'post-3', 10, 0],
+      ]);
+    });
+
+    it('normalizes sheet key cells, including coerced dates', () => {
+      expect(Code.snsHistoryKeyCell_(' media-1 ')).toBe('media-1');
+      expect(Code.snsHistoryKeyCell_(null)).toBe('');
+      expect(Code.snsHistoryKeyCell_('')).toBe('');
+      // 2026-11-08 15:00 UTC is 2026-11-09 00:00 in Asia/Tokyo.
+      expect(
+        Code.snsHistoryKeyCell_(new Date('2026-11-08T15:00:00.000Z'))
+      ).toBe('2026-11-09');
+      expect(
+        Code.snsHistoryKeyCell_(new Date('2026-11-08T14:59:59.000Z'))
+      ).toBe('2026-11-08');
     });
 
     it('blanks null values and the total when every follower count is null', () => {
@@ -940,12 +1091,34 @@ describe('SNS follower counts', () => {
         'https://www.instagram.com/reel/ABC/',
         1000,
       ]);
+      // The expanded tabs are created with their headers on the
+      // same run, and the mocked upload lands on youtube_media.
+      expect(sheets.daily.rows[0]).toEqual(Code.SNS_HISTORY_DAILY_COLUMNS);
+      expect(sheets.threads_media.rows[0]).toEqual(
+        Code.SNS_HISTORY_THREADS_MEDIA_COLUMNS
+      );
+      expect(sheets.facebook_media.rows[0]).toEqual(
+        Code.SNS_HISTORY_FACEBOOK_MEDIA_COLUMNS
+      );
+      expect(sheets.youtube_media.rows[0]).toEqual(
+        Code.SNS_HISTORY_YOUTUBE_MEDIA_COLUMNS
+      );
+      expect(sheets.youtube_media.rows).toHaveLength(2);
+      expect(sheets.youtube_media.rows[1].slice(1)).toEqual([
+        'vid1',
+        '2026-11-08T00:00:00Z',
+        '川口の歌',
+        1000,
+        50,
+        4,
+      ]);
     });
 
-    it('writes each header only once and keeps an existing header', () => {
+    it('keeps account append-only while the key-keyed tabs upsert', () => {
       store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
       Code.appendSnsHistory_(fixtureSnapshot());
       Code.appendSnsHistory_(fixtureSnapshot());
+      // account stays a time series: one appended row per collection.
       expect(sheets.account.rows).toHaveLength(3);
       expect(sheets.account.rows[0]).toEqual(Code.SNS_HISTORY_ACCOUNT_COLUMNS);
       expect(sheets.account.rows[1].slice(1)).toEqual([
@@ -956,8 +1129,18 @@ describe('SNS follower counts', () => {
         ...expectedAccountValues,
         321,
       ]);
-      expect(sheets.media.rows).toHaveLength(5);
+      // The key-keyed tabs hold one row per key, however often the
+      // same post is collected; headers are written once, on creation.
+      expect(sheets.media.rows).toHaveLength(3);
       expect(sheets.media.rows[0]).toEqual(Code.SNS_HISTORY_MEDIA_COLUMNS);
+      expect(sheets.daily.rows).toHaveLength(3);
+      expect(sheets.daily.rows[0]).toEqual(Code.SNS_HISTORY_DAILY_COLUMNS);
+      expect(sheets.threads_media.rows).toHaveLength(2);
+      expect(sheets.threads_media.rows[0]).toEqual(
+        Code.SNS_HISTORY_THREADS_MEDIA_COLUMNS
+      );
+      expect(sheets.youtube_media.rows).toHaveLength(2);
+      expect(sheets.facebook_media.rows).toHaveLength(2);
 
       const headed = makeSheet();
       headed.rows.push(['preset', 'header']);
@@ -967,7 +1150,109 @@ describe('SNS follower counts', () => {
       Code.appendSnsHistory_(fixtureSnapshot());
       expect(headed.rows).toHaveLength(2);
       expect(headed.rows[0]).toEqual(['preset', 'header']);
+      // The upsert writes its rows under an existing header and
+      // leaves the header itself untouched.
       expect(sheets.media.rows[0]).toEqual(['preset', 'header']);
+      expect(sheets.media.rows).toHaveLength(3);
+    });
+
+    it('folds append-era duplicate media rows into one row per post', () => {
+      store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
+      const media = makeSheet();
+      media.rows.push(Code.SNS_HISTORY_MEDIA_COLUMNS.slice());
+      const reelRow = (at, views, reach, likes, comments, shares, saves, avg, total) => [
+        at,
+        'media-reel-1',
+        '2026-11-08T03:00:00+0000',
+        'REELS',
+        'リールのキャプション',
+        'https://www.instagram.com/reel/ABC/',
+        views, reach, likes, comments, shares, saves, avg, total,
+      ];
+      // Three stored rows for the same post from the append-only
+      // era (the newest one missing its reach), plus a post the
+      // fresh fetch no longer returns.
+      media.rows.push(reelRow('2026-11-07T00:00:00.000Z', 800, 700, 30, 3, 1, 5, 7.5, 600));
+      media.rows.push(reelRow('2026-11-08T00:00:00.000Z', 900, 800, 40, 4, 2, 6, 8, 700));
+      media.rows.push(reelRow('2026-11-09T00:00:00.000Z', 950, '', 45, 5, 3, 7, 8.5, 720));
+      media.rows.push([
+        '2026-11-08T00:00:00.000Z',
+        'media-old-1',
+        '2026-10-01T03:00:00+0000',
+        'FEED',
+        '窓の外の投稿',
+        'https://www.instagram.com/p/OLD/',
+        10, 9, 1, 0, 0, 0, '', '',
+      ]);
+      sheets.media = media;
+
+      Code.appendSnsHistory_(fixtureSnapshot());
+
+      expect(sheets.media.rows).toEqual([
+        Code.SNS_HISTORY_MEDIA_COLUMNS,
+        // One row for the reel, carrying the fixture's fresh values.
+        [
+          '2026-11-09T00:00:00.000Z',
+          'media-reel-1',
+          '2026-11-08T03:00:00+0000',
+          'REELS',
+          'リールのキャプション',
+          'https://www.instagram.com/reel/ABC/',
+          1000, 900, 50, 5, 3, 7, 8.5, 765,
+        ],
+        // The post outside the fresh window survives untouched.
+        [
+          '2026-11-08T00:00:00.000Z',
+          'media-old-1',
+          '2026-10-01T03:00:00+0000',
+          'FEED',
+          '窓の外の投稿',
+          'https://www.instagram.com/p/OLD/',
+          10, 9, 1, 0, 0, 0, '', '',
+        ],
+        [
+          '2026-11-09T00:00:00.000Z',
+          'media-image-1',
+          '2026-11-07T03:00:00+0000',
+          'FEED',
+          '写真のキャプション',
+          'https://www.instagram.com/p/DEF/',
+          100, 90, 10, 1, 0, 2, '', '',
+        ],
+      ]);
+    });
+
+    it('upserts daily rows by date and keeps days older than the window', () => {
+      store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
+      const daily = makeSheet();
+      daily.rows.push(Code.SNS_HISTORY_DAILY_COLUMNS.slice());
+      daily.rows.push(['2026-10-01', 5, 1, '2026-10-02T00:00:00.000Z']);
+      daily.rows.push(['2026-11-08', 20, 3, '2026-11-09T00:00:00.000Z']);
+      sheets.daily = daily;
+
+      Code.appendSnsHistory_(fixtureSnapshot());
+
+      expect(sheets.daily.rows).toEqual([
+        Code.SNS_HISTORY_DAILY_COLUMNS,
+        // Older than the 30-day fetch window: stays as stored.
+        ['2026-10-01', 5, 1, '2026-10-02T00:00:00.000Z'],
+        // The fixture reports 2026-11-08 null on both sides, so the
+        // stored values are not erased.
+        ['2026-11-08', 20, 3, '2026-11-09T00:00:00.000Z'],
+        ['2026-11-07', 30, 2, '2026-11-09T00:00:00.000Z'],
+        // Follows only; the missing side stays blank, never 0.
+        ['2026-11-09', 12, '', '2026-11-09T00:00:00.000Z'],
+      ]);
+    });
+
+    it('leaves facebook_media header-only while Facebook is unauthorized', () => {
+      store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
+      const snapshot = fixtureSnapshot();
+      snapshot.facebook = { followers: null, recent_posts: null };
+      Code.appendSnsHistory_(snapshot);
+      expect(sheets.facebook_media.rows).toEqual([
+        Code.SNS_HISTORY_FACEBOOK_MEDIA_COLUMNS,
+      ]);
     });
 
     it('keeps collectSnsCounts successful when the append throws', () => {
