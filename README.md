@@ -60,7 +60,7 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 
 /social 管理画面用。読み取りは `?action=sns_detail` で、レポートと同じ認証ゲート（ID トークンまたは一時アクセスリンク）を通る。
 
-**応答は履歴スプレッドシートから組み立てる**（第2段階）。`account` の最新行を中心に、`media` / `daily` / `threads_media` / `youtube_media` / `ig_demographics` / `threads_account` の各タブから、スナップショットと同形の詳細を再構築する（数分間 CacheService にキャッシュ）。シートが読めない・account に行が無い場合は、従来どおり保存済みスナップショットへフォールバックし、どちらも無ければ全項目 null の空形を返す。シート由来の応答では、収集1回ごとの診断であるエラーキー（`insights_error`、`detail_error`、`media_error` 等）は履歴に保存していないため常に null になり、`daily_follows` は値のある日だけの配列になる（両側 null の日は行自体が無い）。`youtube.recent_videos` の `url` はシートに保存せず video_id から組み立てる。
+**応答は履歴スプレッドシートから組み立てる**（第2段階）。`account` の最新行を中心に、`media` / `daily` / `threads_media` / `youtube_media` / `ig_demographics` / `threads_account` / `x_media` の各タブから、スナップショットと同形の詳細を再構築する（数分間 CacheService にキャッシュ）。シートが読めない・account に行が無い場合は、従来どおり保存済みスナップショットへフォールバックし、どちらも無ければ全項目 null の空形を返す。シート由来の応答では、収集1回ごとの診断であるエラーキー（`insights_error`、`detail_error`、`media_error` 等）は履歴に保存していないため常に null になり、`daily_follows` は値のある日だけの配列になる（両側 null の日は行自体が無い）。`youtube.recent_videos` の `url` はシートに保存せず video_id から組み立てる。
 
 以下は収集側（スナップショットと履歴シートへの書き込み）の仕様。取得は項目ごとに独立して失敗し、取れない項目は null、失敗の要約はセクションごとのエラーキー（秘密値は含まない）に入る。
 
@@ -73,6 +73,7 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - YouTube：`youtube.total_views`（総再生数）と `youtube.video_count`（動画数）を追加。`youtube.recent_videos[]`（新しい順・最大10件）= `{id, title, published_at, views, likes, comments, url}`。失敗時は `youtube.youtube_error`
 - Threads アカウント全体（過去30日）：`threads.views_30d`、`threads.interactions_30d`（total / likes / replies / reposts / quotes）。`threads_insights` から metric ごとに取得し、total_value があればそれを、なければ日別 values の合計を読む（フォロワー数だけは現在値なので従来どおり別扱い）。失敗時は `threads.detail_error`
 - Threads 投稿ごと（新しい順・最大30件）：`threads.recent_posts[]` = `{id, type, posted_at, text（全文、上限2000字）, permalink, views, likes, replies, reposts, quotes}`。投稿一覧は本人の `threads` エッジ、数値は各投稿の media insights から。insights が取れない投稿（他人の投稿のリポスト等）は数値 null のまま残り、失敗件数は `threads.posts_error` に要約される
+- X（フォロワー数＋投稿ごと、新しい順・最大50件）：`x.followers`、`x.recent_posts[]` = `{id, posted_at, text（上限2000字）, url, views, likes, reposts, replies}`。**X の API キーは tweet-gas だけが持ち**、ここには置かない。収集のたびに tweet-gas の Web アプリへ `{ action: "sns_snapshot", sync_token }` を POST して数字だけを受け取る（alarm-gas と time-table-gas の同期と同じ機械間トークン方式）。こちら側のプロパティは `TWEET_GAS_EXEC_URL`（tweet-gas の /exec URL）と `TWEET_GAS_SYNC_TOKEN`（tweet-gas の `SYNC_TOKEN` と同じ値）。未設定なら X は全て null でエラーにもならない。通信自体の失敗は `x.x_error` と `x.posts_error` の両方に同じ要約が入り、tweet-gas 側の取得失敗は tweet-gas が返した `x_error` / `posts_error` をそのまま記録する。`url` はシートに保存せず post_id から組み立てる。ユーザー名（`x.username`）はスナップショットにだけ入り、シートには保存しない
 
 
 ## SNS履歴（スプレッドシート）
@@ -81,13 +82,14 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 
 書き方はタブで2種類に分かれる。**投稿系と日次は「1キー1行の上書き（upsert）」で、account のみ時系列の追記**。
 
-- `account` シート（例外的に追記のまま）：取得ごとに1行を追記する。フォロワー推移グラフの元データなので、ここだけは収集の履歴そのものを残す。列は collected_at、ig_followers、ig_anemone_followers、threads_followers、youtube_subscribers、total_followers（Instagram メイン＋Threads＋YouTube、トップページと同じ定義）、media_count、views_30d、non_follower_pct、reach_30d、accounts_engaged_30d、interactions_total / likes / comments / shares / saves、profile_links_taps_30d、profile_links_taps_source、follows_30d、unfollows_30d、yt_total_views、yt_video_count。null の項目は空欄
+- `account` シート（例外的に追記のまま）：取得ごとに1行を追記する。フォロワー推移グラフの元データなので、ここだけは収集の履歴そのものを残す。列は collected_at、ig_followers、ig_anemone_followers、threads_followers、youtube_subscribers、total_followers（Instagram メイン＋Threads＋YouTube＋X）、media_count、views_30d、non_follower_pct、reach_30d、accounts_engaged_30d、interactions_total / likes / comments / shares / saves、profile_links_taps_30d、profile_links_taps_source、follows_30d、unfollows_30d、yt_total_views、yt_video_count、x_followers。null の項目は空欄。x_followers は最後尾に追加した列で、既存シートのヘッダーに無くても位置で読み書きする（`sns_history` の読み取りはヘッダーに無い列を正規の位置で補う）
 - `media` シート（キー `media_id` で upsert）：`recent_media` の投稿ごとに1行。列は collected_at、media_id、posted_at、type、caption、permalink、views、reach、likes、comments、shares、saves、avg_watch_sec、total_watch_sec
 - `daily` シート（キー `date` で upsert）：Instagram の日次フォロー。列は date、follows、unfollows、collected_at。`daily_follows` は収集のたびに過去30日分が再取得されるため、date をキーに上書きし、30日より古い日も残り続ける。両側 null の日は行を作らず、既存行も消さない
 - `threads_media` シート（キー `post_id` で upsert）：`threads.recent_posts` の投稿ごとに1行。列は collected_at、post_id、posted_at、type、text、permalink、views、likes、replies、reposts、quotes
 - `youtube_media` シート（キー `video_id` で upsert）：`youtube.recent_videos` の動画ごとに1行。列は collected_at、video_id、published_at、title、views、likes、comments。動画ごとの数値はもともと毎回の収集でアップロード一覧から取得していた分（最大10件）で、履歴のために追加の取得はしていない
 - `ig_demographics` シート（キー `breakdown_key` で upsert）：Instagram のフォロワー属性。列は breakdown_key、breakdown、key、value、collected_at。breakdown は age_gender（年代×性別、key は `25-34/F` の形）、city（上位の市）、country（上位の国）の3種で、キーで1行にまとめる。取得に失敗した breakdown は行を作らず、既存行も消さない
 - `threads_account` シート（キー `metric` で upsert）：Threads のアカウント指標（過去30日）。列は metric、value、collected_at。metric は views_30d、interactions_total / likes / replies / reposts / quotes。数値が取れた metric だけ行を作る
+- `x_media` シート（キー `post_id` で upsert）：`x.recent_posts` の投稿ごとに1行。列は collected_at、post_id、posted_at、text、views、likes、reposts、replies。URL は保存せず、読み取り時に post_id から組み立てる
 - `blog_daily` シート（キー `date` で upsert）：ブログの日次 KPI を GA4 から取得して書く（スナップショット経由ではない）。列は date、views、users、sessions、avg_speed_ms、music_plays、collected_at。対象は表示窓の全日（28daysAgo〜today の29日）で、毎回の収集で窓全体を取り直して上書きする（GA4 側の後日修正も次の収集で反映される。当日分は途中経過）。avg_speed_ms は `wv_lcp` イベントの平均値（eventValue / eventCount、ミリ秒）で、表示スピードの指標。music_plays はその日の `music_play` イベント件数
 - `blog_posts` シート（キー `path` で upsert）：ブログの記事ごとに1行。列は path、title、views_28d、collected_at。path は `/<id>` と `/blog/<id>` を一本化した正規形 `/blog/<id>`（フロントのランキングと同じ合算ルール、記事IDの判定は `action=top_articles` と同じ）。views_28d は直近28日の表示回数、title は GA4 の pageTitle
 - `blog_pages` シート（キー `path` で upsert）：blog_posts と同じ取得を記事以外にも広げたもの。列は path、title、views_28d、collected_at。記事は正規形に合算し、それ以外のパス（トップやアプリのページ）はそのままのパスがキー。画面のページレンキング（記事とアプリページが混ざる）用
@@ -97,7 +99,7 @@ YouTube・Instagram・Threads のフォロワー数を GAS 自身が定期取得
 - upsert の方式：収集のたびにタブ全体を読み、キーでマージして（新しい取得値が勝つ。ただし新しい値が null の項目は空欄として扱い、既存値を残す＝null で潰さない）、ヘッダー＋1キー1行で書き戻し、余った行は削除する。この方式により、追記方式だった頃に貯まった `media` の重複行（30投稿×収集回数分）も、次回収集で自動的に1投稿1行へ整理される
 - どのシートも無ければ自動作成し、1行目が空（シートが空）のときだけヘッダー行を書く。既存のヘッダー行は upsert でも書き換えない
 - 書き込みに失敗しても取得自体は成功として扱い、実行ログに `SNS history append failed: <要約>` が1行出る（要約に秘密値・URL は含めない）
-- 読み取りは `?action=sns_history`（認証必須、sns_detail と同じゲート）で、/social の推移グラフ用。`account` シートの行を collected_at 昇順で最大直近2400行返し（1時間ごとの収集で約100日分）、項目は collected_at、ig_followers、threads_followers、youtube_subscribers、total_followers、media_count、views_30d、non_follower_pct、reach_30d、interactions_total、follows_30d、unfollows_30d、yt_total_views の13項目に絞る（空欄は null）。プロパティ未設定・シートが無い／空の場合はエラーにせず `rows: []` を返す
+- 読み取りは `?action=sns_history`（認証必須、sns_detail と同じゲート）で、/social の推移グラフ用。`account` シートの行を collected_at 昇順で最大直近2400行返し（1時間ごとの収集で約100日分）、項目は collected_at、ig_followers、threads_followers、youtube_subscribers、total_followers、media_count、views_30d、non_follower_pct、reach_30d、interactions_total、follows_30d、unfollows_30d、yt_total_views、x_followers の14項目に絞る（空欄は null）。プロパティ未設定・シートが無い／空の場合はエラーにせず `rows: []` を返す
 - 第2段階の読み取り：`action=sns_detail` とデフォルトのレポート応答もシートから組み立てる（詳細は各節）。`blog_pages` / `blog_sources` は「窓のスナップショット」なので、読み取りでは最新の collected_at のバッチの行だけを使う（古い窓の行の凍結した views_28d をランキングに出さないため）。`blog_daily` は日付キーで窓に絞る
 
 ## 診断関数 `debugSnsInsights`（手動実行専用）

@@ -455,6 +455,7 @@ describe('SNS follower counts', () => {
           insights_error: null,
         },
         threads: { followers: null },
+        x: { followers: null },
       });
     });
 
@@ -481,6 +482,7 @@ describe('SNS follower counts', () => {
           insights_error: null,
         },
         threads: { followers: 252 },
+        x: { followers: null },
       });
     });
 
@@ -876,7 +878,7 @@ describe('SNS follower counts', () => {
 
     const expectedAccountValues = [
       1988, 59, 252, 8, 2248, 2404, 10000, 96.3, 5000, 1200, 3000, 2000, 300,
-      400, 300, 46, 'total_value', 498, 58, 123456, 42,
+      400, 300, 46, 'total_value', 498, 58, 123456, 42, '',
     ];
 
     beforeEach(() => {
@@ -1794,6 +1796,7 @@ describe('SNS follower counts', () => {
       set('follows_30d', 180);
       set('unfollows_30d', 30);
       set('yt_total_views', 123456);
+      set('x_followers', 321);
       Object.entries(overrides || {}).forEach(([column, value]) =>
         set(column, value)
       );
@@ -1855,11 +1858,12 @@ describe('SNS follower counts', () => {
           follows_30d: null,
           unfollows_30d: 30,
           yt_total_views: 123456,
+          x_followers: 321,
         },
       ]);
-      // Only the 13 served columns come back: no anemone counts, no
+      // Only the 14 served columns come back: no anemone counts, no
       // taps source, no other sheet columns leak into the response.
-      expect(Object.keys(json.rows[0])).toHaveLength(13);
+      expect(Object.keys(json.rows[0])).toHaveLength(14);
     });
 
     it('sorts ascending by collected_at and drops timestamp-less rows', () => {
