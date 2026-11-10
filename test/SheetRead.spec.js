@@ -131,6 +131,7 @@ describe('Sheet-backed read side (stage 2)', () => {
       [
         AT_NEW, 'media-new', '2026-11-08T03:00:00+0000', 'REELS', '新しい投稿',
         'https://www.instagram.com/reel/NEW/', 1000, 900, 50, 5, 3, 7, 8.5, 765,
+        'https://example.com/thumb-new.jpg',
       ],
     ],
     daily: [
@@ -270,6 +271,12 @@ describe('Sheet-backed read side (stage 2)', () => {
       ]);
       expect(detail.instagram.recent_media[0].avg_watch_sec).toBe(8.5);
       expect(detail.instagram.recent_media[1].avg_watch_sec).toBeNull();
+      // The thumbnail column rides at the end of the media tab; a
+      // row written before the column existed reads back null.
+      expect(detail.instagram.recent_media[0].thumbnail_url).toBe(
+        'https://example.com/thumb-new.jpg'
+      );
+      expect(detail.instagram.recent_media[1].thumbnail_url).toBeNull();
       expect(detail.instagram.daily_follows).toEqual([
         { date: '2026-11-07', follows: 30, unfollows: 2 },
         { date: '2026-11-08', follows: 40, unfollows: 3 },

@@ -286,6 +286,9 @@ describe('SNS follower counts', () => {
       caption: '写真のキャプション',
       timestamp: '2026-11-07T03:00:00+0000',
       permalink: 'https://www.instagram.com/p/DEF/',
+      // Photos carry no thumbnail_url; the image itself rides
+      // media_url and becomes the entry's thumbnail_url.
+      media_url: 'https://example.com/image1.jpg',
     },
   ];
 
@@ -621,6 +624,7 @@ describe('SNS follower counts', () => {
             posted_at: '2026-11-08T03:00:00+0000',
             caption: 'リールのキャプション',
             permalink: 'https://www.instagram.com/reel/ABC/',
+            thumbnail_url: 'https://example.com/thumb1.jpg',
             views: 1000,
             reach: 900,
             likes: 50,
@@ -636,6 +640,7 @@ describe('SNS follower counts', () => {
             posted_at: '2026-11-07T03:00:00+0000',
             caption: '写真のキャプション',
             permalink: 'https://www.instagram.com/p/DEF/',
+            thumbnail_url: 'https://example.com/image1.jpg',
             views: 100,
             reach: 90,
             likes: 10,
@@ -830,6 +835,7 @@ describe('SNS follower counts', () => {
             posted_at: '2026-11-08T03:00:00+0000',
             caption: 'リールのキャプション',
             permalink: 'https://www.instagram.com/reel/ABC/',
+            thumbnail_url: 'https://example.com/thumb1.jpg',
             views: 1000,
             reach: 900,
             likes: 50,
@@ -911,6 +917,7 @@ describe('SNS follower counts', () => {
           'リールのキャプション',
           'https://www.instagram.com/reel/ABC/',
           1000, 900, 50, 5, 3, 7, 8.5, 765,
+          'https://example.com/thumb1.jpg',
         ],
         [
           '2026-11-09T00:00:00.000Z',
@@ -919,7 +926,7 @@ describe('SNS follower counts', () => {
           'FEED',
           '写真のキャプション',
           'https://www.instagram.com/p/DEF/',
-          100, 90, 10, 1, 0, 2, '', '',
+          100, 90, 10, 1, 0, 2, '', '', '',
         ],
       ]);
     });
@@ -1256,8 +1263,10 @@ describe('SNS follower counts', () => {
           'リールのキャプション',
           'https://www.instagram.com/reel/ABC/',
           1000, 900, 50, 5, 3, 7, 8.5, 765,
+          'https://example.com/thumb1.jpg',
         ],
-        // The post outside the fresh window survives untouched.
+        // The post outside the fresh window survives untouched
+        // (padded with an empty thumbnail cell).
         [
           '2026-11-08T00:00:00.000Z',
           'media-old-1',
@@ -1265,7 +1274,7 @@ describe('SNS follower counts', () => {
           'FEED',
           '窓の外の投稿',
           'https://www.instagram.com/p/OLD/',
-          10, 9, 1, 0, 0, 0, '', '',
+          10, 9, 1, 0, 0, 0, '', '', '',
         ],
         [
           '2026-11-09T00:00:00.000Z',
@@ -1274,7 +1283,7 @@ describe('SNS follower counts', () => {
           'FEED',
           '写真のキャプション',
           'https://www.instagram.com/p/DEF/',
-          100, 90, 10, 1, 0, 2, '', '',
+          100, 90, 10, 1, 0, 2, '', '', '',
         ],
       ]);
     });
@@ -3014,6 +3023,7 @@ describe('SNS follower counts', () => {
         posted_at: '2026-11-08T03:00:00+0000',
         caption: longCaption,
         permalink: 'https://www.instagram.com/reel/ABC/',
+        thumbnail_url: 'https://example.com/thumb1.jpg',
         views: 1000,
         reach: 900,
         likes: 50,

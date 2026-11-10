@@ -2646,7 +2646,7 @@ function fetchInstagramRecentMedia_() {
   const listRes = fetchInsightsJson_(
     META_GRAPH_BASE +
       SNS_INSTAGRAM_MAIN_ID +
-      '/media?fields=id,media_type,media_product_type,caption,timestamp,permalink,thumbnail_url&limit=' +
+      '/media?fields=id,media_type,media_product_type,caption,timestamp,permalink,thumbnail_url,media_url&limit=' +
       SNS_RECENT_MEDIA_LIMIT +
       '&access_token=' +
       encodeURIComponent(token)
@@ -2702,6 +2702,14 @@ function buildRecentMediaEntry_(media) {
     posted_at: (media && media.timestamp) || null,
     caption: caption.slice(0, SNS_CAPTION_MAX_LENGTH),
     permalink: (media && media.permalink) || null,
+    // The still image for the /social post lists: videos and reels
+    // carry thumbnail_url, photos carry only media_url (the image
+    // itself), so the first non-empty one wins. Both are signed
+    // CDN URLs that expire; the hourly collection refreshes them,
+    // so a stored value is never older than the collection that
+    // wrote it.
+    thumbnail_url:
+      (media && media.thumbnail_url) || (media && media.media_url) || null,
     views: null,
     reach: null,
     likes: null,
@@ -2987,6 +2995,10 @@ const SNS_HISTORY_MEDIA_COLUMNS = [
   'saves',
   'avg_watch_sec',
   'total_watch_sec',
+  // Appended last on purpose, like x_followers on the account tab:
+  // rows are read positionally against this list, so a new column
+  // may only ever join at the end.
+  'thumbnail_url',
 ];
 // The upserted tabs. "daily" is keyed by its first column (date);
 // the post tabs are keyed by their second column (the id), right
@@ -3182,6 +3194,7 @@ function buildSnsHistoryMediaRows_(snapshot) {
       snsHistoryNumCell_(item.saves),
       snsHistoryNumCell_(item.avg_watch_sec),
       snsHistoryNumCell_(item.total_watch_sec),
+      snsHistoryTextCell_(item.thumbnail_url),
     ];
   });
 }
@@ -4400,6 +4413,7 @@ function buildSnsDetailFromSheet_() {
         posted_at: historyTimestampOrNull_(row.posted_at),
         caption: historyTextOrNull_(row.caption),
         permalink: historyTextOrNull_(row.permalink),
+        thumbnail_url: historyTextOrNull_(row.thumbnail_url),
         views: num(row.views),
         reach: num(row.reach),
         likes: num(row.likes),
