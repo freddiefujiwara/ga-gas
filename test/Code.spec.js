@@ -552,6 +552,90 @@ describe('Code.js', () => {
       });
     });
 
+    it('serves a repeat verification from the cache without refetching', () => {
+      configureAuth();
+      mockAuthFetch({ payload: goodPayload() });
+      const cacheStore = new Map();
+      global.CacheService = {
+        getScriptCache: () => ({
+          get: (key) => (cacheStore.has(key) ? cacheStore.get(key) : null),
+          put: (key, value) => cacheStore.set(key, value),
+        }),
+      };
+      try {
+        expect(Code.verifyGoogleIdTokenOrThrow_('token')).toEqual({
+          email: EMAIL,
+          sub: '12345',
+        });
+        expect(Code.verifyGoogleIdTokenOrThrow_('token')).toEqual({
+          email: EMAIL,
+          sub: '12345',
+        });
+        expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(1);
+        // A different token is a different cache entry.
+        Code.verifyGoogleIdTokenOrThrow_('other-token');
+        expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(2);
+      } finally {
+        delete global.CacheService;
+      }
+    });
+
+    it('re-checks the allowed list on a cache hit', () => {
+      configureAuth();
+      mockAuthFetch({ payload: goodPayload() });
+      const cacheStore = new Map();
+      global.CacheService = {
+        getScriptCache: () => ({
+          get: (key) => (cacheStore.has(key) ? cacheStore.get(key) : null),
+          put: (key, value) => cacheStore.set(key, value),
+        }),
+      };
+      try {
+        Code.verifyGoogleIdTokenOrThrow_('token');
+        store.AVAILABLE_GMAILS = 'other@example.com';
+        expect(() => Code.verifyGoogleIdTokenOrThrow_('token')).toThrow(
+          'forbidden email'
+        );
+        expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(1);
+      } finally {
+        delete global.CacheService;
+      }
+    });
+
+    it('does not trust a cached verification past the token expiry', () => {
+      configureAuth();
+      mockAuthFetch({
+        payload: goodPayload({
+          exp: Math.floor(Date.now() / 1000) + 120,
+        }),
+      });
+      const cacheStore = new Map();
+      global.CacheService = {
+        getScriptCache: () => ({
+          get: (key) => (cacheStore.has(key) ? cacheStore.get(key) : null),
+          put: (key, value) => cacheStore.set(key, value),
+        }),
+      };
+      Code.verifyGoogleIdTokenOrThrow_('token');
+      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(1);
+      // Two hundred seconds later the cached entry's exp has
+      // passed, so verification goes back to tokeninfo — and
+      // the (also expired) payload is rejected there.
+      const nowSpy = vi
+        .spyOn(Date, 'now')
+        .mockReturnValue(Date.now() + 200 * 1000);
+      try {
+        mockAuthFetch({ payload: goodPayload({ exp: 1 }) });
+        expect(() => Code.verifyGoogleIdTokenOrThrow_('token')).toThrow(
+          'token expired'
+        );
+        expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(1);
+      } finally {
+        nowSpy.mockRestore();
+        delete global.CacheService;
+      }
+    });
+
     it('rejects bad tokens for each reason', () => {
       configureAuth();
       const cases = [

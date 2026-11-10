@@ -241,6 +241,18 @@ function getAllowedEmails_() {
     .filter(Boolean);
 }
 
+// Successful ID-token verifications are cached for a few
+// minutes: the /social screen fires several authenticated
+// requests per load (detail, history, the blog shapes), and
+// without the cache every one of them pays a live tokeninfo
+// fetch. The cache key is the SHA-256 hash of the token (the
+// token itself is never stored), the entry dies with the
+// token's own expiry at the latest, and the allowed-email
+// list is re-checked on a hit so removing an address takes
+// effect immediately. Failed verifications are never cached.
+const ID_TOKEN_VERIFY_CACHE_PREFIX = 'id_token_verify_v1_';
+const ID_TOKEN_VERIFY_CACHE_MAX_SECONDS = 300;
+
 function verifyGoogleIdTokenOrThrow_(idToken) {
   if (!idToken) {
     throw new Error('missing id token');
@@ -248,6 +260,34 @@ function verifyGoogleIdTokenOrThrow_(idToken) {
   const oauthClientId = getScriptProperty_('GOOGLE_OAUTH_CLIENT_ID');
   if (!oauthClientId) {
     throw new Error('missing GOOGLE_OAUTH_CLIENT_ID');
+  }
+  const cache = sheetReadCache_();
+  let cacheKey = null;
+  try {
+    cacheKey = cache
+      ? ID_TOKEN_VERIFY_CACHE_PREFIX + hashShareToken_(idToken)
+      : null;
+  } catch (err) {
+    cacheKey = null;
+  }
+  if (cacheKey) {
+    let cached = null;
+    try {
+      cached = JSON.parse(cache.get(cacheKey) || 'null');
+    } catch (err) {
+      cached = null;
+    }
+    if (
+      cached &&
+      cached.email &&
+      Number.isFinite(cached.exp) &&
+      cached.exp > Math.floor(Date.now() / 1000)
+    ) {
+      if (!getAllowedEmails_().includes(cached.email)) {
+        throw new Error('forbidden email');
+      }
+      return { email: cached.email, sub: cached.sub };
+    }
   }
   const response = UrlFetchApp.fetch(
     'https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idToken),
@@ -280,6 +320,24 @@ function verifyGoogleIdTokenOrThrow_(idToken) {
   }
   if (!getAllowedEmails_().includes(email)) {
     throw new Error('forbidden email');
+  }
+  if (cacheKey) {
+    try {
+      cache.put(
+        cacheKey,
+        JSON.stringify({ email, sub: payload.sub, exp: expSeconds }),
+        Math.max(
+          1,
+          Math.min(
+            ID_TOKEN_VERIFY_CACHE_MAX_SECONDS,
+            expSeconds - Math.floor(Date.now() / 1000)
+          )
+        )
+      );
+    } catch (err) {
+      // Caching a verification is an optimization only; a
+      // cache failure never fails the verification itself.
+    }
   }
   return { email, sub: payload.sub };
 }
@@ -547,13 +605,13 @@ function buildEmptySnsDetail_() {
 // stored snapshot is the fallback: when the sheet cannot be
 // read (or holds no account row yet), the snapshot is served
 // exactly as before, and before the first collection the empty
-// shape above is served. The assembled detail is cached for a
-// few minutes so repeated screen loads do not re-read every
-// tab.
+// shape above is served. The assembled detail is cached for
+// an hour — and the hourly collection precomputes it — so
+// repeated screen loads do not re-read every tab.
 function buildSnsDetailResponse_() {
   const cache = sheetReadCache_();
   if (cache) {
-    const hit = cache.get(SNS_DETAIL_CACHE_KEY);
+    const hit = getCachedText_(cache, SNS_DETAIL_CACHE_KEY);
     if (hit) {
       try {
         return Object.assign(
@@ -582,16 +640,15 @@ function buildSnsDetailResponse_() {
     detail = getSnsCountsSnapshot_() || buildEmptySnsDetail_();
   }
   if (cache) {
-    try {
-      cache.put(
-        SNS_DETAIL_CACHE_KEY,
-        JSON.stringify(detail),
-        SNS_DETAIL_CACHE_SECONDS
-      );
-    } catch (err) {
-      // An oversized detail (CacheService caps values at
-      // 100KB) simply goes uncached.
-    }
+    // Stored chunked (see putCachedText_): a detail past the
+    // per-value cap is cached too, instead of going uncached
+    // as it did when the whole JSON had to fit one value.
+    putCachedText_(
+      cache,
+      SNS_DETAIL_CACHE_KEY,
+      JSON.stringify(detail),
+      SNS_DETAIL_CACHE_SECONDS
+    );
   }
   return Object.assign({ ok: true, action: 'sns_detail' }, detail);
 }
@@ -4094,20 +4151,67 @@ function snsHistoryNumberCell_(value) {
   return Number.isFinite(num) ? num : null;
 }
 
+// The history response rides the same read cache as the
+// other sheet-backed payloads: the hourly collection
+// precomputes it (see precomputeReadCaches_), so a read
+// normally never opens the sheet. On a miss the response is
+// assembled from the sheet — reading only the newest
+// SNS_HISTORY_MAX_ROWS data rows, never the whole tab: the
+// account tab grows by a row an hour forever, and rows older
+// than the cap were sliced away after the read anyway.
 function buildSnsHistoryResponse_() {
+  const cache = sheetReadCache_();
+  if (cache) {
+    const hit = getCachedText_(cache, SNS_HISTORY_CACHE_KEY);
+    if (hit) {
+      try {
+        const parsed = JSON.parse(hit);
+        if (parsed && Array.isArray(parsed.rows)) {
+          return parsed;
+        }
+      } catch (err) {
+        // A corrupt cache entry is ignored; the history is rebuilt.
+      }
+    }
+  }
+  const response = assembleSnsHistoryResponse_();
+  if (cache) {
+    putCachedText_(
+      cache,
+      SNS_HISTORY_CACHE_KEY,
+      JSON.stringify(response),
+      SNS_HISTORY_CACHE_SECONDS
+    );
+  }
+  return response;
+}
+
+function assembleSnsHistoryResponse_(openedSpreadsheet) {
   const empty = { ok: true, action: 'sns_history', rows: [] };
-  const sheetId = getScriptProperty_(SNS_HISTORY_SHEET_ID_PROPERTY);
-  if (!sheetId) {
+  const spreadsheet = openedSpreadsheet || openHistorySpreadsheet_();
+  if (!spreadsheet) {
     return empty;
   }
-  const sheet = SpreadsheetApp.openById(sheetId).getSheetByName('account');
+  const sheet = spreadsheet.getSheetByName('account');
   if (!sheet || sheet.getLastRow() < 2) {
     return empty;
   }
-  const values = sheet
-    .getRange(1, 1, sheet.getLastRow(), SNS_HISTORY_ACCOUNT_COLUMNS.length)
-    .getValues();
-  const header = values[0].map((cell) => String(cell));
+  const lastRow = sheet.getLastRow();
+  const firstDataRow = Math.max(2, lastRow - SNS_HISTORY_MAX_ROWS + 1);
+  const header = sheet
+    .getRange(1, 1, 1, SNS_HISTORY_ACCOUNT_COLUMNS.length)
+    .getValues()[0]
+    .map((cell) => String(cell));
+  const values = [header].concat(
+    sheet
+      .getRange(
+        firstDataRow,
+        1,
+        lastRow - firstDataRow + 1,
+        SNS_HISTORY_ACCOUNT_COLUMNS.length
+      )
+      .getValues()
+  );
   const columnIndex = {};
   SNS_HISTORY_RESPONSE_COLUMNS.forEach((column) => {
     const index = header.indexOf(column);
@@ -4150,17 +4254,21 @@ function buildSnsHistoryResponse_() {
 // spreadsheet, so rendering the screen never calls the Meta /
 // GA4 / YouTube APIs: the hourly collection is the only API
 // client, and the builders below only read sheets. Reads are
-// cached in CacheService for a few minutes (the numbers are at
-// most one collection — an hour — old anyway; that trade is
-// the design). A sheet that cannot be read degrades to the
-// stored snapshot (SNS detail) or to an explicit "not
-// collected yet" error (blog reports), never to a live API
-// call made for the screen.
+// cached in CacheService for an hour — the numbers only
+// change at the hourly collection anyway, and the collection
+// itself precomputes the payloads into the cache (see
+// precomputeReadCaches_), so in the steady state a read never
+// touches the sheet at all. A sheet that cannot be read
+// degrades to the stored snapshot (SNS detail) or to an
+// explicit "not collected yet" error (blog reports), never
+// to a live API call made for the screen.
 
 const SNS_DETAIL_CACHE_KEY = 'sns_detail_sheet_v1';
-const SNS_DETAIL_CACHE_SECONDS = 300;
+const SNS_DETAIL_CACHE_SECONDS = 3600;
+const SNS_HISTORY_CACHE_KEY = 'sns_history_sheet_v1';
+const SNS_HISTORY_CACHE_SECONDS = 3600;
 const BLOG_REPORT_CACHE_KEY_PREFIX = 'blog_report_sheet_v1_';
-const BLOG_REPORT_CACHE_SECONDS = 300;
+const BLOG_REPORT_CACHE_SECONDS = 3600;
 
 // The script cache, or null when CacheService is unavailable
 // (unit tests, a bare editor run) — caching is always optional
@@ -4170,6 +4278,76 @@ function sheetReadCache_() {
     return typeof CacheService !== 'undefined'
       ? CacheService.getScriptCache()
       : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// CacheService caps one value at 100KB, and the assembled
+// payloads can outgrow that (the SNS detail carries dozens of
+// captions; the history grows to hundreds of rows). Payload
+// texts are therefore stored split into chunks of
+// PAYLOAD_CACHE_CHUNK_CHARS characters under "<key>#<index>",
+// with the chunk count under "<key>#count" written last, so
+// a reader can never assemble a half-written value: a missing
+// or corrupt chunk simply reads as a cache miss, and the
+// caller rebuilds from the sheet exactly as before. The chunk
+// size stays well under the byte cap even for text that is
+// three bytes per character in UTF-8.
+const PAYLOAD_CACHE_CHUNK_CHARS = 30000;
+const PAYLOAD_CACHE_MAX_CHUNKS = 40;
+
+function putCachedText_(cache, key, text, ttlSeconds) {
+  if (!cache || typeof text !== 'string') {
+    return false;
+  }
+  try {
+    const chunks = [];
+    for (
+      let index = 0;
+      index < text.length;
+      index += PAYLOAD_CACHE_CHUNK_CHARS
+    ) {
+      chunks.push(text.slice(index, index + PAYLOAD_CACHE_CHUNK_CHARS));
+    }
+    if (chunks.length === 0) {
+      chunks.push('');
+    }
+    if (chunks.length > PAYLOAD_CACHE_MAX_CHUNKS) {
+      return false;
+    }
+    chunks.forEach((chunk, index) => {
+      cache.put(key + '#' + index, chunk, ttlSeconds);
+    });
+    cache.put(key + '#count', String(chunks.length), ttlSeconds);
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+function getCachedText_(cache, key) {
+  if (!cache) {
+    return null;
+  }
+  try {
+    const count = Number(cache.get(key + '#count'));
+    if (
+      !Number.isInteger(count) ||
+      count < 1 ||
+      count > PAYLOAD_CACHE_MAX_CHUNKS
+    ) {
+      return null;
+    }
+    const parts = [];
+    for (let index = 0; index < count; index++) {
+      const part = cache.get(key + '#' + index);
+      if (typeof part !== 'string') {
+        return null;
+      }
+      parts.push(part);
+    }
+    return parts.join('');
   } catch (err) {
     return null;
   }
@@ -4203,6 +4381,32 @@ function readHistoryTabObjects_(spreadsheet, name, columns) {
     });
     return row;
   });
+}
+
+// Reads only the last data row of a history tab, as a row
+// object. Returns undefined when the tab does not exist, null
+// when it holds no data rows. The account tab is append-only
+// and chronological, so its last row is the newest collection
+// — the one consumer (the SNS detail) needs nothing older,
+// and reading the whole tab for it would grow by a row an
+// hour forever.
+function readHistoryTabLastRowObject_(spreadsheet, name, columns) {
+  const sheet = spreadsheet.getSheetByName(name);
+  if (!sheet) {
+    return undefined;
+  }
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    return null;
+  }
+  const cells = sheet
+    .getRange(lastRow, 1, 1, columns.length)
+    .getValues()[0];
+  const row = {};
+  columns.forEach((column, index) => {
+    row[column] = cells[index];
+  });
+  return row;
 }
 
 // A text cell as a string, or null when it holds nothing.
@@ -4282,22 +4486,40 @@ function latestBatchRows_(rows) {
 // detail never carries them; and daily_follows lists only the
 // days that carry a value (days null on both sides were never
 // written), so daily_follows_missing_days stays null too.
-function buildSnsDetailFromSheet_() {
-  const spreadsheet = openHistorySpreadsheet_();
+function buildSnsDetailFromSheet_(openedSpreadsheet) {
+  const spreadsheet = openedSpreadsheet || openHistorySpreadsheet_();
   if (!spreadsheet) {
     return null;
   }
-  const accountRows = readHistoryTabObjects_(
+  // The detail is built around the newest account row only:
+  // read just the tab's last row, and fall back to scanning
+  // the whole tab only when that row carries no timestamp
+  // (a leftover of a partial write, say).
+  let latest = null;
+  const lastAccountRow = readHistoryTabLastRowObject_(
     spreadsheet,
     'account',
     SNS_HISTORY_ACCOUNT_COLUMNS
   );
-  if (!accountRows || !accountRows.length) {
-    return null;
+  if (lastAccountRow) {
+    const at = historyTimestampOrNull_(lastAccountRow.collected_at);
+    if (at) {
+      latest = { row: lastAccountRow, collected_at: at };
+    }
   }
-  const latest = latestAccountRow_(accountRows);
   if (!latest) {
-    return null;
+    const accountRows = readHistoryTabObjects_(
+      spreadsheet,
+      'account',
+      SNS_HISTORY_ACCOUNT_COLUMNS
+    );
+    if (!accountRows || !accountRows.length) {
+      return null;
+    }
+    latest = latestAccountRow_(accountRows);
+    if (!latest) {
+      return null;
+    }
   }
   const account = latest.row;
   const num = snsHistoryNumberCell_;
@@ -4703,7 +4925,8 @@ function blogSourcesData_(spreadsheet, params) {
 // called. Unsupported parameter combinations, and a sheet
 // that holds no data yet, answer ok:false instead of falling
 // back to a live call. The full (unsliced) payload is cached
-// per shape for a few minutes; the limit/offset slicing
+// per shape for an hour — and the hourly collection
+// precomputes the screen's shapes; the limit/offset slicing
 // happens per request, after the cache.
 function buildBlogReportResponse_(params, shareSession) {
   const shape = blogReportShape_(params);
@@ -4740,7 +4963,7 @@ function buildBlogReportResponse_(params, shareSession) {
     (shape === 'daily' ? '_' + startKey + '_' + endKey : '');
   let data = null;
   if (cache) {
-    const hit = cache.get(cacheKey);
+    const hit = getCachedText_(cache, cacheKey);
     if (hit) {
       try {
         data = JSON.parse(hit);
@@ -4774,15 +4997,12 @@ function buildBlogReportResponse_(params, shareSession) {
       data = null;
     }
     if (data && cache) {
-      try {
-        cache.put(
-          cacheKey,
-          JSON.stringify(data),
-          BLOG_REPORT_CACHE_SECONDS
-        );
-      } catch (err) {
-        // Oversized payloads simply go uncached.
-      }
+      putCachedText_(
+        cache,
+        cacheKey,
+        JSON.stringify(data),
+        BLOG_REPORT_CACHE_SECONDS
+      );
     }
   }
   if (!data) {
@@ -4807,6 +5027,105 @@ function buildBlogReportResponse_(params, shareSession) {
     _share: shareSession ? { expires_at: shareSession.expires_at } : undefined,
     data: limited,
   };
+}
+
+// --- Collection-time read precompute ---
+// The read side above serves the screen from CacheService;
+// this fills that cache at the one moment the data changes —
+// the end of the hourly collection — so a screen load never
+// pays the sheet reads and assembly at all. Everything here
+// is best-effort: a precompute failure is logged and left for
+// the read path to rebuild from the sheet, exactly as before
+// this step existed. Payloads are stored through the chunked
+// helpers, under the same keys the readers consult.
+function precomputeReadCaches_() {
+  const cache = sheetReadCache_();
+  if (!cache) {
+    return;
+  }
+  const spreadsheet = openHistorySpreadsheet_();
+  if (!spreadsheet) {
+    return;
+  }
+  try {
+    const detail = buildSnsDetailFromSheet_(spreadsheet);
+    if (detail) {
+      putCachedText_(
+        cache,
+        SNS_DETAIL_CACHE_KEY,
+        JSON.stringify(detail),
+        SNS_DETAIL_CACHE_SECONDS
+      );
+    }
+  } catch (err) {
+    console.log('SNS detail precompute failed: ' + err);
+  }
+  try {
+    putCachedText_(
+      cache,
+      SNS_HISTORY_CACHE_KEY,
+      JSON.stringify(assembleSnsHistoryResponse_(spreadsheet)),
+      SNS_HISTORY_CACHE_SECONDS
+    );
+  } catch (err) {
+    console.log('SNS history precompute failed: ' + err);
+  }
+  // The blog shapes the screen asks for: the totals (always
+  // three metrics) and the daily series over the default
+  // window, plus the pages / sources rankings at the metric
+  // widths the screen uses. Any other parameter combination
+  // simply misses here and is cached by its first read, as
+  // before.
+  const blogShapes = [
+    ['totals', 3, () => blogTotalsData_(spreadsheet)],
+    [
+      'daily',
+      1,
+      () => {
+        const nowMs = Date.now();
+        const startKey = resolveBlogDateKey_('28daysAgo', nowMs);
+        const endKey = resolveBlogDateKey_('today', nowMs);
+        return startKey && endKey
+          ? {
+              data: blogDailyData_(spreadsheet, startKey, endKey),
+              dates: [startKey, endKey],
+            }
+          : null;
+      },
+    ],
+    ['pages', 1, () => blogPagesData_(spreadsheet, { metrics: [0] })],
+    ['pages', 3, () => blogPagesData_(spreadsheet, { metrics: [0, 0, 0] })],
+    ['sources', 1, () => blogSourcesData_(spreadsheet, { metrics: [0] })],
+    [
+      'sources',
+      3,
+      () => blogSourcesData_(spreadsheet, { metrics: [0, 0, 0] }),
+    ],
+  ];
+  blogShapes.forEach(([shape, metricsLength, build]) => {
+    try {
+      const built = build();
+      if (!built) {
+        return;
+      }
+      const data = built.data !== undefined ? built.data : built;
+      if (!data) {
+        return;
+      }
+      let key = BLOG_REPORT_CACHE_KEY_PREFIX + shape + '_' + metricsLength;
+      if (built.dates) {
+        key += '_' + built.dates[0] + '_' + built.dates[1];
+      }
+      putCachedText_(
+        cache,
+        key,
+        JSON.stringify(data),
+        BLOG_REPORT_CACHE_SECONDS
+      );
+    } catch (err) {
+      console.log('Blog ' + shape + ' precompute failed: ' + err);
+    }
+  });
 }
 
 // Trigger target: collects the latest follower counts and stores the
@@ -4916,6 +5235,14 @@ function collectSnsCounts() {
   );
   appendSnsHistory_(snapshot);
   appendBlogHistory_();
+  // The history writes above are the only moments the read
+  // payloads can change, so rebuild them into the read cache
+  // here; screen loads then never assemble from the sheet.
+  try {
+    precomputeReadCaches_();
+  } catch (err) {
+    console.log('Read cache precompute failed: ' + err);
+  }
   console.log('SNS counts collected: ' + JSON.stringify(snapshot));
   return snapshot;
 }
@@ -5303,6 +5630,11 @@ if (typeof exports !== 'undefined') {
   exports.buildBlogSourcesRows_ = buildBlogSourcesRows_;
   exports.openHistorySpreadsheet_ = openHistorySpreadsheet_;
   exports.readHistoryTabObjects_ = readHistoryTabObjects_;
+  exports.readHistoryTabLastRowObject_ = readHistoryTabLastRowObject_;
+  exports.getCachedText_ = getCachedText_;
+  exports.putCachedText_ = putCachedText_;
+  exports.assembleSnsHistoryResponse_ = assembleSnsHistoryResponse_;
+  exports.precomputeReadCaches_ = precomputeReadCaches_;
   exports.latestAccountRow_ = latestAccountRow_;
   exports.latestBatchRows_ = latestBatchRows_;
   exports.buildSnsDetailFromSheet_ = buildSnsDetailFromSheet_;
