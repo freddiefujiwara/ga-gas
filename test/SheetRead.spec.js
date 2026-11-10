@@ -641,4 +641,134 @@ describe('Sheet-backed read side (stage 2)', () => {
       expect(global.UrlFetchApp.fetch).not.toHaveBeenCalled();
     });
   });
+
+  describe('read performance: chunked cache, bounded reads, precompute', () => {
+    const installCache = () => {
+      const cacheStore = new Map();
+      global.CacheService = {
+        getScriptCache: () => ({
+          get: (key) => (cacheStore.has(key) ? cacheStore.get(key) : null),
+          put: (key, value) => cacheStore.set(key, value),
+          remove: (key) => cacheStore.delete(key),
+        }),
+      };
+      return cacheStore;
+    };
+
+    it('round-trips a payload larger than one cache value', () => {
+      const backing = new Map();
+      const cache = {
+        get: (key) => (backing.has(key) ? backing.get(key) : null),
+        put: (key, value) => backing.set(key, value),
+      };
+      const text = 'x'.repeat(75000) + 'END';
+      expect(Code.putCachedText_(cache, 'k', text, 60)).toBe(true);
+      expect(Code.getCachedText_(cache, 'k')).toBe(text);
+      // A missing chunk reads as a miss, never as a corrupt value.
+      backing.delete('k#1');
+      expect(Code.getCachedText_(cache, 'k')).toBeNull();
+      expect(Code.getCachedText_(cache, 'absent')).toBeNull();
+      // A payload past the chunk cap is refused, not truncated.
+      expect(
+        Code.putCachedText_(cache, 'big', 'y'.repeat(30000 * 41), 60)
+      ).toBe(false);
+      expect(Code.getCachedText_(null, 'k')).toBeNull();
+    });
+
+    it('serves sns_history from the cache without re-reading the sheet', () => {
+      serveTabs({
+        account: [
+          Code.SNS_HISTORY_ACCOUNT_COLUMNS,
+          accountRow({ collected_at: AT_OLD, ig_followers: 1990 }),
+          accountRow({ collected_at: AT_NEW, ig_followers: 2000 }),
+        ],
+      });
+      installCache();
+      const first = Code.buildSnsHistoryResponse_();
+      expect(first.rows).toHaveLength(2);
+      expect(openById).toHaveBeenCalledTimes(1);
+      const second = Code.buildSnsHistoryResponse_();
+      expect(second).toEqual(first);
+      expect(openById).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads only the newest 2400 account rows for sns_history', () => {
+      const rows = [Code.SNS_HISTORY_ACCOUNT_COLUMNS];
+      const total = 2405; // SNS_HISTORY_MAX_ROWS (2400) + 5
+      const base = Date.parse('2026-01-01T00:00:00.000Z');
+      for (let i = 0; i < total; i++) {
+        rows.push(
+          accountRow({
+            collected_at: new Date(base + i * 3600000).toISOString(),
+            ig_followers: i,
+          })
+        );
+      }
+      serveTabs({ account: rows });
+      const response = Code.buildSnsHistoryResponse_();
+      expect(response.rows).toHaveLength(2400);
+      expect(response.rows[0].ig_followers).toBe(5);
+      expect(response.rows[2399].ig_followers).toBe(2404);
+    });
+
+    it('falls back to a full account scan when the last row has no timestamp', () => {
+      const tabs = detailTabs();
+      tabs.account.push(accountRow({ collected_at: '', ig_followers: 9999 }));
+      serveTabs(tabs);
+      const detail = Code.buildSnsDetailFromSheet_();
+      expect(detail.collected_at).toBe(AT_NEW);
+      expect(detail.instagram.freddiefujiwara).toBe(2000);
+    });
+
+    it('precomputeReadCaches_ fills the read caches from the sheet', () => {
+      serveTabs(
+        Object.assign(detailTabs(), {
+          blog_totals: [
+            Code.SNS_HISTORY_BLOG_TOTALS_COLUMNS,
+            ['28d', 4925, 241, 900, AT_NEW],
+          ],
+          blog_daily: [
+            Code.SNS_HISTORY_BLOG_DAILY_COLUMNS,
+            ['2026-11-09', 30, 12, 15, 2500, '', AT_NEW],
+          ],
+          blog_pages: [
+            Code.SNS_HISTORY_BLOG_PAGES_COLUMNS,
+            ['/', 'トップ', 123, AT_NEW],
+          ],
+          blog_sources: [
+            Code.SNS_HISTORY_BLOG_SOURCES_COLUMNS,
+            ['Direct', 300, AT_NEW],
+          ],
+        })
+      );
+      installCache();
+      Code.precomputeReadCaches_();
+      // With the sheet unreachable, every read must be answered
+      // from the precomputed cache alone.
+      global.SpreadsheetApp = {
+        openById: vi.fn(() => {
+          throw new Error('sheet unreachable');
+        }),
+      };
+      const detail = Code.buildSnsDetailResponse_();
+      expect(detail.collected_at).toBe(AT_NEW);
+      expect(detail.instagram.freddiefujiwara).toBe(2000);
+      const history = Code.buildSnsHistoryResponse_();
+      expect(history.rows).toHaveLength(2);
+      const totals = Code.buildBlogReportResponse_(
+        {
+          startDate: '28daysAgo',
+          endDate: 'today',
+          metrics: ['screenPageViews', 'activeUsers', 'sessions'],
+          dimensions: [],
+          limit: 1,
+          offset: 0,
+          filters: [],
+        },
+        null
+      );
+      expect(totals.ok).toBe(true);
+      expect(totals.data.rows[0].metricValues[0].value).toBe('4925');
+    });
+  });
 });
