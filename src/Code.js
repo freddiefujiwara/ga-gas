@@ -22,7 +22,8 @@
  * The default report is served from the history spreadsheet the
  * hourly collection writes (stage 2), in the fixed shapes the
  * /social screen uses — totals, daily views, page ranking,
- * channel ranking — and no longer calls the GA4 Data API.
+ * channel ranking, per-article display times — and no longer
+ * calls the GA4 Data API.
  * Unsupported parameter combinations answer ok:false.
  *
  * Actions:
@@ -3167,6 +3168,18 @@ const SNS_HISTORY_BLOG_SOURCES_COLUMNS = [
   'views_28d',
   'collected_at',
 ];
+// "blog_speed" (key: canonical article path) carries each
+// article's total article_render time and sample count over the
+// last 28 days, from the blog's article_render event (render_ms
+// is the GA4 custom metric 「記事表示時間」). The average is
+// total / samples; articles nobody displayed have no row.
+const SNS_HISTORY_BLOG_SPEED_COLUMNS = [
+  'path',
+  'title',
+  'total_render_ms',
+  'samples',
+  'collected_at',
+];
 // Numbers are written as numbers; anything else (null, undefined,
 // non-finite) becomes an empty cell so the sheet stays sortable.
 function snsHistoryNumCell_(value) {
@@ -3658,6 +3671,12 @@ function appendSnsHistory_(snapshot) {
 //     be summed out of blog_daily; it is collected as-is.
 //   - "blog_sources" (key: channel): the window's views split
 //     by sessionDefaultChannelGroup, for the sources ranking.
+//   - "blog_speed" (key: path): one row per article, carrying
+//     its total article_render time and sample count over the
+//     last 28 days, from the blog's article_render events (the
+//     render_ms custom metric). The screen divides the two for
+//     the average display time; an article with no display in
+//     the window has no row.
 // Both writes are best-effort in the same way as the SNS history:
 // gated on SNS_HISTORY_SHEET_ID and GA4_PROPERTY_ID, and a failure
 // logs one line instead of failing the collection.
@@ -3668,6 +3687,8 @@ const BLOG_DAILY_FETCH_LIMIT = 40;
 const BLOG_SOURCES_FETCH_LIMIT = 100;
 const BLOG_SPEED_EVENT_NAME = 'wv_lcp';
 const BLOG_MUSIC_EVENT_NAME = 'music_play';
+const BLOG_RENDER_EVENT_NAME = 'article_render';
+const BLOG_RENDER_METRIC = 'customEvent:render_ms';
 
 // One runReport call for the blog history: the report's rows, or
 // null when the API did not answer 200 (or the fetch itself
@@ -3968,6 +3989,20 @@ function fetchBlogSourcesData_(propertyId) {
     .sort((a, b) => b.views_28d - a.views_28d);
 }
 
+// One "blog_speed" row per entry of fetchBlogSpeedData_.
+function buildBlogSpeedRows_(entries, collectedAt) {
+  return (entries || []).map((entry) => {
+    const item = entry || {};
+    return [
+      snsHistoryTextCell_(item.path),
+      snsHistoryTextCell_(item.title),
+      snsHistoryNumCell_(item.total_render_ms),
+      snsHistoryNumCell_(item.samples),
+      snsHistoryTextCell_(collectedAt),
+    ];
+  });
+}
+
 // One "blog_posts" row per entry of fetchBlogPostsData_.
 function buildBlogPostsRows_(entries, collectedAt) {
   return (entries || []).map((entry) => {
@@ -4004,6 +4039,79 @@ function buildBlogTotalsRows_(totals, collectedAt) {
       snsHistoryTextCell_(collectedAt),
     ],
   ];
+}
+
+// The blog's per-article display times over the last 28 days:
+// the article_render events' render_ms total and sample count,
+// merged under the canonical /blog/<id> path like blog_posts
+// (the title comes from the path form with the most samples).
+// Returns null when the report failed — while the render_ms
+// custom metric is unregistered in GA4 the API answers an
+// error, which reads as a failed report and simply skips the
+// tab until the first displays arrive.
+function fetchBlogSpeedData_(propertyId) {
+  const rows = fetchBlogReportRows_(propertyId, {
+    startDate: BLOG_POSTS_WINDOW_DAYS + 'daysAgo',
+    endDate: 'today',
+    metrics: [BLOG_RENDER_METRIC, 'eventCount'],
+    dimensions: ['pagePath', 'pageTitle'],
+    limit: BLOG_POSTS_FETCH_LIMIT,
+    offset: 0,
+    filters: parseFilterClauses_(
+      'eventName:exact:' + BLOG_RENDER_EVENT_NAME
+    ),
+  });
+  if (!rows) {
+    return null;
+  }
+  const byPath = {};
+  rows.forEach((row) => {
+    const dimensionValues = (row && row.dimensionValues) || [];
+    const id = articleIdFromPath_(
+      dimensionValues[0] && dimensionValues[0].value
+    );
+    if (!id) {
+      return;
+    }
+    const samples = blogReportMetric_(row, 1) || 0;
+    if (!samples) {
+      return;
+    }
+    const path = '/blog/' + id;
+    const rawTitle = String(
+      (dimensionValues[1] && dimensionValues[1].value) || ''
+    );
+    const title = rawTitle === '(not set)' ? '' : rawTitle;
+    const existing = byPath[path];
+    if (!existing) {
+      byPath[path] = {
+        path,
+        title,
+        total_render_ms: blogReportMetric_(row, 0) || 0,
+        samples,
+        topSamples: samples,
+      };
+      return;
+    }
+    existing.total_render_ms += blogReportMetric_(row, 0) || 0;
+    existing.samples += samples;
+    if (samples > existing.topSamples) {
+      existing.topSamples = samples;
+      existing.title = title;
+    }
+  });
+  return Object.keys(byPath)
+    .map((path) => byPath[path])
+    .map((entry) => ({
+      path: entry.path,
+      title: entry.title,
+      total_render_ms: entry.total_render_ms,
+      samples: entry.samples,
+    }))
+    .sort(
+      (a, b) =>
+        b.total_render_ms / b.samples - a.total_render_ms / a.samples
+    );
 }
 
 // One "blog_sources" row per entry of fetchBlogSourcesData_.
@@ -4095,6 +4203,18 @@ function appendBlogHistory_() {
       );
     } else {
       console.log('Blog history: sources report failed, blog_sources skipped');
+    }
+    const speed = fetchBlogSpeedData_(propertyId);
+    if (speed) {
+      upsertSnsHistorySheet_(
+        spreadsheet,
+        'blog_speed',
+        SNS_HISTORY_BLOG_SPEED_COLUMNS,
+        0,
+        buildBlogSpeedRows_(speed, collectedAt)
+      );
+    } else {
+      console.log('Blog history: speed report failed, blog_speed skipped');
     }
   } catch (err) {
     console.log(
@@ -4753,6 +4873,17 @@ function blogReportShape_(params) {
       ? 'totals'
       : null;
   }
+  // The per-article display-time report: pagePath x the
+  // article_render metric pair (total render_ms, sample count),
+  // served from the blog_speed tab in the same GA4 shape the
+  // live report would return.
+  if (
+    dims.length === 1 &&
+    dims[0] === 'pagePath' &&
+    metrics.join(',') === BLOG_RENDER_METRIC + ',eventCount'
+  ) {
+    return 'speed';
+  }
   if (dims.length !== 1 || metrics[0] !== 'screenPageViews') {
     return null;
   }
@@ -4890,6 +5021,35 @@ function blogPagesData_(spreadsheet, params) {
   };
 }
 
+// The blog_speed tab in the GA4 report shape: one row per
+// article, metricValues [total_render_ms, samples], slowest
+// average first. Articles with no recorded display are absent,
+// exactly like the live report.
+function blogSpeedData_(spreadsheet) {
+  const rows = readHistoryTabObjects_(
+    spreadsheet,
+    'blog_speed',
+    SNS_HISTORY_BLOG_SPEED_COLUMNS
+  );
+  if (!rows) {
+    return null;
+  }
+  const entries = latestBatchRows_(rows)
+    .map((row) => ({
+      path: historyTextOrNull_(row.path),
+      total: snsHistoryNumberCell_(row.total_render_ms),
+      samples: snsHistoryNumberCell_(row.samples),
+    }))
+    .filter((entry) => entry.path && entry.samples)
+    .sort((a, b) => b.total / b.samples - a.total / a.samples);
+  return {
+    rows: entries.map((entry) =>
+      blogReportRow_(entry.path, [entry.total, entry.samples])
+    ),
+    rowCount: entries.length,
+  };
+}
+
 function blogSourcesData_(spreadsheet, params) {
   const rows = readHistoryTabObjects_(
     spreadsheet,
@@ -4984,6 +5144,8 @@ function buildBlogReportResponse_(params, shareSession) {
           data = blogPagesData_(spreadsheet, params);
         } else if (shape === 'sources') {
           data = blogSourcesData_(spreadsheet, params);
+        } else if (shape === 'speed') {
+          data = blogSpeedData_(spreadsheet);
         }
       }
     } catch (err) {
@@ -5101,6 +5263,7 @@ function precomputeReadCaches_() {
       3,
       () => blogSourcesData_(spreadsheet, { metrics: [0, 0, 0] }),
     ],
+    ['speed', 2, () => blogSpeedData_(spreadsheet)],
   ];
   blogShapes.forEach(([shape, metricsLength, build]) => {
     try {
@@ -5628,6 +5791,8 @@ if (typeof exports !== 'undefined') {
   exports.buildBlogTotalsRows_ = buildBlogTotalsRows_;
   exports.fetchBlogSourcesData_ = fetchBlogSourcesData_;
   exports.buildBlogSourcesRows_ = buildBlogSourcesRows_;
+  exports.fetchBlogSpeedData_ = fetchBlogSpeedData_;
+  exports.buildBlogSpeedRows_ = buildBlogSpeedRows_;
   exports.openHistorySpreadsheet_ = openHistorySpreadsheet_;
   exports.readHistoryTabObjects_ = readHistoryTabObjects_;
   exports.readHistoryTabLastRowObject_ = readHistoryTabLastRowObject_;
@@ -5660,4 +5825,5 @@ if (typeof exports !== 'undefined') {
   exports.SNS_HISTORY_BLOG_PAGES_COLUMNS = SNS_HISTORY_BLOG_PAGES_COLUMNS;
   exports.SNS_HISTORY_BLOG_TOTALS_COLUMNS = SNS_HISTORY_BLOG_TOTALS_COLUMNS;
   exports.SNS_HISTORY_BLOG_SOURCES_COLUMNS = SNS_HISTORY_BLOG_SOURCES_COLUMNS;
+  exports.SNS_HISTORY_BLOG_SPEED_COLUMNS = SNS_HISTORY_BLOG_SPEED_COLUMNS;
 }

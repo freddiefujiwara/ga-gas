@@ -556,6 +556,39 @@ describe('Sheet-backed read side (stage 2)', () => {
       ]);
     });
 
+    it('serves the speed shape from blog_speed, slowest average first', () => {
+      serveTabs(
+        Object.assign(blogTabs(), {
+          blog_speed: [
+            Code.SNS_HISTORY_BLOG_SPEED_COLUMNS,
+            ['/blog/9stalearticle00000000000', '古い窓の記事', 999999, 1, AT_OLD],
+            ['/blog/1abcdefghijklmnopqrstuvwx', '記事タイトル', 40000, 20, AT_NEW],
+            ['/blog/2abcdefghijklmnopqrstuvwx', '', 9000, 3, AT_NEW],
+          ],
+        })
+      );
+      const response = Code.buildBlogReportResponse_(
+        paramsFor({
+          metrics: ['customEvent:render_ms', 'eventCount'],
+          dimensions: ['pagePath'],
+          limit: 25,
+        }),
+        null
+      );
+      expect(response.ok).toBe(true);
+      expect(response.data.rowCount).toBe(2);
+      expect(response.data.rows).toEqual([
+        {
+          dimensionValues: [{ value: '/blog/2abcdefghijklmnopqrstuvwx' }],
+          metricValues: [{ value: '9000' }, { value: '3' }],
+        },
+        {
+          dimensionValues: [{ value: '/blog/1abcdefghijklmnopqrstuvwx' }],
+          metricValues: [{ value: '40000' }, { value: '20' }],
+        },
+      ]);
+    });
+
     it('serves the sources shape sorted by views', () => {
       serveTabs(blogTabs());
       const response = Code.buildBlogReportResponse_(

@@ -1396,6 +1396,12 @@ describe('SNS follower counts', () => {
           ga4Row(['20261108'], [240000, 100]),
           ga4Row(['20261109'], [5000, 2]),
         ],
+        render: [
+          ga4Row(['/1abcdefghijklmnopqrstuvwx', '記事タイトルA'], [30000, 10]),
+          ga4Row(['/blog/1abcdefghijklmnopqrstuvwx', '記事タイトルA別形'], [10000, 10]),
+          ga4Row(['/blog/2abcdefghijklmnopqrstuvwx', '(not set)'], [9000, 3]),
+          ga4Row(['/', 'トップ'], [5000, 5]),
+        ],
         posts: [
           ga4Row(['/1abcdefghijklmnopqrstuvwx', '記事タイトルA'], [10]),
           ga4Row(['/blog/1abcdefghijklmnopqrstuvwx', '記事タイトルA別形'], [5]),
@@ -1418,6 +1424,9 @@ describe('SNS follower counts', () => {
         ga4Requests.push(body);
         const dimensions = (body.dimensions || []).map((d) => d.name);
         const filterText = JSON.stringify(body.dimensionFilter || {});
+        if (filterText.includes('article_render')) {
+          return res(200, { rows: bodies.render });
+        }
         if (dimensions.includes('pagePath')) {
           return res(200, { rows: bodies.posts });
         }
@@ -1651,6 +1660,82 @@ describe('SNS follower counts', () => {
     it('returns null for the posts data when the report fails', () => {
       fetchHandler = () => res(500, { error: { message: 'boom' } });
       expect(Code.fetchBlogPostsData_('561730442')).toBeNull();
+    });
+
+    it('merges split article paths for the speed data and sorts by average', () => {
+      mockGa4Blog();
+      const speed = Code.fetchBlogSpeedData_('561730442');
+      expect(speed).toEqual([
+        {
+          path: '/blog/2abcdefghijklmnopqrstuvwx',
+          title: '',
+          total_render_ms: 9000,
+          samples: 3,
+        },
+        {
+          path: '/blog/1abcdefghijklmnopqrstuvwx',
+          title: '記事タイトルA',
+          total_render_ms: 40000,
+          samples: 20,
+        },
+      ]);
+      const renderBody = ga4Requests.find((body) =>
+        JSON.stringify(body.dimensionFilter || {}).includes('article_render')
+      );
+      expect(renderBody.metrics).toEqual([
+        { name: 'customEvent:render_ms' },
+        { name: 'eventCount' },
+      ]);
+    });
+
+    it('returns null for the speed data when the report fails', () => {
+      fetchHandler = () => res(500, { error: { message: 'boom' } });
+      expect(Code.fetchBlogSpeedData_('561730442')).toBeNull();
+    });
+
+    it('builds blog_speed rows with totals and sample counts', () => {
+      const rows = Code.buildBlogSpeedRows_(
+        [
+          {
+            path: '/blog/1abcdefghijklmnopqrstuvwx',
+            title: '記事タイトルA',
+            total_render_ms: 40000,
+            samples: 20,
+          },
+        ],
+        '2026-11-09T03:00:00.000Z'
+      );
+      expect(rows).toEqual([
+        [
+          '/blog/1abcdefghijklmnopqrstuvwx',
+          '記事タイトルA',
+          40000,
+          20,
+          '2026-11-09T03:00:00.000Z',
+        ],
+      ]);
+      expect(Code.buildBlogSpeedRows_(null, 't')).toEqual([]);
+    });
+
+    it('writes the blog_speed tab end to end', () => {
+      mockGa4Blog();
+      Code.appendBlogHistory_();
+      expect(sheets.blog_speed.rows[0]).toEqual(
+        Code.SNS_HISTORY_BLOG_SPEED_COLUMNS
+      );
+      expect(sheets.blog_speed.rows).toHaveLength(3);
+      expect(sheets.blog_speed.rows[1].slice(0, 4)).toEqual([
+        '/blog/2abcdefghijklmnopqrstuvwx',
+        '',
+        9000,
+        3,
+      ]);
+      expect(sheets.blog_speed.rows[2].slice(0, 4)).toEqual([
+        '/blog/1abcdefghijklmnopqrstuvwx',
+        '記事タイトルA',
+        40000,
+        20,
+      ]);
     });
 
     it('writes the blog tabs end to end and upserts on the next run', () => {
