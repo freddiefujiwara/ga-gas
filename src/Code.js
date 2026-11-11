@@ -392,6 +392,62 @@ function validateShareToken_(token) {
   return { expires_at: expiresAt };
 }
 
+// --- Owner sessions (long-lived sign-in) ---
+// Google ID tokens expire after about an hour, which used to drop the
+// owner back at the sign-in gate. After a Google sign-in the frontend
+// exchanges the ID token for one of these 30-day owner sessions (same
+// Script Properties storage as the share session, separate keys) and
+// uses it for all later calls. Issuing a new one overwrites the old
+// one, and the frontend revokes its session on logout.
+
+function issueOwnerSession_() {
+  const now = new Date();
+  const expires = new Date(now.getTime() + SHARE_TTL_SECONDS * 1000);
+  const token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('OWNER_TOKEN_HASH', hashShareToken_(token));
+  props.setProperty('OWNER_EXPIRES_AT', expires.toISOString());
+  return {
+    session_token: token,
+    issued_at: now.toISOString(),
+    expires_at: expires.toISOString(),
+    ttl_seconds: SHARE_TTL_SECONDS,
+  };
+}
+
+function revokeOwnerSession_() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('OWNER_TOKEN_HASH');
+  props.deleteProperty('OWNER_EXPIRES_AT');
+  return { revoked: true };
+}
+
+function validateOwnerToken_(token) {
+  if (!token) {
+    return null;
+  }
+  const props = PropertiesService.getScriptProperties();
+  const hash = props.getProperty('OWNER_TOKEN_HASH');
+  if (!hash || hashShareToken_(token) !== hash) {
+    return null;
+  }
+  const expiresAt = props.getProperty('OWNER_EXPIRES_AT');
+  if (!expiresAt || expiresAt <= new Date().toISOString()) {
+    return null;
+  }
+  return { expires_at: expiresAt };
+}
+
+// Owner proof for owner-only actions: a valid Google ID token, or a
+// live owner session token (the post-sign-in steady state).
+function requireOwnerAuth_(e) {
+  const sessionToken = (e && e.parameter && e.parameter.session_token) || '';
+  if (sessionToken && validateOwnerToken_(sessionToken)) {
+    return;
+  }
+  verifyGoogleIdTokenOrThrow_(extractIdToken_(e));
+}
+
 // Editor helper: issue a token and log the frontend share URL.
 // Useful for bootstrapping before the frontend is deployed.
 function issueShareToken() {
@@ -5715,9 +5771,20 @@ function doGet(e) {
       }
     }
     let shareSession = null;
-    if (parameter.action === 'issue_share' || parameter.action === 'revoke_share') {
+    if (parameter.action === 'exchange_session') {
       try {
         verifyGoogleIdTokenOrThrow_(extractIdToken_(e));
+      } catch (error) {
+        return jsonOut_({ ok: false, status: 401, error: String((error && error.message) || error) });
+      }
+      return jsonOut_(Object.assign({ ok: true }, issueOwnerSession_()));
+    }
+    if (parameter.action === 'revoke_session') {
+      return jsonOut_(Object.assign({ ok: true }, revokeOwnerSession_()));
+    }
+    if (parameter.action === 'issue_share' || parameter.action === 'revoke_share') {
+      try {
+        requireOwnerAuth_(e);
       } catch (error) {
         return jsonOut_({ ok: false, status: 401, error: String((error && error.message) || error) });
       }
@@ -5726,7 +5793,15 @@ function doGet(e) {
       return jsonOut_(Object.assign({ ok: true }, result));
     }
     if (isAuthConfigured_()) {
-      if (parameter.share_token) {
+      if (parameter.session_token) {
+        if (!validateOwnerToken_(parameter.session_token)) {
+          return jsonOut_({
+            ok: false,
+            status: 401,
+            error: 'session expired or invalid',
+          });
+        }
+      } else if (parameter.share_token) {
         shareSession = validateShareToken_(parameter.share_token);
         if (!shareSession) {
           return jsonOut_({
@@ -5778,6 +5853,9 @@ if (typeof exports !== 'undefined') {
   exports.issueShareSession_ = issueShareSession_;
   exports.revokeShareSession_ = revokeShareSession_;
   exports.validateShareToken_ = validateShareToken_;
+  exports.issueOwnerSession_ = issueOwnerSession_;
+  exports.revokeOwnerSession_ = revokeOwnerSession_;
+  exports.validateOwnerToken_ = validateOwnerToken_;
   exports.hashShareToken_ = hashShareToken_;
   exports.isAuthConfigured_ = isAuthConfigured_;
   exports.extractIdToken_ = extractIdToken_;

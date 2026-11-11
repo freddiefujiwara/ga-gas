@@ -713,6 +713,38 @@ describe('Code.js', () => {
       Code.doGet({ parameter: {} });
       expect(lastJson().ok).toBe(true);
     });
+
+    it('owner sessions: exchange issues a 30-day token that serves data', () => {
+      setProperty(PROPERTY_ID);
+      configureAuth();
+      mockAuthFetch({ payload: goodPayload() });
+      mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
+      Code.doGet({ parameter: { action: 'exchange_session' } });
+      expect(lastJson().status).toBe(401);
+      Code.doGet({ parameter: { action: 'exchange_session', id_token: 'token' } });
+      const issued = lastJson();
+      expect(issued.ok).toBe(true);
+      expect(issued.session_token).toMatch(/^[0-9a-f]{64}$/);
+      expect(issued.ttl_seconds).toBe(30 * 24 * 60 * 60);
+      expect(store.OWNER_TOKEN_HASH).toBe(Code.hashShareToken_(issued.session_token));
+      Code.doGet({ parameter: { session_token: issued.session_token } });
+      expect(lastJson().ok).toBe(true);
+      Code.doGet({ parameter: { session_token: 'bogus' } });
+      expect(lastJson()).toEqual({ ok: false, status: 401, error: 'session expired or invalid' });
+    });
+
+    it('owner sessions: revoke clears the token and issue_share accepts a session', () => {
+      setProperty(PROPERTY_ID);
+      configureAuth();
+      mockAuthFetch({ payload: goodPayload() });
+      const token = Code.issueOwnerSession_().session_token;
+      expect(Code.validateOwnerToken_(token)).not.toBeNull();
+      Code.doGet({ parameter: { action: 'issue_share', session_token: token } });
+      expect(lastJson().share_token).toMatch(/^[0-9a-f]{64}$/);
+      Code.doGet({ parameter: { action: 'revoke_session', session_token: token } });
+      expect(lastJson()).toEqual({ ok: true, revoked: true });
+      expect(Code.validateOwnerToken_(token)).toBeNull();
+    });
   });
 
   describe('doGet action=music_count', () => {
