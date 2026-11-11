@@ -5541,6 +5541,100 @@ function htmlOut_(html) {
   );
 }
 
+// --- Smoke records inlet (doPost, action=record_smoke) ---
+// The morning smoke workflow on GitHub Actions measures the
+// static pages, the pinned blog articles and the GAS endpoints
+// from its runner and POSTs one JSON batch here:
+//   { action: 'record_smoke', token,
+//     records: [{ target, kind, ms, ok }] }
+// Rows land in the history spreadsheet's "smoke_records" tab —
+// an append-only log (recorded_at, target, kind, ms, ok) the
+// trend is read from. The token must match the Script Property
+// SMOKE_RECORD_TOKEN; while that property is unset the inlet
+// refuses every batch, so deploying this code alone records
+// nothing. The matching GitHub Actions secret carries the same
+// token; neither side prints it.
+const SMOKE_RECORDS_TAB = 'smoke_records';
+const SMOKE_RECORDS_COLUMNS = ['recorded_at', 'target', 'kind', 'ms', 'ok'];
+const SMOKE_RECORD_TOKEN_PROPERTY = 'SMOKE_RECORD_TOKEN';
+const SMOKE_RECORDS_MAX_BATCH = 100;
+
+function doPost(e) {
+  try {
+    const body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+    if (body && body.action === 'record_smoke') {
+      return jsonOut_(recordSmoke_(body));
+    }
+    return jsonOut_({ ok: false, error: 'unknown action' });
+  } catch (err) {
+    return jsonOut_({ ok: false, error: 'invalid request body' });
+  }
+}
+
+// Validates one record_smoke batch and appends its rows.
+// Refusals are ok:false answers, never throws, so the caller
+// can log the reason; a failed append writes nothing (the
+// batch lands in a single setValues call).
+function recordSmoke_(body) {
+  const expected = getScriptProperty_(SMOKE_RECORD_TOKEN_PROPERTY);
+  if (!expected) {
+    return { ok: false, error: 'smoke recording is not configured' };
+  }
+  if (!body || body.token !== expected) {
+    return { ok: false, error: 'invalid token' };
+  }
+  const sheetId = getScriptProperty_(SNS_HISTORY_SHEET_ID_PROPERTY);
+  if (!sheetId) {
+    return { ok: false, error: 'history sheet is not configured' };
+  }
+  const records = Array.isArray(body.records)
+    ? body.records.slice(0, SMOKE_RECORDS_MAX_BATCH)
+    : [];
+  if (!records.length) {
+    return { ok: false, error: 'no records' };
+  }
+  const recordedAt = new Date().toISOString();
+  const rows = records.map((record) => {
+    const item = record || {};
+    return [
+      recordedAt,
+      String(item.target || ''),
+      String(item.kind || ''),
+      typeof item.ms === 'number' && Number.isFinite(item.ms)
+        ? Math.round(item.ms)
+        : '',
+      item.ok === true ? 'ok' : 'ng',
+    ];
+  });
+  try {
+    const spreadsheet = SpreadsheetApp.openById(sheetId);
+    appendSmokeRows_(spreadsheet, rows);
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'append failed: ' + summarizeSnsHistoryError_(err, sheetId),
+    };
+  }
+  return { ok: true, recorded: rows.length };
+}
+
+// Appends rows to the smoke_records tab, creating it with its
+// header row on first use.
+function appendSmokeRows_(spreadsheet, rows) {
+  let sheet = spreadsheet.getSheetByName(SMOKE_RECORDS_TAB);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(SMOKE_RECORDS_TAB);
+    sheet
+      .getRange(1, 1, 1, SMOKE_RECORDS_COLUMNS.length)
+      .setValues([SMOKE_RECORDS_COLUMNS]);
+  }
+  if (rows.length) {
+    sheet
+      .getRange(sheet.getLastRow() + 1, 1, rows.length, SMOKE_RECORDS_COLUMNS.length)
+      .setValues(rows);
+  }
+}
+
 function doGet(e) {
   try {
     const parameter = (e && e.parameter) || {};
@@ -5793,6 +5887,10 @@ if (typeof exports !== 'undefined') {
   exports.buildBlogSourcesRows_ = buildBlogSourcesRows_;
   exports.fetchBlogSpeedData_ = fetchBlogSpeedData_;
   exports.buildBlogSpeedRows_ = buildBlogSpeedRows_;
+  exports.doPost = doPost;
+  exports.recordSmoke_ = recordSmoke_;
+  exports.appendSmokeRows_ = appendSmokeRows_;
+  exports.SMOKE_RECORDS_COLUMNS = SMOKE_RECORDS_COLUMNS;
   exports.openHistorySpreadsheet_ = openHistorySpreadsheet_;
   exports.readHistoryTabObjects_ = readHistoryTabObjects_;
   exports.readHistoryTabLastRowObject_ = readHistoryTabLastRowObject_;

@@ -1857,6 +1857,102 @@ describe('SNS follower counts', () => {
     });
   });
 
+  describe('Smoke records inlet', () => {
+    let smokeSheets;
+    let smokeSpreadsheet;
+
+    const makeSmokeSheet = () => {
+      const sheet = {
+        rows: [],
+        getRange: (row, col, numRows) => ({
+          setValues: (values) => {
+            values.forEach((r, i) => {
+              sheet.rows[row - 1 + i] = r;
+            });
+          },
+        }),
+        getLastRow: () => sheet.rows.length,
+      };
+      return sheet;
+    };
+
+    const post = (body) =>
+      Code.doPost({ postData: { contents: JSON.stringify(body) } });
+
+    beforeEach(() => {
+      smokeSheets = {};
+      smokeSpreadsheet = {
+        getSheetByName: (name) => smokeSheets[name] || null,
+        insertSheet: (name) => {
+          smokeSheets[name] = makeSmokeSheet();
+          return smokeSheets[name];
+        },
+      };
+      global.SpreadsheetApp = { openById: vi.fn(() => smokeSpreadsheet) };
+      store.SNS_HISTORY_SHEET_ID = 'history-sheet-id';
+      store.SMOKE_RECORD_TOKEN = 'record-token';
+    });
+
+    it('appends a batch to the smoke_records tab, creating the header once', () => {
+      post({
+        action: 'record_smoke',
+        token: 'record-token',
+        records: [
+          { target: 'https://freddiefujiwara.com/map', kind: 'page', ms: 812.6, ok: true },
+          { target: 'blog-prod', kind: 'endpoint', ms: null, ok: false },
+        ],
+      });
+      expect(lastJson()).toEqual({ ok: true, recorded: 2 });
+      const rows = smokeSheets.smoke_records.rows;
+      expect(rows[0]).toEqual(Code.SMOKE_RECORDS_COLUMNS);
+      expect(rows).toHaveLength(3);
+      expect(rows[1].slice(1)).toEqual([
+        'https://freddiefujiwara.com/map',
+        'page',
+        813,
+        'ok',
+      ]);
+      expect(rows[2].slice(1)).toEqual(['blog-prod', 'endpoint', '', 'ng']);
+      expect(typeof rows[1][0]).toBe('string');
+
+      post({
+        action: 'record_smoke',
+        token: 'record-token',
+        records: [{ target: 'x', kind: 'page', ms: 1, ok: true }],
+      });
+      expect(smokeSheets.smoke_records.rows).toHaveLength(4);
+    });
+
+    it('refuses a wrong token and an unconfigured inlet without writing', () => {
+      post({
+        action: 'record_smoke',
+        token: 'wrong',
+        records: [{ target: 'x', kind: 'page', ms: 1, ok: true }],
+      });
+      expect(lastJson()).toEqual({ ok: false, error: 'invalid token' });
+      expect(smokeSheets.smoke_records).toBeUndefined();
+
+      delete store.SMOKE_RECORD_TOKEN;
+      post({
+        action: 'record_smoke',
+        token: 'record-token',
+        records: [{ target: 'x', kind: 'page', ms: 1, ok: true }],
+      });
+      expect(lastJson()).toEqual({
+        ok: false,
+        error: 'smoke recording is not configured',
+      });
+      expect(smokeSheets.smoke_records).toBeUndefined();
+    });
+
+    it('refuses unknown actions and empty batches', () => {
+      post({ action: 'something_else' });
+      expect(lastJson()).toEqual({ ok: false, error: 'unknown action' });
+      post({ action: 'record_smoke', token: 'record-token', records: [] });
+      expect(lastJson()).toEqual({ ok: false, error: 'no records' });
+    });
+  });
+
   describe('doGet action=sns_history', () => {
     const HEADER = Code.SNS_HISTORY_ACCOUNT_COLUMNS;
 
