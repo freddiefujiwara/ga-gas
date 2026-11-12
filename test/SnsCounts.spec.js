@@ -712,11 +712,11 @@ describe('SNS follower counts', () => {
 
     it('returns null subscribers for hidden counts and empty channels', () => {
       mockYouTube({ items: [{ statistics: { hiddenSubscriberCount: true } }] });
-      expect(Code.fetchYouTubeSubscribers_()).toBeNull();
+      expect(Code.fetchYouTubeChannelDetail_().subscribers).toBeNull();
       mockYouTube({ items: [] });
-      expect(Code.fetchYouTubeSubscribers_()).toBeNull();
+      expect(Code.fetchYouTubeChannelDetail_().subscribers).toBeNull();
       mockYouTube({ items: [{ statistics: { subscriberCount: '12' } }] });
-      expect(Code.fetchYouTubeSubscribers_()).toBe(12);
+      expect(Code.fetchYouTubeChannelDetail_().subscribers).toBe(12);
     });
 
     it('survives fetch throwing', () => {
@@ -3386,7 +3386,6 @@ describe('SNS follower counts', () => {
       expect(detail.subscribers).toBeNull();
       expect(detail.recent_videos).toBeNull();
       expect(detail.youtube_error).toBe('YouTube advanced service is unavailable');
-      expect(Code.fetchYouTubeSubscribers_()).toBeNull();
     });
   });
 
