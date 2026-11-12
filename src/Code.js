@@ -1107,12 +1107,6 @@ function parseThreadsInsightsByName_(data) {
   return totals;
 }
 
-function fetchYouTubeSubscribers_() {
-  // Kept as the narrow accessor; the channel fetch itself lives in
-  // fetchYouTubeChannelDetail_() with the rest of the SNS detail.
-  return fetchYouTubeChannelDetail_().subscribers;
-}
-
 // --- X detail (via tweet-gas, GAS-to-GAS sync) ---------------------
 // X's API keys live only in tweet-gas (the project that posts to
 // X); this project never holds them. The hourly collection POSTs
@@ -5900,7 +5894,6 @@ if (typeof exports !== 'undefined') {
   exports.parseThreadsInsightsByName_ = parseThreadsInsightsByName_;
   exports.debugThreadsPosts = debugThreadsPosts;
   exports.debugThreadsFollowers = debugThreadsFollowers;
-  exports.fetchYouTubeSubscribers_ = fetchYouTubeSubscribers_;
   exports.buildSnsDetailResponse_ = buildSnsDetailResponse_;
   exports.buildEmptySnsDetail_ = buildEmptySnsDetail_;
   exports.snsNumberOrNull_ = snsNumberOrNull_;
