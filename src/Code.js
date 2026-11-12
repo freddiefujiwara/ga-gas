@@ -3218,18 +3218,44 @@ const SNS_HISTORY_BLOG_SOURCES_COLUMNS = [
   'views_28d',
   'collected_at',
 ];
-// "blog_speed" (key: canonical article path) carries each
-// article's total article_render time and sample count over the
-// last 28 days, from the blog's article_render event (render_ms
-// is the GA4 custom metric 「記事表示時間」). The average is
-// total / samples; articles nobody displayed have no row.
+// "blog_speed" (key: JST date + canonical article path) carries
+// each article's total article_render time and sample count for
+// one calendar day, from the blog's article_render event
+// (render_ms is the GA4 custom metric 「記事表示時間」). The
+// average is total / samples; articles nobody displayed that
+// day have no row. Every collection re-fetches the whole window
+// day by day, so a day's rows are overwritten with GA4's latest
+// figures while the day is in the window and stay as the final
+// values once it ages out — the same contract as blog_daily.
+// Before this daily shape, the tab held one cumulative row per
+// article over the whole window; those rows are archived under
+// BLOG_SPEED_CUMULATIVE_TAB on the first daily collection (see
+// migrateBlogSpeedTab_) and are never mixed into the daily tab.
+// slow_count counts the day's article_render_slow companion
+// events for the article — the displays that took ten seconds
+// or more — so an average inflated by one stall reads as such.
+// The column rides last so the daily rows keep their cell
+// positions; rows collected before it existed read it as empty.
 const SNS_HISTORY_BLOG_SPEED_COLUMNS = [
+  'date',
+  'path',
+  'title',
+  'total_render_ms',
+  'samples',
+  'collected_at',
+  'slow_count',
+];
+// The pre-daily blog_speed schema (one cumulative row per
+// article, keyed by path alone), kept so the migration can
+// recognize — and stop touching — an already-archived tab.
+const SNS_HISTORY_BLOG_SPEED_CUMULATIVE_COLUMNS = [
   'path',
   'title',
   'total_render_ms',
   'samples',
   'collected_at',
 ];
+const BLOG_SPEED_CUMULATIVE_TAB = 'blog_speed_cumulative';
 // Numbers are written as numbers; anything else (null, undefined,
 // non-finite) becomes an empty cell so the sheet stays sortable.
 function snsHistoryNumCell_(value) {
@@ -3550,15 +3576,20 @@ function readSnsHistoryRows_(sheet, columns) {
 // per key, in first-seen order, where a fresh row's non-empty
 // cells win and its empty cells (the nulls of the fresh fetch)
 // leave the stored values untouched. Rows without a key are
-// dropped on both sides.
+// dropped on both sides. The key is one column index, or an
+// array of indexes for the tabs keyed by more than one column
+// (blog_speed is keyed by date + path); a row missing any part
+// of a composite key is dropped the same way.
 function mergeSnsHistoryRows_(existingRows, newRows, keyIndex) {
+  const keyIndexes = Array.isArray(keyIndex) ? keyIndex : [keyIndex];
   const merged = [];
   const indexByKey = {};
   const absorb = (row) => {
-    const key = snsHistoryKeyCell_(row[keyIndex]);
-    if (!key) {
+    const parts = keyIndexes.map((index) => snsHistoryKeyCell_(row[index]));
+    if (parts.some((part) => !part)) {
       return;
     }
+    const key = parts.join('\u0001');
     if (!(key in indexByKey)) {
       indexByKey[key] = merged.length;
       merged.push(row.slice());
@@ -3721,12 +3752,17 @@ function appendSnsHistory_(snapshot) {
 //     be summed out of blog_daily; it is collected as-is.
 //   - "blog_sources" (key: channel): the window's views split
 //     by sessionDefaultChannelGroup, for the sources ranking.
-//   - "blog_speed" (key: path): one row per article, carrying
-//     its total article_render time and sample count over the
-//     last 28 days, from the blog's article_render events (the
-//     render_ms custom metric). The screen divides the two for
-//     the average display time; an article with no display in
-//     the window has no row.
+//   - "blog_speed" (key: date + path): one row per article per
+//     calendar day, carrying that day's total article_render
+//     time and sample count, from the blog's article_render
+//     events (the render_ms custom metric). The screen divides
+//     the two for the day's average display time; an article
+//     with no display on a day has no row for that day. The
+//     pre-daily cumulative rows live on under the
+//     blog_speed_cumulative tab (see migrateBlogSpeedTab_).
+//     The row also carries the day's article_render_slow count
+//     (displays of ten seconds or more) so a stall-inflated
+//     average is visible as one.
 // Both writes are best-effort in the same way as the SNS history:
 // gated on SNS_HISTORY_SHEET_ID and GA4_PROPERTY_ID, and a failure
 // logs one line instead of failing the collection.
@@ -3739,6 +3775,26 @@ const BLOG_SPEED_EVENT_NAME = 'wv_lcp';
 const BLOG_MUSIC_EVENT_NAME = 'music_play';
 const BLOG_RENDER_EVENT_NAME = 'article_render';
 const BLOG_RENDER_METRIC = 'customEvent:render_ms';
+// The companion event the blog sends alongside article_render
+// when a display takes ten seconds or more. Its per-day,
+// per-article count separates one stalled load from uniformly
+// slow displays in a way the average alone cannot (the map
+// article on 2026-11-12: a 7.5s average from six ~1.8s displays
+// and one 41.8s stall). Counting a named event needs no custom
+// metric.
+const BLOG_RENDER_SLOW_EVENT_NAME = 'article_render_slow';
+// The third metric name the screen's speed report asks for when
+// it wants the slow counts: the sheet bridge serves it from
+// blog_speed's slow_count column. It is a bridge name, not a
+// GA4 metric — the Data API cannot count one named event inside
+// another event's report without a filter, and this bridge
+// serves fixed shapes only.
+const BLOG_RENDER_SLOW_METRIC = 'customEvent:render_slow_count';
+// The daily speed fetch keys rows by date x pagePath x pageTitle,
+// so its row count grows with the window's days in a way the
+// window-only fetches' does not; the cap sits well above the
+// observed volume (a few dozen rows a day) without paging.
+const BLOG_SPEED_DAILY_FETCH_LIMIT = 5000;
 
 // One runReport call for the blog history: the report's rows, or
 // null when the API did not answer 200 (or the fetch itself
@@ -4039,16 +4095,22 @@ function fetchBlogSourcesData_(propertyId) {
     .sort((a, b) => b.views_28d - a.views_28d);
 }
 
-// One "blog_speed" row per entry of fetchBlogSpeedData_.
+// One "blog_speed" row per entry of fetchBlogSpeedDailyData_:
+// one article's display times for one calendar day, with the
+// slow count the caller merged in from fetchBlogSlowCounts_
+// (an unset slow_count writes an empty cell, which the upsert
+// merge reads as "keep the stored count").
 function buildBlogSpeedRows_(entries, collectedAt) {
   return (entries || []).map((entry) => {
     const item = entry || {};
     return [
+      snsHistoryTextCell_(item.date),
       snsHistoryTextCell_(item.path),
       snsHistoryTextCell_(item.title),
       snsHistoryNumCell_(item.total_render_ms),
       snsHistoryNumCell_(item.samples),
       snsHistoryTextCell_(collectedAt),
+      snsHistoryNumCell_(item.slow_count),
     ];
   });
 }
@@ -4091,21 +4153,27 @@ function buildBlogTotalsRows_(totals, collectedAt) {
   ];
 }
 
-// The blog's per-article display times over the last 28 days:
-// the article_render events' render_ms total and sample count,
-// merged under the canonical /blog/<id> path like blog_posts
-// (the title comes from the path form with the most samples).
-// Returns null when the report failed — while the render_ms
-// custom metric is unregistered in GA4 the API answers an
-// error, which reads as a failed report and simply skips the
-// tab until the first displays arrive.
-function fetchBlogSpeedData_(propertyId) {
+// The blog's per-article display times, one entry per calendar
+// day per article over the display window: the article_render
+// events' render_ms total and sample count for that day, merged
+// under the canonical /blog/<id> path like blog_posts (the
+// title comes from the path form with the most samples that
+// day). The window is re-fetched whole on every collection, so
+// days GA4 has not recorded yet simply have no entries — the
+// first daily collection backfills every day the window still
+// covers (back to the render metric's first day), with no
+// separate repair step. Returns null when the report failed —
+// while the render_ms custom metric is unregistered in GA4 the
+// API answers an error, which reads as a failed report and
+// simply skips the tab until the first displays arrive.
+function fetchBlogSpeedDailyData_(propertyId) {
+  const nowMs = Date.now();
   const rows = fetchBlogReportRows_(propertyId, {
-    startDate: BLOG_POSTS_WINDOW_DAYS + 'daysAgo',
-    endDate: 'today',
+    startDate: jstDateKey_(nowMs - BLOG_POSTS_WINDOW_DAYS * SNS_DAY_MS),
+    endDate: jstDateKey_(nowMs),
     metrics: [BLOG_RENDER_METRIC, 'eventCount'],
-    dimensions: ['pagePath', 'pageTitle'],
-    limit: BLOG_POSTS_FETCH_LIMIT,
+    dimensions: ['date', 'pagePath', 'pageTitle'],
+    limit: BLOG_SPEED_DAILY_FETCH_LIMIT,
     offset: 0,
     filters: parseFilterClauses_(
       'eventName:exact:' + BLOG_RENDER_EVENT_NAME
@@ -4114,11 +4182,17 @@ function fetchBlogSpeedData_(propertyId) {
   if (!rows) {
     return null;
   }
-  const byPath = {};
+  const byDayPath = {};
   rows.forEach((row) => {
     const dimensionValues = (row && row.dimensionValues) || [];
-    const id = articleIdFromPath_(
+    const date = ga4DateKey_(
       dimensionValues[0] && dimensionValues[0].value
+    );
+    if (!date) {
+      return;
+    }
+    const id = articleIdFromPath_(
+      dimensionValues[1] && dimensionValues[1].value
     );
     if (!id) {
       return;
@@ -4129,12 +4203,14 @@ function fetchBlogSpeedData_(propertyId) {
     }
     const path = '/blog/' + id;
     const rawTitle = String(
-      (dimensionValues[1] && dimensionValues[1].value) || ''
+      (dimensionValues[2] && dimensionValues[2].value) || ''
     );
     const title = rawTitle === '(not set)' ? '' : rawTitle;
-    const existing = byPath[path];
+    const key = date + '|' + path;
+    const existing = byDayPath[key];
     if (!existing) {
-      byPath[path] = {
+      byDayPath[key] = {
+        date,
         path,
         title,
         total_render_ms: blogReportMetric_(row, 0) || 0,
@@ -4150,18 +4226,118 @@ function fetchBlogSpeedData_(propertyId) {
       existing.title = title;
     }
   });
-  return Object.keys(byPath)
-    .map((path) => byPath[path])
+  return Object.keys(byDayPath)
+    .map((key) => byDayPath[key])
     .map((entry) => ({
+      date: entry.date,
       path: entry.path,
       title: entry.title,
       total_render_ms: entry.total_render_ms,
       samples: entry.samples,
     }))
-    .sort(
-      (a, b) =>
-        b.total_render_ms / b.samples - a.total_render_ms / a.samples
+    .sort((a, b) => {
+      if (a.date !== b.date) {
+        return a.date < b.date ? -1 : 1;
+      }
+      return b.total_render_ms / b.samples - a.total_render_ms / a.samples;
+    });
+}
+
+// The per-day, per-article counts of article_render_slow over
+// the same window as fetchBlogSpeedDailyData_ — how many of
+// each article's displays on each day took ten seconds or
+// more — merged under the canonical /blog/<id> path like the
+// speed data, as { 'yyyy-mm-dd|/blog/<id>': count }. Day +
+// article pairs with no slow display are absent (the caller
+// reads absence as zero). Returns null when the report failed:
+// the caller then leaves the stored counts untouched instead
+// of reporting a false zero.
+function fetchBlogSlowCounts_(propertyId) {
+  const nowMs = Date.now();
+  const rows = fetchBlogReportRows_(propertyId, {
+    startDate: jstDateKey_(nowMs - BLOG_POSTS_WINDOW_DAYS * SNS_DAY_MS),
+    endDate: jstDateKey_(nowMs),
+    metrics: ['eventCount'],
+    dimensions: ['date', 'pagePath'],
+    limit: BLOG_SPEED_DAILY_FETCH_LIMIT,
+    offset: 0,
+    filters: parseFilterClauses_(
+      'eventName:exact:' + BLOG_RENDER_SLOW_EVENT_NAME
+    ),
+  });
+  if (!rows) {
+    return null;
+  }
+  const counts = {};
+  rows.forEach((row) => {
+    const dimensionValues = (row && row.dimensionValues) || [];
+    const date = ga4DateKey_(
+      dimensionValues[0] && dimensionValues[0].value
     );
+    if (!date) {
+      return;
+    }
+    const id = articleIdFromPath_(
+      dimensionValues[1] && dimensionValues[1].value
+    );
+    if (!id) {
+      return;
+    }
+    const count = blogReportMetric_(row, 0) || 0;
+    if (!count) {
+      return;
+    }
+    const key = date + '|/blog/' + id;
+    counts[key] = (counts[key] || 0) + count;
+  });
+  return counts;
+}
+
+// Moves a pre-daily "blog_speed" tab out of the way before the
+// first daily write: while the tab's header still starts with
+// the cumulative schema's "path", the sheet is renamed to the
+// archive tab (BLOG_SPEED_CUMULATIVE_TAB, or the first free
+// numbered variant), so the daily upsert starts from an empty
+// tab and the old cumulative rows are never merged into — or
+// read as — daily ones. A tab already headed "date" (or no tab
+// at all) is left alone, so the migration runs once. Best
+// effort like the rest of the blog history: a failure logs one
+// line and the collection carries on.
+function migrateBlogSpeedTab_(spreadsheet) {
+  try {
+    const sheet = spreadsheet.getSheetByName('blog_speed');
+    if (!sheet || sheet.getLastRow() === 0) {
+      return;
+    }
+    const header = sheet.getRange(1, 1, 1, 1).getValues()[0][0];
+    if (
+      snsHistoryKeyCell_(header) !==
+      SNS_HISTORY_BLOG_SPEED_CUMULATIVE_COLUMNS[0]
+    ) {
+      return;
+    }
+    let archiveName = BLOG_SPEED_CUMULATIVE_TAB;
+    for (
+      let suffix = 2;
+      spreadsheet.getSheetByName(archiveName);
+      suffix++
+    ) {
+      archiveName = BLOG_SPEED_CUMULATIVE_TAB + '_' + suffix;
+    }
+    sheet.setName(archiveName);
+    console.log(
+      'Blog history: archived the cumulative blog_speed tab as ' +
+        archiveName
+    );
+  } catch (err) {
+    console.log(
+      'Blog history: blog_speed migration failed: ' +
+        summarizeSnsHistoryError_(
+          err,
+          getScriptProperty_(SNS_HISTORY_SHEET_ID_PROPERTY)
+        )
+    );
+  }
 }
 
 // One "blog_sources" row per entry of fetchBlogSourcesData_.
@@ -4254,13 +4430,29 @@ function appendBlogHistory_() {
     } else {
       console.log('Blog history: sources report failed, blog_sources skipped');
     }
-    const speed = fetchBlogSpeedData_(propertyId);
+    migrateBlogSpeedTab_(spreadsheet);
+    const speed = fetchBlogSpeedDailyData_(propertyId);
     if (speed) {
+      // The slow counts ride the same rows, keyed by day +
+      // article. A failed slow report leaves slow_count unset
+      // on every entry, and the empty cells keep the stored
+      // counts (the upsert merge), instead of reporting a
+      // false zero for the day.
+      const slowCounts = fetchBlogSlowCounts_(propertyId);
+      if (slowCounts) {
+        speed.forEach((entry) => {
+          entry.slow_count = slowCounts[entry.date + '|' + entry.path] || 0;
+        });
+      } else {
+        console.log(
+          'Blog history: slow report failed, blog_speed slow counts kept'
+        );
+      }
       upsertSnsHistorySheet_(
         spreadsheet,
         'blog_speed',
         SNS_HISTORY_BLOG_SPEED_COLUMNS,
-        0,
+        [0, 1],
         buildBlogSpeedRows_(speed, collectedAt)
       );
     } else {
@@ -4926,11 +5118,17 @@ function blogReportShape_(params) {
   // The per-article display-time report: pagePath x the
   // article_render metric pair (total render_ms, sample count),
   // served from the blog_speed tab in the same GA4 shape the
-  // live report would return.
+  // live report would return. The pair may carry the bridge's
+  // slow-count metric as a third value (the day's
+  // article_render_slow count); the pair alone keeps serving
+  // the two values, so a screen that predates the slow counts
+  // is unaffected.
   if (
     dims.length === 1 &&
     dims[0] === 'pagePath' &&
-    metrics.join(',') === BLOG_RENDER_METRIC + ',eventCount'
+    (metrics.join(',') === BLOG_RENDER_METRIC + ',eventCount' ||
+      metrics.join(',') ===
+        BLOG_RENDER_METRIC + ',eventCount,' + BLOG_RENDER_SLOW_METRIC)
   ) {
     return 'speed';
   }
@@ -5071,11 +5269,21 @@ function blogPagesData_(spreadsheet, params) {
   };
 }
 
-// The blog_speed tab in the GA4 report shape: one row per
-// article, metricValues [total_render_ms, samples], slowest
-// average first. Articles with no recorded display are absent,
-// exactly like the live report.
-function blogSpeedData_(spreadsheet) {
+// The blog_speed tab in the GA4 report shape, for yesterday
+// (JST) only: one row per article, metricValues
+// [total_render_ms, samples], slowest average first. Today's
+// rows are a running total and never served, so the ranking
+// always shows a finished day; articles with no recorded
+// display yesterday are absent, exactly like the live report.
+// The payload carries the served day as `date` next to the GA4
+// rows, so the screen can label the ranking with the day it
+// actually shows (the hour-cached payload can straddle
+// midnight, when the day it holds is no longer yesterday).
+// When the report asked for the slow-count metric as well
+// (metricCount 3), each row carries the day's slow_count as
+// the third value (0 when the tab holds none for it, e.g.
+// rows collected before the column).
+function blogSpeedData_(spreadsheet, metricCount) {
   const rows = readHistoryTabObjects_(
     spreadsheet,
     'blog_speed',
@@ -5084,19 +5292,29 @@ function blogSpeedData_(spreadsheet) {
   if (!rows) {
     return null;
   }
-  const entries = latestBatchRows_(rows)
+  const date = jstDateKey_(Date.now() - SNS_DAY_MS);
+  const entries = rows
+    .filter((row) => snsHistoryKeyCell_(row.date) === date)
     .map((row) => ({
       path: historyTextOrNull_(row.path),
       total: snsHistoryNumberCell_(row.total_render_ms),
       samples: snsHistoryNumberCell_(row.samples),
+      slow: snsHistoryNumberCell_(row.slow_count),
     }))
     .filter((entry) => entry.path && entry.samples)
     .sort((a, b) => b.total / b.samples - a.total / a.samples);
+  const wantsSlow = (metricCount || 2) >= 3;
   return {
     rows: entries.map((entry) =>
-      blogReportRow_(entry.path, [entry.total, entry.samples])
+      blogReportRow_(
+        entry.path,
+        wantsSlow
+          ? [entry.total, entry.samples, entry.slow || 0]
+          : [entry.total, entry.samples]
+      )
     ),
     rowCount: entries.length,
+    date,
   };
 }
 
@@ -5195,7 +5413,7 @@ function buildBlogReportResponse_(params, shareSession) {
         } else if (shape === 'sources') {
           data = blogSourcesData_(spreadsheet, params);
         } else if (shape === 'speed') {
-          data = blogSpeedData_(spreadsheet);
+          data = blogSpeedData_(spreadsheet, params.metrics.length);
         }
       }
     } catch (err) {
@@ -5313,7 +5531,8 @@ function precomputeReadCaches_() {
       3,
       () => blogSourcesData_(spreadsheet, { metrics: [0, 0, 0] }),
     ],
-    ['speed', 2, () => blogSpeedData_(spreadsheet)],
+    ['speed', 2, () => blogSpeedData_(spreadsheet, 2)],
+    ['speed', 3, () => blogSpeedData_(spreadsheet, 3)],
   ];
   blogShapes.forEach(([shape, metricsLength, build]) => {
     try {
@@ -5956,7 +6175,9 @@ if (typeof exports !== 'undefined') {
   exports.buildBlogTotalsRows_ = buildBlogTotalsRows_;
   exports.fetchBlogSourcesData_ = fetchBlogSourcesData_;
   exports.buildBlogSourcesRows_ = buildBlogSourcesRows_;
-  exports.fetchBlogSpeedData_ = fetchBlogSpeedData_;
+  exports.fetchBlogSpeedDailyData_ = fetchBlogSpeedDailyData_;
+  exports.fetchBlogSlowCounts_ = fetchBlogSlowCounts_;
+  exports.migrateBlogSpeedTab_ = migrateBlogSpeedTab_;
   exports.buildBlogSpeedRows_ = buildBlogSpeedRows_;
   exports.doPost = doPost;
   exports.recordSmoke_ = recordSmoke_;
@@ -5995,4 +6216,7 @@ if (typeof exports !== 'undefined') {
   exports.SNS_HISTORY_BLOG_TOTALS_COLUMNS = SNS_HISTORY_BLOG_TOTALS_COLUMNS;
   exports.SNS_HISTORY_BLOG_SOURCES_COLUMNS = SNS_HISTORY_BLOG_SOURCES_COLUMNS;
   exports.SNS_HISTORY_BLOG_SPEED_COLUMNS = SNS_HISTORY_BLOG_SPEED_COLUMNS;
+  exports.SNS_HISTORY_BLOG_SPEED_CUMULATIVE_COLUMNS =
+    SNS_HISTORY_BLOG_SPEED_CUMULATIVE_COLUMNS;
+  exports.BLOG_SPEED_CUMULATIVE_TAB = BLOG_SPEED_CUMULATIVE_TAB;
 }
