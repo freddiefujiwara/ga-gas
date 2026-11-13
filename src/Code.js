@@ -4278,11 +4278,16 @@ function appendBlogHistory_() {
 // The authenticated counterpart of the append above: the /ga
 // trend charts read the "account" sheet back through this action.
 // Only the columns the charts need are served, and the response is
-// capped at the newest 2400 rows (about 100 days at hourly
-// collections — the cap counts rows, so it grew with the move from
-// 6-hourly to hourly collection to keep the same window). An
-// unset property or a missing/empty sheet is not an
-// error: the history simply has not started yet, so rows is [].
+// capped at the newest 6600 rows (about 275 days at hourly
+// collections). The window is sized by what the front asks for:
+// the Instagram trend's longest period is 180 days, and its
+// 全期間 option plots everything served, so the cap is a safety
+// valve rather than the period selector — the front slices the
+// days it shows. A full window serializes to roughly 3.1M
+// characters (about 460 per row), which is also why the payload
+// cache chunk cap below sits at 120. An unset property or a
+// missing/empty sheet is not an error: the history simply has
+// not started yet, so rows is [].
 
 const SNS_HISTORY_RESPONSE_COLUMNS = [
   'collected_at',
@@ -4306,7 +4311,7 @@ const SNS_HISTORY_RESPONSE_COLUMNS = [
   'yt_total_views',
   'x_followers',
 ];
-const SNS_HISTORY_MAX_ROWS = 2400;
+const SNS_HISTORY_MAX_ROWS = 6600;
 
 // Sheets hands date cells back as Date objects and numbers as
 // numbers, while untouched cells come back as ''. Normalize to the
@@ -4470,9 +4475,11 @@ function sheetReadCache_() {
 // or corrupt chunk simply reads as a cache miss, and the
 // caller rebuilds from the sheet exactly as before. The chunk
 // size stays well under the byte cap even for text that is
-// three bytes per character in UTF-8.
+// three bytes per character in UTF-8. The chunk cap leaves
+// room for the largest payload, the SNS history at its full
+// 6600-row window (roughly 3.1M characters, ~103 chunks).
 const PAYLOAD_CACHE_CHUNK_CHARS = 30000;
-const PAYLOAD_CACHE_MAX_CHUNKS = 40;
+const PAYLOAD_CACHE_MAX_CHUNKS = 120;
 
 function putCachedText_(cache, key, text, ttlSeconds) {
   if (!cache || typeof text !== 'string') {
