@@ -213,8 +213,9 @@ function fetchTopArticles_(propertyId) {
 // (share_token parameter). The share token travels in the frontend URL
 // hash fragment (#share=...), so it never reaches servers or referrers.
 // issue_share / revoke_share actions require an ID token.
-// While the two properties above are unset, authentication is skipped
-// (migration period only; production runs with them set).
+// Authentication is always required for the private actions below:
+// when the two properties above are unset, token verification fails
+// and the request is rejected (fail closed).
 
 function getScriptProperty_(key) {
   return PropertiesService.getScriptProperties().getProperty(key) || '';
@@ -395,96 +396,18 @@ function validateShareToken_(token) {
 // --- Owner sessions (long-lived sign-in) ---
 // Google ID tokens expire after about an hour, which used to drop the
 // owner back at the sign-in gate. After a Google sign-in the frontend
-// exchanges the ID token for one of these 30-day owner sessions and
-// uses it for all later calls. The frontend revokes only its own
-// session on logout.
-//
-// Storage: a JSON map in the Script Property OWNER_SESSIONS, of the
-// form { "<sha256 hash of token>": "<expires_at ISO>", ... }.
-// Owner sessions coexist across devices and browsers: issuing a new
-// one adds an entry and does NOT overwrite or revoke the others
-// (unlike share sessions, where reissuing must invalidate the old
-// link -- that behaviour is unchanged and lives in separate keys).
-// A Script Property map is used instead of a sheet tab because this
-// app's history spreadsheet is optional (SNS_HISTORY_SHEET_ID may be
-// unset, in which case SpreadsheetApp is never touched), while auth
-// must work regardless; share and owner sessions have always lived
-// in Script Properties here. Each entry is about 100 bytes, expired
-// entries are pruned on load, and the map is capped at
-// OWNER_SESSIONS_MAX newest entries, so it stays far below the
-// per-property size limit. The property is created by this code on
-// first issue, so no manual property setup is needed.
-//
-// Backward compatibility: the previous single-session keys
-// OWNER_TOKEN_HASH / OWNER_EXPIRES_AT are still honoured.
-// loadOwnerSessions_() merges a live legacy entry into the map in
-// memory, so a token issued before this change keeps working until
-// its own 30-day expiry; issueOwnerSession_() then persists the
-// merged map and deletes the legacy keys (the migration).
-
-const OWNER_SESSIONS_PROPERTY = 'OWNER_SESSIONS';
-const OWNER_SESSIONS_MAX = 10;
-
-function loadOwnerSessions_(props) {
-  const nowIso = new Date().toISOString();
-  const sessions = {};
-  try {
-    const parsed = JSON.parse(props.getProperty(OWNER_SESSIONS_PROPERTY) || '{}');
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      for (const hash of Object.keys(parsed)) {
-        const expiresAt = parsed[hash];
-        if (typeof expiresAt === 'string' && expiresAt > nowIso) {
-          sessions[hash] = expiresAt;
-        }
-      }
-    }
-  } catch (err) {
-    // A corrupt map must not lock the owner out: start from an
-    // empty map; a live legacy entry below is still merged in.
-  }
-  const legacyHash = props.getProperty('OWNER_TOKEN_HASH');
-  const legacyExpiresAt = props.getProperty('OWNER_EXPIRES_AT');
-  if (
-    legacyHash &&
-    legacyExpiresAt &&
-    legacyExpiresAt > nowIso &&
-    !(legacyHash in sessions)
-  ) {
-    sessions[legacyHash] = legacyExpiresAt;
-  }
-  return sessions;
-}
-
-function saveOwnerSessions_(props, sessions) {
-  let entries = Object.entries(sessions);
-  if (entries.length > OWNER_SESSIONS_MAX) {
-    entries.sort((a, b) => (a[1] < b[1] ? 1 : a[1] > b[1] ? -1 : 0));
-    entries = entries.slice(0, OWNER_SESSIONS_MAX);
-  }
-  if (!entries.length) {
-    props.deleteProperty(OWNER_SESSIONS_PROPERTY);
-    return {};
-  }
-  const trimmed = {};
-  for (const [hash, expiresAt] of entries) {
-    trimmed[hash] = expiresAt;
-  }
-  props.setProperty(OWNER_SESSIONS_PROPERTY, JSON.stringify(trimmed));
-  return trimmed;
-}
+// exchanges the ID token for one of these 30-day owner sessions (same
+// Script Properties storage as the share session, separate keys) and
+// uses it for all later calls. Issuing a new one overwrites the old
+// one, and the frontend revokes its session on logout.
 
 function issueOwnerSession_() {
   const now = new Date();
   const expires = new Date(now.getTime() + SHARE_TTL_SECONDS * 1000);
   const token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
   const props = PropertiesService.getScriptProperties();
-  const sessions = loadOwnerSessions_(props);
-  sessions[hashShareToken_(token)] = expires.toISOString();
-  saveOwnerSessions_(props, sessions);
-  // The merged map now carries any legacy session, so the old
-  // single-session keys are removed (the migration step).
-  props.deleteProperty('OWNER_TOKEN_HASH');
-  props.deleteProperty('OWNER_EXPIRES_AT');
+  props.setProperty('OWNER_TOKEN_HASH', hashShareToken_(token));
+  props.setProperty('OWNER_EXPIRES_AT', expires.toISOString());
   return {
     session_token: token,
     issued_at: now.toISOString(),
@@ -493,22 +416,10 @@ function issueOwnerSession_() {
   };
 }
 
-function revokeOwnerSession_(token) {
+function revokeOwnerSession_() {
   const props = PropertiesService.getScriptProperties();
-  if (token) {
-    const hash = hashShareToken_(token);
-    const sessions = loadOwnerSessions_(props);
-    if (hash in sessions) {
-      delete sessions[hash];
-      saveOwnerSessions_(props, sessions);
-    }
-    if (props.getProperty('OWNER_TOKEN_HASH') === hash) {
-      props.deleteProperty('OWNER_TOKEN_HASH');
-      props.deleteProperty('OWNER_EXPIRES_AT');
-    }
-  }
-  // Without a token the session to revoke cannot be identified, so
-  // no other session is touched (mirrors health-gas).
+  props.deleteProperty('OWNER_TOKEN_HASH');
+  props.deleteProperty('OWNER_EXPIRES_AT');
   return { revoked: true };
 }
 
@@ -517,9 +428,12 @@ function validateOwnerToken_(token) {
     return null;
   }
   const props = PropertiesService.getScriptProperties();
-  const sessions = loadOwnerSessions_(props);
-  const expiresAt = sessions[hashShareToken_(token)];
-  if (!expiresAt) {
+  const hash = props.getProperty('OWNER_TOKEN_HASH');
+  if (!hash || hashShareToken_(token) !== hash) {
+    return null;
+  }
+  const expiresAt = props.getProperty('OWNER_EXPIRES_AT');
+  if (!expiresAt || expiresAt <= new Date().toISOString()) {
     return null;
   }
   return { expires_at: expiresAt };
@@ -3305,44 +3219,18 @@ const SNS_HISTORY_BLOG_SOURCES_COLUMNS = [
   'views_28d',
   'collected_at',
 ];
-// "blog_speed" (key: JST date + canonical article path) carries
-// each article's total article_render time and sample count for
-// one calendar day, from the blog's article_render event
-// (render_ms is the GA4 custom metric 「記事表示時間」). The
-// average is total / samples; articles nobody displayed that
-// day have no row. Every collection re-fetches the whole window
-// day by day, so a day's rows are overwritten with GA4's latest
-// figures while the day is in the window and stay as the final
-// values once it ages out — the same contract as blog_daily.
-// Before this daily shape, the tab held one cumulative row per
-// article over the whole window; those rows are archived under
-// BLOG_SPEED_CUMULATIVE_TAB on the first daily collection (see
-// migrateBlogSpeedTab_) and are never mixed into the daily tab.
-// slow_count counts the day's article_render_slow companion
-// events for the article — the displays that took ten seconds
-// or more — so an average inflated by one stall reads as such.
-// The column rides last so the daily rows keep their cell
-// positions; rows collected before it existed read it as empty.
+// "blog_speed" (key: canonical article path) carries each
+// article's total article_render time and sample count over the
+// last 28 days, from the blog's article_render event (render_ms
+// is the GA4 custom metric 「記事表示時間」). The average is
+// total / samples; articles nobody displayed have no row.
 const SNS_HISTORY_BLOG_SPEED_COLUMNS = [
-  'date',
-  'path',
-  'title',
-  'total_render_ms',
-  'samples',
-  'collected_at',
-  'slow_count',
-];
-// The pre-daily blog_speed schema (one cumulative row per
-// article, keyed by path alone), kept so the migration can
-// recognize — and stop touching — an already-archived tab.
-const SNS_HISTORY_BLOG_SPEED_CUMULATIVE_COLUMNS = [
   'path',
   'title',
   'total_render_ms',
   'samples',
   'collected_at',
 ];
-const BLOG_SPEED_CUMULATIVE_TAB = 'blog_speed_cumulative';
 // Numbers are written as numbers; anything else (null, undefined,
 // non-finite) becomes an empty cell so the sheet stays sortable.
 function snsHistoryNumCell_(value) {
@@ -3663,20 +3551,15 @@ function readSnsHistoryRows_(sheet, columns) {
 // per key, in first-seen order, where a fresh row's non-empty
 // cells win and its empty cells (the nulls of the fresh fetch)
 // leave the stored values untouched. Rows without a key are
-// dropped on both sides. The key is one column index, or an
-// array of indexes for the tabs keyed by more than one column
-// (blog_speed is keyed by date + path); a row missing any part
-// of a composite key is dropped the same way.
+// dropped on both sides.
 function mergeSnsHistoryRows_(existingRows, newRows, keyIndex) {
-  const keyIndexes = Array.isArray(keyIndex) ? keyIndex : [keyIndex];
   const merged = [];
   const indexByKey = {};
   const absorb = (row) => {
-    const parts = keyIndexes.map((index) => snsHistoryKeyCell_(row[index]));
-    if (parts.some((part) => !part)) {
+    const key = snsHistoryKeyCell_(row[keyIndex]);
+    if (!key) {
       return;
     }
-    const key = parts.join('\u0001');
     if (!(key in indexByKey)) {
       indexByKey[key] = merged.length;
       merged.push(row.slice());
@@ -3839,17 +3722,12 @@ function appendSnsHistory_(snapshot) {
 //     be summed out of blog_daily; it is collected as-is.
 //   - "blog_sources" (key: channel): the window's views split
 //     by sessionDefaultChannelGroup, for the sources ranking.
-//   - "blog_speed" (key: date + path): one row per article per
-//     calendar day, carrying that day's total article_render
-//     time and sample count, from the blog's article_render
-//     events (the render_ms custom metric). The screen divides
-//     the two for the day's average display time; an article
-//     with no display on a day has no row for that day. The
-//     pre-daily cumulative rows live on under the
-//     blog_speed_cumulative tab (see migrateBlogSpeedTab_).
-//     The row also carries the day's article_render_slow count
-//     (displays of ten seconds or more) so a stall-inflated
-//     average is visible as one.
+//   - "blog_speed" (key: path): one row per article, carrying
+//     its total article_render time and sample count over the
+//     last 28 days, from the blog's article_render events (the
+//     render_ms custom metric). The screen divides the two for
+//     the average display time; an article with no display in
+//     the window has no row.
 // Both writes are best-effort in the same way as the SNS history:
 // gated on SNS_HISTORY_SHEET_ID and GA4_PROPERTY_ID, and a failure
 // logs one line instead of failing the collection.
@@ -3862,26 +3740,6 @@ const BLOG_SPEED_EVENT_NAME = 'wv_lcp';
 const BLOG_MUSIC_EVENT_NAME = 'music_play';
 const BLOG_RENDER_EVENT_NAME = 'article_render';
 const BLOG_RENDER_METRIC = 'customEvent:render_ms';
-// The companion event the blog sends alongside article_render
-// when a display takes ten seconds or more. Its per-day,
-// per-article count separates one stalled load from uniformly
-// slow displays in a way the average alone cannot (the map
-// article on 2026-11-12: a 7.5s average from six ~1.8s displays
-// and one 41.8s stall). Counting a named event needs no custom
-// metric.
-const BLOG_RENDER_SLOW_EVENT_NAME = 'article_render_slow';
-// The third metric name the screen's speed report asks for when
-// it wants the slow counts: the sheet bridge serves it from
-// blog_speed's slow_count column. It is a bridge name, not a
-// GA4 metric — the Data API cannot count one named event inside
-// another event's report without a filter, and this bridge
-// serves fixed shapes only.
-const BLOG_RENDER_SLOW_METRIC = 'customEvent:render_slow_count';
-// The daily speed fetch keys rows by date x pagePath x pageTitle,
-// so its row count grows with the window's days in a way the
-// window-only fetches' does not; the cap sits well above the
-// observed volume (a few dozen rows a day) without paging.
-const BLOG_SPEED_DAILY_FETCH_LIMIT = 5000;
 
 // One runReport call for the blog history: the report's rows, or
 // null when the API did not answer 200 (or the fetch itself
@@ -4182,22 +4040,16 @@ function fetchBlogSourcesData_(propertyId) {
     .sort((a, b) => b.views_28d - a.views_28d);
 }
 
-// One "blog_speed" row per entry of fetchBlogSpeedDailyData_:
-// one article's display times for one calendar day, with the
-// slow count the caller merged in from fetchBlogSlowCounts_
-// (an unset slow_count writes an empty cell, which the upsert
-// merge reads as "keep the stored count").
+// One "blog_speed" row per entry of fetchBlogSpeedData_.
 function buildBlogSpeedRows_(entries, collectedAt) {
   return (entries || []).map((entry) => {
     const item = entry || {};
     return [
-      snsHistoryTextCell_(item.date),
       snsHistoryTextCell_(item.path),
       snsHistoryTextCell_(item.title),
       snsHistoryNumCell_(item.total_render_ms),
       snsHistoryNumCell_(item.samples),
       snsHistoryTextCell_(collectedAt),
-      snsHistoryNumCell_(item.slow_count),
     ];
   });
 }
@@ -4240,27 +4092,21 @@ function buildBlogTotalsRows_(totals, collectedAt) {
   ];
 }
 
-// The blog's per-article display times, one entry per calendar
-// day per article over the display window: the article_render
-// events' render_ms total and sample count for that day, merged
-// under the canonical /blog/<id> path like blog_posts (the
-// title comes from the path form with the most samples that
-// day). The window is re-fetched whole on every collection, so
-// days GA4 has not recorded yet simply have no entries — the
-// first daily collection backfills every day the window still
-// covers (back to the render metric's first day), with no
-// separate repair step. Returns null when the report failed —
-// while the render_ms custom metric is unregistered in GA4 the
-// API answers an error, which reads as a failed report and
-// simply skips the tab until the first displays arrive.
-function fetchBlogSpeedDailyData_(propertyId) {
-  const nowMs = Date.now();
+// The blog's per-article display times over the last 28 days:
+// the article_render events' render_ms total and sample count,
+// merged under the canonical /blog/<id> path like blog_posts
+// (the title comes from the path form with the most samples).
+// Returns null when the report failed — while the render_ms
+// custom metric is unregistered in GA4 the API answers an
+// error, which reads as a failed report and simply skips the
+// tab until the first displays arrive.
+function fetchBlogSpeedData_(propertyId) {
   const rows = fetchBlogReportRows_(propertyId, {
-    startDate: jstDateKey_(nowMs - BLOG_POSTS_WINDOW_DAYS * SNS_DAY_MS),
-    endDate: jstDateKey_(nowMs),
+    startDate: BLOG_POSTS_WINDOW_DAYS + 'daysAgo',
+    endDate: 'today',
     metrics: [BLOG_RENDER_METRIC, 'eventCount'],
-    dimensions: ['date', 'pagePath', 'pageTitle'],
-    limit: BLOG_SPEED_DAILY_FETCH_LIMIT,
+    dimensions: ['pagePath', 'pageTitle'],
+    limit: BLOG_POSTS_FETCH_LIMIT,
     offset: 0,
     filters: parseFilterClauses_(
       'eventName:exact:' + BLOG_RENDER_EVENT_NAME
@@ -4269,17 +4115,11 @@ function fetchBlogSpeedDailyData_(propertyId) {
   if (!rows) {
     return null;
   }
-  const byDayPath = {};
+  const byPath = {};
   rows.forEach((row) => {
     const dimensionValues = (row && row.dimensionValues) || [];
-    const date = ga4DateKey_(
-      dimensionValues[0] && dimensionValues[0].value
-    );
-    if (!date) {
-      return;
-    }
     const id = articleIdFromPath_(
-      dimensionValues[1] && dimensionValues[1].value
+      dimensionValues[0] && dimensionValues[0].value
     );
     if (!id) {
       return;
@@ -4290,14 +4130,12 @@ function fetchBlogSpeedDailyData_(propertyId) {
     }
     const path = '/blog/' + id;
     const rawTitle = String(
-      (dimensionValues[2] && dimensionValues[2].value) || ''
+      (dimensionValues[1] && dimensionValues[1].value) || ''
     );
     const title = rawTitle === '(not set)' ? '' : rawTitle;
-    const key = date + '|' + path;
-    const existing = byDayPath[key];
+    const existing = byPath[path];
     if (!existing) {
-      byDayPath[key] = {
-        date,
+      byPath[path] = {
         path,
         title,
         total_render_ms: blogReportMetric_(row, 0) || 0,
@@ -4313,118 +4151,18 @@ function fetchBlogSpeedDailyData_(propertyId) {
       existing.title = title;
     }
   });
-  return Object.keys(byDayPath)
-    .map((key) => byDayPath[key])
+  return Object.keys(byPath)
+    .map((path) => byPath[path])
     .map((entry) => ({
-      date: entry.date,
       path: entry.path,
       title: entry.title,
       total_render_ms: entry.total_render_ms,
       samples: entry.samples,
     }))
-    .sort((a, b) => {
-      if (a.date !== b.date) {
-        return a.date < b.date ? -1 : 1;
-      }
-      return b.total_render_ms / b.samples - a.total_render_ms / a.samples;
-    });
-}
-
-// The per-day, per-article counts of article_render_slow over
-// the same window as fetchBlogSpeedDailyData_ — how many of
-// each article's displays on each day took ten seconds or
-// more — merged under the canonical /blog/<id> path like the
-// speed data, as { 'yyyy-mm-dd|/blog/<id>': count }. Day +
-// article pairs with no slow display are absent (the caller
-// reads absence as zero). Returns null when the report failed:
-// the caller then leaves the stored counts untouched instead
-// of reporting a false zero.
-function fetchBlogSlowCounts_(propertyId) {
-  const nowMs = Date.now();
-  const rows = fetchBlogReportRows_(propertyId, {
-    startDate: jstDateKey_(nowMs - BLOG_POSTS_WINDOW_DAYS * SNS_DAY_MS),
-    endDate: jstDateKey_(nowMs),
-    metrics: ['eventCount'],
-    dimensions: ['date', 'pagePath'],
-    limit: BLOG_SPEED_DAILY_FETCH_LIMIT,
-    offset: 0,
-    filters: parseFilterClauses_(
-      'eventName:exact:' + BLOG_RENDER_SLOW_EVENT_NAME
-    ),
-  });
-  if (!rows) {
-    return null;
-  }
-  const counts = {};
-  rows.forEach((row) => {
-    const dimensionValues = (row && row.dimensionValues) || [];
-    const date = ga4DateKey_(
-      dimensionValues[0] && dimensionValues[0].value
+    .sort(
+      (a, b) =>
+        b.total_render_ms / b.samples - a.total_render_ms / a.samples
     );
-    if (!date) {
-      return;
-    }
-    const id = articleIdFromPath_(
-      dimensionValues[1] && dimensionValues[1].value
-    );
-    if (!id) {
-      return;
-    }
-    const count = blogReportMetric_(row, 0) || 0;
-    if (!count) {
-      return;
-    }
-    const key = date + '|/blog/' + id;
-    counts[key] = (counts[key] || 0) + count;
-  });
-  return counts;
-}
-
-// Moves a pre-daily "blog_speed" tab out of the way before the
-// first daily write: while the tab's header still starts with
-// the cumulative schema's "path", the sheet is renamed to the
-// archive tab (BLOG_SPEED_CUMULATIVE_TAB, or the first free
-// numbered variant), so the daily upsert starts from an empty
-// tab and the old cumulative rows are never merged into — or
-// read as — daily ones. A tab already headed "date" (or no tab
-// at all) is left alone, so the migration runs once. Best
-// effort like the rest of the blog history: a failure logs one
-// line and the collection carries on.
-function migrateBlogSpeedTab_(spreadsheet) {
-  try {
-    const sheet = spreadsheet.getSheetByName('blog_speed');
-    if (!sheet || sheet.getLastRow() === 0) {
-      return;
-    }
-    const header = sheet.getRange(1, 1, 1, 1).getValues()[0][0];
-    if (
-      snsHistoryKeyCell_(header) !==
-      SNS_HISTORY_BLOG_SPEED_CUMULATIVE_COLUMNS[0]
-    ) {
-      return;
-    }
-    let archiveName = BLOG_SPEED_CUMULATIVE_TAB;
-    for (
-      let suffix = 2;
-      spreadsheet.getSheetByName(archiveName);
-      suffix++
-    ) {
-      archiveName = BLOG_SPEED_CUMULATIVE_TAB + '_' + suffix;
-    }
-    sheet.setName(archiveName);
-    console.log(
-      'Blog history: archived the cumulative blog_speed tab as ' +
-        archiveName
-    );
-  } catch (err) {
-    console.log(
-      'Blog history: blog_speed migration failed: ' +
-        summarizeSnsHistoryError_(
-          err,
-          getScriptProperty_(SNS_HISTORY_SHEET_ID_PROPERTY)
-        )
-    );
-  }
 }
 
 // One "blog_sources" row per entry of fetchBlogSourcesData_.
@@ -4517,29 +4255,13 @@ function appendBlogHistory_() {
     } else {
       console.log('Blog history: sources report failed, blog_sources skipped');
     }
-    migrateBlogSpeedTab_(spreadsheet);
-    const speed = fetchBlogSpeedDailyData_(propertyId);
+    const speed = fetchBlogSpeedData_(propertyId);
     if (speed) {
-      // The slow counts ride the same rows, keyed by day +
-      // article. A failed slow report leaves slow_count unset
-      // on every entry, and the empty cells keep the stored
-      // counts (the upsert merge), instead of reporting a
-      // false zero for the day.
-      const slowCounts = fetchBlogSlowCounts_(propertyId);
-      if (slowCounts) {
-        speed.forEach((entry) => {
-          entry.slow_count = slowCounts[entry.date + '|' + entry.path] || 0;
-        });
-      } else {
-        console.log(
-          'Blog history: slow report failed, blog_speed slow counts kept'
-        );
-      }
       upsertSnsHistorySheet_(
         spreadsheet,
         'blog_speed',
         SNS_HISTORY_BLOG_SPEED_COLUMNS,
-        [0, 1],
+        0,
         buildBlogSpeedRows_(speed, collectedAt)
       );
     } else {
@@ -5205,17 +4927,11 @@ function blogReportShape_(params) {
   // The per-article display-time report: pagePath x the
   // article_render metric pair (total render_ms, sample count),
   // served from the blog_speed tab in the same GA4 shape the
-  // live report would return. The pair may carry the bridge's
-  // slow-count metric as a third value (the day's
-  // article_render_slow count); the pair alone keeps serving
-  // the two values, so a screen that predates the slow counts
-  // is unaffected.
+  // live report would return.
   if (
     dims.length === 1 &&
     dims[0] === 'pagePath' &&
-    (metrics.join(',') === BLOG_RENDER_METRIC + ',eventCount' ||
-      metrics.join(',') ===
-        BLOG_RENDER_METRIC + ',eventCount,' + BLOG_RENDER_SLOW_METRIC)
+    metrics.join(',') === BLOG_RENDER_METRIC + ',eventCount'
   ) {
     return 'speed';
   }
@@ -5356,21 +5072,11 @@ function blogPagesData_(spreadsheet, params) {
   };
 }
 
-// The blog_speed tab in the GA4 report shape, for yesterday
-// (JST) only: one row per article, metricValues
-// [total_render_ms, samples], slowest average first. Today's
-// rows are a running total and never served, so the ranking
-// always shows a finished day; articles with no recorded
-// display yesterday are absent, exactly like the live report.
-// The payload carries the served day as `date` next to the GA4
-// rows, so the screen can label the ranking with the day it
-// actually shows (the hour-cached payload can straddle
-// midnight, when the day it holds is no longer yesterday).
-// When the report asked for the slow-count metric as well
-// (metricCount 3), each row carries the day's slow_count as
-// the third value (0 when the tab holds none for it, e.g.
-// rows collected before the column).
-function blogSpeedData_(spreadsheet, metricCount) {
+// The blog_speed tab in the GA4 report shape: one row per
+// article, metricValues [total_render_ms, samples], slowest
+// average first. Articles with no recorded display are absent,
+// exactly like the live report.
+function blogSpeedData_(spreadsheet) {
   const rows = readHistoryTabObjects_(
     spreadsheet,
     'blog_speed',
@@ -5379,29 +5085,19 @@ function blogSpeedData_(spreadsheet, metricCount) {
   if (!rows) {
     return null;
   }
-  const date = jstDateKey_(Date.now() - SNS_DAY_MS);
-  const entries = rows
-    .filter((row) => snsHistoryKeyCell_(row.date) === date)
+  const entries = latestBatchRows_(rows)
     .map((row) => ({
       path: historyTextOrNull_(row.path),
       total: snsHistoryNumberCell_(row.total_render_ms),
       samples: snsHistoryNumberCell_(row.samples),
-      slow: snsHistoryNumberCell_(row.slow_count),
     }))
     .filter((entry) => entry.path && entry.samples)
     .sort((a, b) => b.total / b.samples - a.total / a.samples);
-  const wantsSlow = (metricCount || 2) >= 3;
   return {
     rows: entries.map((entry) =>
-      blogReportRow_(
-        entry.path,
-        wantsSlow
-          ? [entry.total, entry.samples, entry.slow || 0]
-          : [entry.total, entry.samples]
-      )
+      blogReportRow_(entry.path, [entry.total, entry.samples])
     ),
     rowCount: entries.length,
-    date,
   };
 }
 
@@ -5500,7 +5196,7 @@ function buildBlogReportResponse_(params, shareSession) {
         } else if (shape === 'sources') {
           data = blogSourcesData_(spreadsheet, params);
         } else if (shape === 'speed') {
-          data = blogSpeedData_(spreadsheet, params.metrics.length);
+          data = blogSpeedData_(spreadsheet);
         }
       }
     } catch (err) {
@@ -5618,8 +5314,7 @@ function precomputeReadCaches_() {
       3,
       () => blogSourcesData_(spreadsheet, { metrics: [0, 0, 0] }),
     ],
-    ['speed', 2, () => blogSpeedData_(spreadsheet, 2)],
-    ['speed', 3, () => blogSpeedData_(spreadsheet, 3)],
+    ['speed', 2, () => blogSpeedData_(spreadsheet)],
   ];
   blogShapes.forEach(([shape, metricsLength, build]) => {
     try {
@@ -6080,7 +5775,13 @@ function doGet(e) {
       return jsonOut_(Object.assign({ ok: true }, issueOwnerSession_()));
     }
     if (parameter.action === 'revoke_session') {
-      return jsonOut_(Object.assign({ ok: true }, revokeOwnerSession_(parameter.session_token || '')));
+      // Only the holder of the live session token may revoke it;
+      // an unauthenticated revoke would let anyone kill the owner's
+      // 30-day session at will.
+      if (!parameter.session_token || !validateOwnerToken_(parameter.session_token)) {
+        return jsonOut_({ ok: false, status: 401, error: 'session expired or invalid' });
+      }
+      return jsonOut_(Object.assign({ ok: true }, revokeOwnerSession_()));
     }
     if (parameter.action === 'issue_share' || parameter.action === 'revoke_share') {
       try {
@@ -6092,7 +5793,7 @@ function doGet(e) {
         parameter.action === 'issue_share' ? issueShareSession_() : revokeShareSession_();
       return jsonOut_(Object.assign({ ok: true }, result));
     }
-    if (isAuthConfigured_()) {
+    {
       if (parameter.session_token) {
         if (!validateOwnerToken_(parameter.session_token)) {
           return jsonOut_({
@@ -6156,10 +5857,6 @@ if (typeof exports !== 'undefined') {
   exports.issueOwnerSession_ = issueOwnerSession_;
   exports.revokeOwnerSession_ = revokeOwnerSession_;
   exports.validateOwnerToken_ = validateOwnerToken_;
-  exports.loadOwnerSessions_ = loadOwnerSessions_;
-  exports.saveOwnerSessions_ = saveOwnerSessions_;
-  exports.OWNER_SESSIONS_PROPERTY = OWNER_SESSIONS_PROPERTY;
-  exports.OWNER_SESSIONS_MAX = OWNER_SESSIONS_MAX;
   exports.hashShareToken_ = hashShareToken_;
   exports.isAuthConfigured_ = isAuthConfigured_;
   exports.extractIdToken_ = extractIdToken_;
@@ -6266,9 +5963,7 @@ if (typeof exports !== 'undefined') {
   exports.buildBlogTotalsRows_ = buildBlogTotalsRows_;
   exports.fetchBlogSourcesData_ = fetchBlogSourcesData_;
   exports.buildBlogSourcesRows_ = buildBlogSourcesRows_;
-  exports.fetchBlogSpeedDailyData_ = fetchBlogSpeedDailyData_;
-  exports.fetchBlogSlowCounts_ = fetchBlogSlowCounts_;
-  exports.migrateBlogSpeedTab_ = migrateBlogSpeedTab_;
+  exports.fetchBlogSpeedData_ = fetchBlogSpeedData_;
   exports.buildBlogSpeedRows_ = buildBlogSpeedRows_;
   exports.doPost = doPost;
   exports.recordSmoke_ = recordSmoke_;
@@ -6307,7 +6002,4 @@ if (typeof exports !== 'undefined') {
   exports.SNS_HISTORY_BLOG_TOTALS_COLUMNS = SNS_HISTORY_BLOG_TOTALS_COLUMNS;
   exports.SNS_HISTORY_BLOG_SOURCES_COLUMNS = SNS_HISTORY_BLOG_SOURCES_COLUMNS;
   exports.SNS_HISTORY_BLOG_SPEED_COLUMNS = SNS_HISTORY_BLOG_SPEED_COLUMNS;
-  exports.SNS_HISTORY_BLOG_SPEED_CUMULATIVE_COLUMNS =
-    SNS_HISTORY_BLOG_SPEED_CUMULATIVE_COLUMNS;
-  exports.BLOG_SPEED_CUMULATIVE_TAB = BLOG_SPEED_CUMULATIVE_TAB;
 }

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { createHash } from 'node:crypto';
 import * as Code from '../src/Code.js';
 
 // Stage 2: the /social screen's reads (sns_detail and the blog
@@ -22,14 +23,7 @@ describe('Sheet-backed read side (stage 2)', () => {
 
   const makeSheet = () => {
     const sheet = {
-      name: '',
       rows: [],
-      getName() {
-        return sheet.name;
-      },
-      setName(next) {
-        sheet.name = next;
-      },
       getLastRow() {
         return sheet.rows.length;
       },
@@ -84,6 +78,10 @@ describe('Sheet-backed read side (stage 2)', () => {
   };
 
   const lastJson = () => JSON.parse(outputs[outputs.length - 1].text);
+
+  // The private actions sit behind the auth gate, so the doGet
+  // integration tests present a freshly issued share token.
+  const testShareToken = () => Code.issueShareSession_().share_token;
 
   const accountRow = (values) => {
     const row = Code.SNS_HISTORY_ACCOUNT_COLUMNS.map(() => '');
@@ -202,6 +200,14 @@ describe('Sheet-backed read side (stage 2)', () => {
           delete store[key];
         },
       }),
+    };
+    let uuidCounter = 0;
+    global.Utilities = {
+      DigestAlgorithm: { SHA_256: 'SHA_256' },
+      computeDigest: vi.fn((algo, value) => [
+        ...createHash('sha256').update(String(value)).digest(),
+      ]),
+      getUuid: vi.fn(() => '00000000-0000-4000-8000-00000000000' + uuidCounter++),
     };
     global.ContentService = {
       createTextOutput: vi.fn((text) => {
@@ -563,19 +569,14 @@ describe('Sheet-backed read side (stage 2)', () => {
       ]);
     });
 
-    it('serves the speed shape from blog_speed for yesterday only, slowest average first', () => {
+    it('serves the speed shape from blog_speed, slowest average first', () => {
       serveTabs(
         Object.assign(blogTabs(), {
           blog_speed: [
             Code.SNS_HISTORY_BLOG_SPEED_COLUMNS,
-            // Yesterday (2026-11-08) under the frozen clock: the
-            // two rows the ranking serves.
-            ['2026-11-08', '/blog/1abcdefghijklmnopqrstuvwx', '記事タイトル', 40000, 20, AT_NEW],
-            ['2026-11-08', '/blog/2abcdefghijklmnopqrstuvwx', '', 9000, 3, AT_NEW],
-            // Today is still a running total and the day before
-            // yesterday is finished history: neither is served.
-            ['2026-11-09', '/blog/9stalearticle00000000000', '今日の記事', 999999, 1, AT_NEW],
-            ['2026-11-07', '/blog/9stalearticle00000000000', '一昨日の記事', 888888, 1, AT_OLD],
+            ['/blog/9stalearticle00000000000', '古い窓の記事', 999999, 1, AT_OLD],
+            ['/blog/1abcdefghijklmnopqrstuvwx', '記事タイトル', 40000, 20, AT_NEW],
+            ['/blog/2abcdefghijklmnopqrstuvwx', '', 9000, 3, AT_NEW],
           ],
         })
       );
@@ -589,7 +590,6 @@ describe('Sheet-backed read side (stage 2)', () => {
       );
       expect(response.ok).toBe(true);
       expect(response.data.rowCount).toBe(2);
-      expect(response.data.date).toBe('2026-11-08');
       expect(response.data.rows).toEqual([
         {
           dimensionValues: [{ value: '/blog/2abcdefghijklmnopqrstuvwx' }],
@@ -598,45 +598,6 @@ describe('Sheet-backed read side (stage 2)', () => {
         {
           dimensionValues: [{ value: '/blog/1abcdefghijklmnopqrstuvwx' }],
           metricValues: [{ value: '40000' }, { value: '20' }],
-        },
-      ]);
-    });
-
-    it('serves the slow counts as the third value when the speed report asks for them', () => {
-      serveTabs(
-        Object.assign(blogTabs(), {
-          blog_speed: [
-            Code.SNS_HISTORY_BLOG_SPEED_COLUMNS,
-            // Yesterday under the frozen clock. The first row is
-            // the 2026-11-12 map article's shape in miniature: a
-            // 7.5s average over 7 displays, one of them slow.
-            ['2026-11-08', '/blog/1abcdefghijklmnopqrstuvwx', '記事タイトル', 52500, 7, AT_NEW, 1],
-            ['2026-11-08', '/blog/2abcdefghijklmnopqrstuvwx', '', 9000, 3, AT_NEW, 0],
-          ],
-        })
-      );
-      const response = Code.buildBlogReportResponse_(
-        paramsFor({
-          metrics: [
-            'customEvent:render_ms',
-            'eventCount',
-            'customEvent:render_slow_count',
-          ],
-          dimensions: ['pagePath'],
-          limit: 25,
-        }),
-        null
-      );
-      expect(response.ok).toBe(true);
-      expect(response.data.date).toBe('2026-11-08');
-      expect(response.data.rows).toEqual([
-        {
-          dimensionValues: [{ value: '/blog/1abcdefghijklmnopqrstuvwx' }],
-          metricValues: [{ value: '52500' }, { value: '7' }, { value: '1' }],
-        },
-        {
-          dimensionValues: [{ value: '/blog/2abcdefghijklmnopqrstuvwx' }],
-          metricValues: [{ value: '9000' }, { value: '3' }, { value: '0' }],
         },
       ]);
     });
@@ -703,7 +664,9 @@ describe('Sheet-backed read side (stage 2)', () => {
   describe('doGet integration', () => {
     it('serves sns_detail from the sheet without any fetch', () => {
       serveTabs(detailTabs());
-      Code.doGet({ parameter: { action: 'sns_detail' } });
+      Code.doGet({
+        parameter: { action: 'sns_detail', share_token: testShareToken() },
+      });
       const json = lastJson();
       expect(json.ok).toBe(true);
       expect(json.action).toBe('sns_detail');
@@ -719,7 +682,7 @@ describe('Sheet-backed read side (stage 2)', () => {
           ['/', 'トップ', 123, AT_NEW],
         ],
       });
-      Code.doGet({ parameter: {} });
+      Code.doGet({ parameter: { share_token: testShareToken() } });
       const json = lastJson();
       expect(json.ok).toBe(true);
       expect(json.data.rows).toHaveLength(1);

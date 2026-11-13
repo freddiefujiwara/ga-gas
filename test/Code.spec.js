@@ -76,6 +76,11 @@ describe('Code.js', () => {
 
   const lastJson = () => JSON.parse(outputs[outputs.length - 1].text);
 
+  // The private actions sit behind the auth gate even when no auth
+  // properties are configured, so data-serving tests present a
+  // freshly issued share token.
+  const testShareToken = () => Code.issueShareSession_().share_token;
+
   // A readable stand-in for one history-sheet tab: rows are the
   // raw cell values, header row first.
   const makeSheet = (rows) => {
@@ -133,7 +138,7 @@ describe('Code.js', () => {
     it('returns the page ranking from the history sheet with default parameters', () => {
       setProperty(PROPERTY_ID);
       mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
-      Code.doGet({ parameter: {} });
+      Code.doGet({ parameter: { share_token: testShareToken() } });
       const json = lastJson();
       expect(json.ok).toBe(true);
       expect(json.property).toBe(PROPERTY_ID);
@@ -153,7 +158,9 @@ describe('Code.js', () => {
     it('serves the totals shape from blog_totals (the share-validation call)', () => {
       setProperty(PROPERTY_ID);
       mockHistorySheet({ blog_totals: BLOG_TOTALS_TAB });
-      Code.doGet({ parameter: { dimensions: '', limit: '1' } });
+      Code.doGet({
+        parameter: { dimensions: '', limit: '1', share_token: testShareToken() },
+      });
       const json = lastJson();
       expect(json.ok).toBe(true);
       expect(json.dimensions).toEqual([]);
@@ -168,14 +175,21 @@ describe('Code.js', () => {
     it('rejects report shapes the sheet cannot answer', () => {
       setProperty(PROPERTY_ID);
       mockHistorySheet({ blog_pages: BLOG_PAGES_TAB, blog_totals: BLOG_TOTALS_TAB });
-      Code.doGet({ parameter: { dimensions: 'sessionMedium' } });
-      expect(lastJson().ok).toBe(false);
-      expect(lastJson().error).toContain('unsupported report parameters');
-      Code.doGet({ parameter: { dimensions: '', metrics: 'sessions,activeUsers' } });
+      const shareToken = testShareToken();
+      Code.doGet({ parameter: { dimensions: 'sessionMedium', share_token: shareToken } });
       expect(lastJson().ok).toBe(false);
       expect(lastJson().error).toContain('unsupported report parameters');
       Code.doGet({
-        parameter: { dimensions: 'date', metrics: 'screenPageViews,activeUsers' },
+        parameter: { dimensions: '', metrics: 'sessions,activeUsers', share_token: shareToken },
+      });
+      expect(lastJson().ok).toBe(false);
+      expect(lastJson().error).toContain('unsupported report parameters');
+      Code.doGet({
+        parameter: {
+          dimensions: 'date',
+          metrics: 'screenPageViews,activeUsers',
+          share_token: shareToken,
+        },
       });
       expect(lastJson().ok).toBe(false);
     });
@@ -187,7 +201,7 @@ describe('Code.js', () => {
         rows.push(['/p' + i, '', 100 - i, '2026-11-09T06:00:00.000Z']);
       }
       mockHistorySheet({ blog_pages: rows });
-      Code.doGet({ parameter: { limit: 'abc' } });
+      Code.doGet({ parameter: { limit: 'abc', share_token: testShareToken() } });
       const json = lastJson();
       expect(json.ok).toBe(true);
       expect(json.data.rows).toHaveLength(25);
@@ -197,7 +211,9 @@ describe('Code.js', () => {
     it('applies offset and limit to the sheet rows', () => {
       setProperty(PROPERTY_ID);
       mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
-      Code.doGet({ parameter: { offset: '1', limit: '1' } });
+      Code.doGet({
+        parameter: { offset: '1', limit: '1', share_token: testShareToken() },
+      });
       const json = lastJson();
       expect(json.ok).toBe(true);
       expect(json.offset).toBe(1);
@@ -212,7 +228,7 @@ describe('Code.js', () => {
 
     it('answers an error when the sheet holds no blog data yet', () => {
       setProperty(PROPERTY_ID);
-      Code.doGet({ parameter: {} });
+      Code.doGet({ parameter: { share_token: testShareToken() } });
       const json = lastJson();
       expect(json.ok).toBe(false);
       expect(json.error).toContain('has not been collected');
@@ -227,7 +243,7 @@ describe('Code.js', () => {
           throw new Error('drive exploded');
         }),
       };
-      Code.doGet({ parameter: {} });
+      Code.doGet({ parameter: { share_token: testShareToken() } });
       const json = lastJson();
       expect(json.ok).toBe(false);
       expect(global.UrlFetchApp.fetch).not.toHaveBeenCalled();
@@ -237,7 +253,9 @@ describe('Code.js', () => {
       setProperty(PROPERTY_ID);
       mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
       Code.doGet();
-      expect(lastJson().ok).toBe(true);
+      const json = lastJson();
+      expect(json.ok).toBe(false);
+      expect(json.status).toBe(401);
     });
   });
 
@@ -412,7 +430,12 @@ describe('Code.js', () => {
       setProperty(PROPERTY_ID);
       mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
       Code.doGet({
-        parameter: { filter: 'pagePath:contains:/list-of-stuff/', offset: '50', limit: '10' },
+        parameter: {
+          filter: 'pagePath:contains:/list-of-stuff/',
+          offset: '50',
+          limit: '10',
+          share_token: testShareToken(),
+        },
       });
       const json = lastJson();
       expect(json.ok).toBe(false);
@@ -422,7 +445,9 @@ describe('Code.js', () => {
     it('returns an error JSON for an invalid filter clause', () => {
       setProperty(PROPERTY_ID);
       mockFetch(200, { rows: [] });
-      Code.doGet({ parameter: { filter: 'pagePath' } });
+      Code.doGet({
+        parameter: { filter: 'pagePath', share_token: testShareToken() },
+      });
       const json = lastJson();
       expect(json.ok).toBe(false);
       expect(json.error).toContain('Invalid filter clause');
@@ -707,11 +732,12 @@ describe('Code.js', () => {
       expect(lastJson()).toEqual({ ok: true, revoked: true });
     });
 
-    it('leaves the gate open while auth is not configured', () => {
+    it('rejects data requests while auth is not configured', () => {
       setProperty(PROPERTY_ID);
       mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
       Code.doGet({ parameter: {} });
-      expect(lastJson().ok).toBe(true);
+      expect(lastJson().ok).toBe(false);
+      expect(lastJson().status).toBe(401);
     });
 
     it('owner sessions: exchange issues a 30-day token that serves data', () => {
@@ -726,8 +752,7 @@ describe('Code.js', () => {
       expect(issued.ok).toBe(true);
       expect(issued.session_token).toMatch(/^[0-9a-f]{64}$/);
       expect(issued.ttl_seconds).toBe(30 * 24 * 60 * 60);
-      expect(JSON.parse(store.OWNER_SESSIONS)[Code.hashShareToken_(issued.session_token)]).toBe(issued.expires_at);
-      expect(store.OWNER_TOKEN_HASH).toBeUndefined();
+      expect(store.OWNER_TOKEN_HASH).toBe(Code.hashShareToken_(issued.session_token));
       Code.doGet({ parameter: { session_token: issued.session_token } });
       expect(lastJson().ok).toBe(true);
       Code.doGet({ parameter: { session_token: 'bogus' } });
@@ -747,94 +772,26 @@ describe('Code.js', () => {
       expect(Code.validateOwnerToken_(token)).toBeNull();
     });
 
-    it('owner sessions: a second session does not invalidate the first', () => {
+    it('owner sessions: revoke_session requires the live session token', () => {
       setProperty(PROPERTY_ID);
       configureAuth();
       mockAuthFetch({ payload: goodPayload() });
-      mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
-      const first = Code.issueOwnerSession_().session_token;
-      const second = Code.issueOwnerSession_().session_token;
-      expect(second).not.toBe(first);
-      expect(Code.validateOwnerToken_(first)).not.toBeNull();
-      expect(Code.validateOwnerToken_(second)).not.toBeNull();
-      expect(Object.keys(JSON.parse(store.OWNER_SESSIONS))).toHaveLength(2);
-      Code.doGet({ parameter: { session_token: first } });
-      expect(lastJson().ok).toBe(true);
-      Code.doGet({ parameter: { session_token: second } });
-      expect(lastJson().ok).toBe(true);
+      const token = Code.issueOwnerSession_().session_token;
+      Code.doGet({ parameter: { action: 'revoke_session' } });
+      expect(lastJson().ok).toBe(false);
+      expect(lastJson().status).toBe(401);
+      expect(Code.validateOwnerToken_(token)).not.toBeNull();
+      Code.doGet({ parameter: { action: 'revoke_session', session_token: 'bogus' } });
+      expect(lastJson().ok).toBe(false);
+      expect(Code.validateOwnerToken_(token)).not.toBeNull();
     });
 
-    it('owner sessions: logout revokes only its own session', () => {
+    it('private actions fail closed when auth properties are unset', () => {
+      // No configureAuth(): GOOGLE_OAUTH_CLIENT_ID / AVAILABLE_GMAILS unset.
       setProperty(PROPERTY_ID);
-      const first = Code.issueOwnerSession_().session_token;
-      const second = Code.issueOwnerSession_().session_token;
-      Code.doGet({ parameter: { action: 'revoke_session', session_token: first } });
-      expect(lastJson()).toEqual({ ok: true, revoked: true });
-      expect(Code.validateOwnerToken_(first)).toBeNull();
-      expect(Code.validateOwnerToken_(second)).not.toBeNull();
-      // A revoke without a token identifies no session and
-      // must not clear the remaining one.
-      Code.revokeOwnerSession_();
-      expect(Code.validateOwnerToken_(second)).not.toBeNull();
-      Code.revokeOwnerSession_(second);
-      expect(Code.validateOwnerToken_(second)).toBeNull();
-    });
-
-    it('owner sessions: a legacy single token still validates and migrates on issue', () => {
-      const legacyToken = 'legacy-owner-token';
-      const legacyExpires = new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString();
-      store.OWNER_TOKEN_HASH = Code.hashShareToken_(legacyToken);
-      store.OWNER_EXPIRES_AT = legacyExpires;
-      // Validates against the old keys before any new session exists.
-      expect(Code.validateOwnerToken_(legacyToken)).toEqual({ expires_at: legacyExpires });
-      // Issuing a new session migrates the legacy one into the map
-      // instead of overwriting it, and removes the legacy keys.
-      const issued = Code.issueOwnerSession_();
-      expect(Code.validateOwnerToken_(legacyToken)).toEqual({ expires_at: legacyExpires });
-      expect(Code.validateOwnerToken_(issued.session_token)).not.toBeNull();
-      expect(store.OWNER_TOKEN_HASH).toBeUndefined();
-      expect(store.OWNER_EXPIRES_AT).toBeUndefined();
-      const map = JSON.parse(store.OWNER_SESSIONS);
-      expect(map[Code.hashShareToken_(legacyToken)]).toBe(legacyExpires);
-      expect(map[Code.hashShareToken_(issued.session_token)]).toBe(issued.expires_at);
-      // Revoking the migrated legacy session leaves the new one live.
-      Code.revokeOwnerSession_(legacyToken);
-      expect(Code.validateOwnerToken_(legacyToken)).toBeNull();
-      expect(Code.validateOwnerToken_(issued.session_token)).not.toBeNull();
-    });
-
-    it('owner sessions: an expired legacy token and expired map entries are rejected', () => {
-      const legacyToken = 'expired-legacy-token';
-      store.OWNER_TOKEN_HASH = Code.hashShareToken_(legacyToken);
-      store.OWNER_EXPIRES_AT = '2000-01-01T00:00:00.000Z';
-      expect(Code.validateOwnerToken_(legacyToken)).toBeNull();
-      const token = 'expired-map-token';
-      store.OWNER_SESSIONS = JSON.stringify({
-        [Code.hashShareToken_(token)]: '2000-01-01T00:00:00.000Z',
-      });
-      expect(Code.validateOwnerToken_(token)).toBeNull();
-      // Issuing prunes the expired entry instead of carrying it over.
-      const issued = Code.issueOwnerSession_();
-      const map = JSON.parse(store.OWNER_SESSIONS);
-      expect(Object.keys(map)).toEqual([Code.hashShareToken_(issued.session_token)]);
-    });
-
-    it('owner sessions: a corrupt OWNER_SESSIONS value does not break issue or validate', () => {
-      store.OWNER_SESSIONS = 'not-json{';
-      const issued = Code.issueOwnerSession_();
-      expect(Code.validateOwnerToken_(issued.session_token)).not.toBeNull();
-    });
-
-    it('share sessions: reissuing still invalidates the previous share link', () => {
-      const first = Code.issueShareSession_().share_token;
-      const second = Code.issueShareSession_().share_token;
-      expect(second).not.toBe(first);
-      expect(Code.validateShareToken_(first)).toBeNull();
-      expect(Code.validateShareToken_(second)).not.toBeNull();
-      // Owner sessions are stored separately and are untouched.
-      const owner = Code.issueOwnerSession_().session_token;
-      Code.issueShareSession_();
-      expect(Code.validateOwnerToken_(owner)).not.toBeNull();
+      Code.doGet({ parameter: { action: 'sns_detail' } });
+      expect(lastJson().ok).toBe(false);
+      expect(lastJson().status).toBe(401);
     });
   });
 
