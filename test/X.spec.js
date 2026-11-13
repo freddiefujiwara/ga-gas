@@ -129,6 +129,9 @@ describe('X via tweet-gas (GAS-to-GAS sync)', () => {
       expect(detail).toEqual({
         followers: null,
         username: null,
+        api_balance_usd: null,
+        api_daily_posts: null,
+        usage_error: null,
         recent_posts: null,
         x_error: null,
         posts_error: null,
@@ -213,6 +216,65 @@ describe('X via tweet-gas (GAS-to-GAS sync)', () => {
       expect(detail.posts_error).toContain('HTTP 429');
     });
 
+    it('maps the usage half from the snapshot response', () => {
+      configureSync();
+      fetchHandler = () =>
+        res(200, {
+          ok: true,
+          x: { followers: 321, username: 'freddiefujiwara', recent_posts: WIRE_POSTS },
+          x_error: null,
+          posts_error: null,
+          x_usage: {
+            credit_balance_usd: 41.65,
+            prepaid_balance_usd: 25,
+            free_balance_usd: 16.65,
+            daily_posts: [
+              { date: '2026-11-08', tweets_consumed: 120 },
+              { date: '2026-11-07', tweets_consumed: null },
+            ],
+          },
+          usage_error: null,
+        });
+      const detail = Code.fetchXDetail_();
+      expect(detail.api_balance_usd).toBe(41.65);
+      // Daily posts come out ascending, null counts preserved.
+      expect(detail.api_daily_posts).toEqual([
+        { date: '2026-11-07', tweets_consumed: null },
+        { date: '2026-11-08', tweets_consumed: 120 },
+      ]);
+      expect(detail.usage_error).toBeNull();
+      expect(detail.followers).toBe(321);
+    });
+
+    it('passes a partial usage failure through as usage_error', () => {
+      configureSync();
+      fetchHandler = () =>
+        res(200, {
+          ok: true,
+          x: { followers: 321, username: 'freddiefujiwara', recent_posts: [] },
+          x_error: null,
+          posts_error: null,
+          x_usage: { credit_balance_usd: null, daily_posts: null },
+          usage_error: 'credits fetch failed',
+        });
+      const detail = Code.fetchXDetail_();
+      expect(detail.api_balance_usd).toBeNull();
+      expect(detail.api_daily_posts).toBeNull();
+      expect(detail.usage_error).toBe('credits fetch failed');
+    });
+
+    it('keeps the balance null when the response carries none', () => {
+      configureSync();
+      fetchHandler = () =>
+        res(200, {
+          ok: true,
+          x: { followers: 321, username: 'freddiefujiwara', recent_posts: [] },
+          x_error: null,
+          posts_error: null,
+        });
+      expect(Code.fetchXDetail_().api_balance_usd).toBeNull();
+    });
+
     it('survives a fetch exception', () => {
       configureSync();
       fetchHandler = () => {
@@ -221,6 +283,73 @@ describe('X via tweet-gas (GAS-to-GAS sync)', () => {
       const detail = Code.fetchXDetail_();
       expect(detail.x_error).toContain('tweet-gas fetch exception');
       expect(detail.followers).toBeNull();
+    });
+  });
+
+  describe('extractXUsage_', () => {
+    it('reads the balance and daily posts from x_usage', () => {
+      const usage = Code.extractXUsage_({
+        x_usage: {
+          credit_balance_usd: 41.65,
+          daily_posts: [{ date: '2026-11-08', tweets_consumed: 120 }],
+        },
+        usage_error: null,
+      });
+      expect(usage.balance_usd).toBe(41.65);
+      expect(usage.daily_posts).toEqual([
+        { date: '2026-11-08', tweets_consumed: 120 },
+      ]);
+      expect(usage.usage_error).toBeNull();
+    });
+
+    it('keeps a reported zero balance', () => {
+      expect(
+        Code.extractXUsage_({ x_usage: { credit_balance_usd: 0 } }).balance_usd
+      ).toBe(0);
+    });
+
+    it('drops malformed daily entries and keeps null counts', () => {
+      const usage = Code.extractXUsage_({
+        x_usage: {
+          credit_balance_usd: null,
+          daily_posts: [
+            { date: 'not-a-date', tweets_consumed: 5 },
+            { tweets_consumed: 5 },
+            null,
+            { date: '2026-11-08', tweets_consumed: null },
+          ],
+        },
+      });
+      expect(usage.daily_posts).toEqual([
+        { date: '2026-11-08', tweets_consumed: null },
+      ]);
+    });
+
+    it('returns all nulls when x_usage itself is null or absent', () => {
+      expect(Code.extractXUsage_({ x_usage: null })).toEqual({
+        balance_usd: null,
+        daily_posts: null,
+        usage_error: null,
+      });
+      expect(Code.extractXUsage_({})).toEqual({
+        balance_usd: null,
+        daily_posts: null,
+        usage_error: null,
+      });
+      expect(Code.extractXUsage_(null)).toEqual({
+        balance_usd: null,
+        daily_posts: null,
+        usage_error: null,
+      });
+    });
+
+    it('keeps usage_error even when x_usage is null', () => {
+      const usage = Code.extractXUsage_({
+        x_usage: null,
+        usage_error: 'tweet-gas bearer unavailable',
+      });
+      expect(usage.usage_error).toBe('tweet-gas bearer unavailable');
+      expect(usage.balance_usd).toBeNull();
     });
   });
 
@@ -254,8 +383,12 @@ describe('X via tweet-gas (GAS-to-GAS sync)', () => {
       const totalIndex = Code.SNS_HISTORY_ACCOUNT_COLUMNS.indexOf('total_followers');
       expect(row[totalIndex]).toBe(2000 + 252 + 10 + 321);
       const xIndex = Code.SNS_HISTORY_ACCOUNT_COLUMNS.indexOf('x_followers');
-      expect(xIndex).toBe(Code.SNS_HISTORY_ACCOUNT_COLUMNS.length - 1);
       expect(row[xIndex]).toBe(321);
+      // The API balance column rides last, after x_followers.
+      const balanceIndex =
+        Code.SNS_HISTORY_ACCOUNT_COLUMNS.indexOf('x_api_balance_usd');
+      expect(balanceIndex).toBe(Code.SNS_HISTORY_ACCOUNT_COLUMNS.length - 1);
+      expect(row[balanceIndex]).toBe('');
     });
 
     it('builds one x_media row per post, without the derived URL', () => {
@@ -272,6 +405,35 @@ describe('X via tweet-gas (GAS-to-GAS sync)', () => {
           2,
         ],
       ]);
+    });
+
+    it('builds one x_daily row per consumed day', () => {
+      const snap = snapshotWithX();
+      snap.x.api_daily_posts = [
+        { date: '2026-11-08', tweets_consumed: 120 },
+        { date: '2026-11-09', tweets_consumed: null },
+      ];
+      expect(Code.buildSnsHistoryXDailyRows_(snap)).toEqual([
+        ['2026-11-08', 120, '2026-11-10T00:00:00.000Z'],
+        ['2026-11-09', '', '2026-11-10T00:00:00.000Z'],
+      ]);
+      // A failed daily fetch (null) contributes no rows.
+      snap.x.api_daily_posts = null;
+      expect(Code.buildSnsHistoryXDailyRows_(snap)).toEqual([]);
+    });
+
+    it('upserts x_daily end to end through appendSnsHistory_', () => {
+      const snap = snapshotWithX();
+      snap.x.api_daily_posts = [{ date: '2026-11-09', tweets_consumed: 100 }];
+      serveTabs({});
+      Code.appendSnsHistory_(snap);
+      expect(sheets.x_daily.rows[0]).toEqual(Code.SNS_HISTORY_X_DAILY_COLUMNS);
+      expect(sheets.x_daily.rows).toHaveLength(2);
+      snap.x.api_daily_posts = [{ date: '2026-11-09', tweets_consumed: 140 }];
+      Code.appendSnsHistory_(snap);
+      // Still one row for the day, carrying the newer count.
+      expect(sheets.x_daily.rows).toHaveLength(2);
+      expect(sheets.x_daily.rows[1][1]).toBe(140);
     });
 
     it('upserts x_media end to end through appendSnsHistory_', () => {
@@ -336,6 +498,7 @@ describe('X via tweet-gas (GAS-to-GAS sync)', () => {
       });
       const detail = Code.buildSnsDetailFromSheet_();
       expect(detail.x.followers).toBe(321);
+      expect(detail.x.api_balance_usd).toBeNull();
       expect(detail.x.username).toBeNull();
       expect(detail.x.recent_posts.map((post) => post.id)).toEqual([
         '2002',
@@ -347,8 +510,62 @@ describe('X via tweet-gas (GAS-to-GAS sync)', () => {
       expect(detail.x.recent_posts[0].views).toBe(900);
     });
 
+    it('carries the daily posts through the sheet into sns_detail', () => {
+      serveTabs({
+        account: [
+          Code.SNS_HISTORY_ACCOUNT_COLUMNS,
+          accountRow({
+            collected_at: '2026-11-10T00:00:00.000Z',
+            x_followers: 321,
+            x_api_balance_usd: 41.65,
+          }),
+        ],
+        x_daily: [
+          Code.SNS_HISTORY_X_DAILY_COLUMNS,
+          ['2026-11-09', 140, '2026-11-10T00:00:00.000Z'],
+          ['2026-11-08', '', '2026-11-10T00:00:00.000Z'],
+        ],
+      });
+      const detail = Code.buildSnsDetailFromSheet_();
+      expect(detail.x.api_daily_posts).toEqual([
+        { date: '2026-11-08', tweets_consumed: null },
+        { date: '2026-11-09', tweets_consumed: 140 },
+      ]);
+    });
+
+    it('carries the API balance through the account row, sns_detail and sns_history', () => {
+      serveTabs({
+        account: [
+          Code.SNS_HISTORY_ACCOUNT_COLUMNS,
+          accountRow({
+            collected_at: '2026-11-10T00:00:00.000Z',
+            x_followers: 321,
+            x_api_balance_usd: 41.65,
+          }),
+        ],
+      });
+      const detail = Code.buildSnsDetailFromSheet_();
+      expect(detail.x.api_balance_usd).toBe(41.65);
+      const response = Code.buildSnsHistoryResponse_();
+      expect(response.rows).toHaveLength(1);
+      expect(response.rows[0].x_api_balance_usd).toBe(41.65);
+    });
+
+    it('writes the API balance into the appended account row', () => {
+      const row = Code.buildSnsHistoryAccountRow_({
+        collected_at: '2026-11-10T00:00:00.000Z',
+        x: { followers: 321, api_balance_usd: 41.65 },
+      });
+      const balanceIndex =
+        Code.SNS_HISTORY_ACCOUNT_COLUMNS.indexOf('x_api_balance_usd');
+      expect(row[balanceIndex]).toBe(41.65);
+    });
+
     it('serves x_followers in sns_history from the canonical position when the stored header predates the column', () => {
-      const oldColumns = Code.SNS_HISTORY_ACCOUNT_COLUMNS.slice(0, -1);
+      const oldColumns = Code.SNS_HISTORY_ACCOUNT_COLUMNS.slice(
+        0,
+        Code.SNS_HISTORY_ACCOUNT_COLUMNS.indexOf('x_followers')
+      );
       expect(oldColumns).not.toContain('x_followers');
       const dataRow = oldColumns.map(() => '');
       dataRow[0] = '2026-11-10T00:00:00.000Z';

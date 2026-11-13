@@ -649,6 +649,9 @@ function buildEmptySnsDetail_() {
     x: {
       followers: null,
       username: null,
+      api_balance_usd: null,
+      api_daily_posts: null,
+      usage_error: null,
       x_error: null,
       recent_posts: null,
       posts_error: null,
@@ -1113,7 +1116,10 @@ function parseThreadsInsightsByName_(data) {
 // X); this project never holds them. The hourly collection POSTs
 // { action: 'sns_snapshot', sync_token } to tweet-gas's web app
 // and receives the follower count plus the newest posts with
-// their public metrics. That is the same machine sync-token
+// their public metrics. The response also carries the X API
+// usage half (credit balance and daily post consumption) at
+// its top level — see extractXUsage_ for the field contract.
+// That is the same machine sync-token
 // pattern alarm-gas and time-table-gas use: the caller holds
 // TWEET_GAS_EXEC_URL (the other app's /exec URL) and
 // TWEET_GAS_SYNC_TOKEN, the same value as tweet-gas's SYNC_TOKEN
@@ -1126,6 +1132,10 @@ function parseThreadsInsightsByName_(data) {
 
 const SNS_X_RECENT_POSTS_LIMIT = 50;
 
+// How many days of X API post consumption the sync carries
+// (tweet-gas sends the last 90 days).
+const SNS_X_DAILY_POSTS_LIMIT = 90;
+
 // A wire value from the tweet-gas response as a number, or null
 // when it did not arrive as one.
 function xWireNumberOrNull_(value) {
@@ -1134,6 +1144,48 @@ function xWireNumberOrNull_(value) {
   }
   const num = Number(value);
   return Number.isFinite(num) ? num : null;
+}
+
+// The X API usage section from the tweet-gas response: the
+// credit balance (USD) and the daily post consumption, or nulls
+// when the response carries no usage half. The contract (set by
+// tweet-gas): the snapshot response carries, at its top level,
+// x_usage (an object, or null when tweet-gas could not obtain a
+// Bearer token at all) and usage_error (a summary string, or
+// null). Inside x_usage, credit_balance_usd is the balance
+// total and daily_posts is the last 90 days of
+// { date: "YYYY-MM-DD", tweets_consumed } in ascending order;
+// either half may independently be missing (null) when its own
+// fetch failed, with usage_error saying so. A balance the API
+// reports as zero is a real balance and is kept.
+function extractXUsage_(data) {
+  const result = { balance_usd: null, daily_posts: null, usage_error: null };
+  const root = data || {};
+  if (typeof root.usage_error === 'string' && root.usage_error) {
+    result.usage_error = root.usage_error;
+  }
+  const usage = root.x_usage;
+  if (!usage || typeof usage !== 'object') {
+    return result;
+  }
+  result.balance_usd = xWireNumberOrNull_(usage.credit_balance_usd);
+  if (Array.isArray(usage.daily_posts)) {
+    result.daily_posts = usage.daily_posts
+      .map((entry) => {
+        const item = entry || {};
+        return {
+          date:
+            typeof item.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item.date)
+              ? item.date
+              : null,
+          tweets_consumed: xWireNumberOrNull_(item.tweets_consumed),
+        };
+      })
+      .filter((entry) => entry.date)
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))
+      .slice(-SNS_X_DAILY_POSTS_LIMIT);
+  }
+  return result;
 }
 
 // One snapshot entry for an X post, normalized from the wire
@@ -1164,6 +1216,9 @@ function fetchXDetail_() {
   const result = {
     followers: null,
     username: null,
+    api_balance_usd: null,
+    api_daily_posts: null,
+    usage_error: null,
     recent_posts: null,
     x_error: null,
     posts_error: null,
@@ -1210,6 +1265,10 @@ function fetchXDetail_() {
   const x = data.x || {};
   result.followers = xWireNumberOrNull_(x.followers);
   result.username = x.username != null ? String(x.username) : null;
+  const usage = extractXUsage_(data);
+  result.api_balance_usd = usage.balance_usd;
+  result.api_daily_posts = usage.daily_posts;
+  result.usage_error = usage.usage_error;
   result.x_error =
     typeof data.x_error === 'string' && data.x_error ? data.x_error : null;
   result.posts_error =
@@ -3088,6 +3147,9 @@ const SNS_HISTORY_ACCOUNT_COLUMNS = [
   // end. (buildSnsHistoryResponse_ additionally falls back to this
   // canonical position for a column the stored header predates.)
   'x_followers',
+  // The X API credit balance (USD) from the tweet-gas sync,
+  // appended after x_followers under the same rule.
+  'x_api_balance_usd',
 ];
 const SNS_HISTORY_MEDIA_COLUMNS = [
   'collected_at',
@@ -3153,6 +3215,10 @@ const SNS_HISTORY_X_MEDIA_COLUMNS = [
   'reposts',
   'replies',
 ];
+// "x_daily" is keyed by its first column (date), like the
+// Instagram "daily" tab: one row per calendar day of X API
+// post consumption from the tweet-gas usage half.
+const SNS_HISTORY_X_DAILY_COLUMNS = ['date', 'tweets_consumed', 'collected_at'];
 // "ig_demographics" is keyed by its first column, the breakdown
 // and segment joined ("age_gender|25-34/F", "city|Kawaguchi",
 // "country|JP"), so the three follower_demographics breakdowns
@@ -3285,6 +3351,7 @@ function buildSnsHistoryAccountRow_(snapshot) {
     snsHistoryNumCell_(youtube.total_views),
     snsHistoryNumCell_(youtube.video_count),
     snsHistoryNumCell_(x.followers),
+    snsHistoryNumCell_(x.api_balance_usd),
   ];
 }
 
@@ -3419,6 +3486,26 @@ function buildSnsHistoryXMediaRows_(snapshot) {
       snsHistoryNumCell_(item.replies),
     ];
   });
+}
+
+// One "x_daily" row per entry of x.api_daily_posts: the X API
+// post consumption of one calendar day, keyed by its date like
+// the Instagram "daily" tab. A failed daily fetch (the snapshot
+// carries null) contributes no rows, so stored days are never
+// erased by an outage; a day whose count the API did not report
+// (tweets_consumed null) still records its date with an empty
+// count cell.
+function buildSnsHistoryXDailyRows_(snapshot) {
+  const snap = snapshot || {};
+  const x = snap.x || {};
+  const days = Array.isArray(x.api_daily_posts) ? x.api_daily_posts : [];
+  return days
+    .filter((entry) => entry && typeof entry.date === 'string' && entry.date)
+    .map((entry) => [
+      snsHistoryTextCell_(entry.date),
+      snsHistoryNumCell_(entry.tweets_consumed),
+      snsHistoryTextCell_(snap.collected_at),
+    ]);
 }
 
 // One "ig_demographics" row per (breakdown, segment) of
@@ -3663,6 +3750,13 @@ function appendSnsHistory_(snapshot) {
       SNS_HISTORY_X_MEDIA_COLUMNS,
       1,
       buildSnsHistoryXMediaRows_(snapshot)
+    );
+    upsertSnsHistorySheet_(
+      spreadsheet,
+      'x_daily',
+      SNS_HISTORY_X_DAILY_COLUMNS,
+      0,
+      buildSnsHistoryXDailyRows_(snapshot)
     );
     upsertSnsHistorySheet_(
       spreadsheet,
@@ -4310,6 +4404,10 @@ const SNS_HISTORY_RESPONSE_COLUMNS = [
   'unfollows_30d',
   'yt_total_views',
   'x_followers',
+  // The X API credit balance rides along so the X tab can show
+  // the current balance and estimate its runway from the stored
+  // series itself.
+  'x_api_balance_usd',
 ];
 const SNS_HISTORY_MAX_ROWS = 6600;
 
@@ -4893,6 +4991,22 @@ function buildSnsDetailFromSheet_(openedSpreadsheet) {
   // leaves it null — the stored-snapshot fallback carries it.
   const x = detail.x;
   x.followers = num(account.x_followers);
+  x.api_balance_usd = num(account.x_api_balance_usd);
+  const xDailyRows = readHistoryTabObjects_(
+    spreadsheet,
+    'x_daily',
+    SNS_HISTORY_X_DAILY_COLUMNS
+  );
+  if (xDailyRows) {
+    x.api_daily_posts = xDailyRows
+      .map((row) => ({
+        date: historyTextOrNull_(row.date),
+        tweets_consumed: num(row.tweets_consumed),
+      }))
+      .filter((entry) => entry.date)
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))
+      .slice(-SNS_X_DAILY_POSTS_LIMIT);
+  }
   const xRows = readHistoryTabObjects_(
     spreadsheet,
     'x_media',
@@ -5413,6 +5527,9 @@ function collectSnsCounts() {
     x: {
       followers: xDetail.followers,
       username: xDetail.username,
+      api_balance_usd: xDetail.api_balance_usd,
+      api_daily_posts: xDetail.api_daily_posts,
+      usage_error: xDetail.usage_error,
       x_error: xDetail.x_error,
       recent_posts: xDetail.recent_posts,
       posts_error: xDetail.posts_error,
@@ -5940,6 +6057,7 @@ if (typeof exports !== 'undefined') {
   exports.fetchYouTubeRecentVideos_ = fetchYouTubeRecentVideos_;
   exports.summarizeYouTubeError_ = summarizeYouTubeError_;
   exports.fetchXDetail_ = fetchXDetail_;
+  exports.extractXUsage_ = extractXUsage_;
   exports.buildXPostEntry_ = buildXPostEntry_;
   exports.xWireNumberOrNull_ = xWireNumberOrNull_;
   exports.isTokenRefreshDue_ = isTokenRefreshDue_;
@@ -5959,6 +6077,8 @@ if (typeof exports !== 'undefined') {
   exports.buildSnsHistoryThreadsMediaRows_ = buildSnsHistoryThreadsMediaRows_;
   exports.buildSnsHistoryYouTubeMediaRows_ = buildSnsHistoryYouTubeMediaRows_;
   exports.buildSnsHistoryXMediaRows_ = buildSnsHistoryXMediaRows_;
+  exports.buildSnsHistoryXDailyRows_ = buildSnsHistoryXDailyRows_;
+  exports.SNS_HISTORY_X_DAILY_COLUMNS = SNS_HISTORY_X_DAILY_COLUMNS;
   exports.buildSnsHistoryDemographicsRows_ = buildSnsHistoryDemographicsRows_;
   exports.buildSnsHistoryThreadsAccountRows_ = buildSnsHistoryThreadsAccountRows_;
   exports.appendBlogHistory_ = appendBlogHistory_;
