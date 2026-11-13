@@ -2264,15 +2264,19 @@ describe('SNS follower counts', () => {
           non_follower_pct: 96.3,
           reach_30d: 5000,
           interactions_total: 3000,
+          interactions_likes: null,
+          interactions_comments: null,
+          interactions_shares: null,
+          interactions_saves: null,
           follows_30d: null,
           unfollows_30d: 30,
           yt_total_views: 123456,
           x_followers: 321,
         },
       ]);
-      // Only the 14 served columns come back: no anemone counts, no
+      // Only the 18 served columns come back: no anemone counts, no
       // taps source, no other sheet columns leak into the response.
-      expect(Object.keys(json.rows[0])).toHaveLength(14);
+      expect(Object.keys(json.rows[0])).toHaveLength(18);
     });
 
     it('sorts ascending by collected_at and drops timestamp-less rows', () => {

@@ -4573,6 +4573,12 @@ const SNS_HISTORY_RESPONSE_COLUMNS = [
   'non_follower_pct',
   'reach_30d',
   'interactions_total',
+  // The interaction breakdown rides along so the Instagram
+  // tab can chart each kind of reaction, not just the total.
+  'interactions_likes',
+  'interactions_comments',
+  'interactions_shares',
+  'interactions_saves',
   'follows_30d',
   'unfollows_30d',
   'yt_total_views',
