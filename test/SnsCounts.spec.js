@@ -1069,6 +1069,30 @@ describe('SNS follower counts', () => {
       ]);
     });
 
+    it('merges rows by a composite key: every part must match', () => {
+      const merged = Code.mergeSnsHistoryRows_(
+        [
+          ['2026-11-08', '/blog/a', 100, 2],
+          ['2026-11-09', '/blog/a', 300, 3],
+          ['', '/blog/b', 999, 9],
+          ['2026-11-09', '', 999, 9],
+        ],
+        [
+          ['2026-11-08', '/blog/a', 150, ''],
+          ['2026-11-08', '/blog/b', 50, 1],
+        ],
+        [0, 1]
+      );
+      // The same path on another day is a different row, rows
+      // missing either key part are dropped, and a fresh blank
+      // keeps the stored value inside the matched row.
+      expect(merged).toEqual([
+        ['2026-11-08', '/blog/a', 150, 2],
+        ['2026-11-09', '/blog/a', 300, 3],
+        ['2026-11-08', '/blog/b', 50, 1],
+      ]);
+    });
+
     it('normalizes sheet key cells, including coerced dates', () => {
       expect(Code.snsHistoryKeyCell_(' media-1 ')).toBe('media-1');
       expect(Code.snsHistoryKeyCell_(null)).toBe('');
@@ -1362,9 +1386,20 @@ describe('SNS follower counts', () => {
     let nowSpy;
     let ga4Requests;
 
-    const makeSheet = () => {
+    const makeSheet = (name) => {
       const sheet = {
+        name: name || '',
         rows: [],
+        getName() {
+          return sheet.name;
+        },
+        setName(next) {
+          if (sheet.name && sheets[sheet.name] === sheet) {
+            delete sheets[sheet.name];
+          }
+          sheet.name = next;
+          sheets[next] = sheet;
+        },
         getLastRow() {
           return sheet.rows.length;
         },
@@ -1416,10 +1451,15 @@ describe('SNS follower counts', () => {
           ga4Row(['20261109'], [5000, 2]),
         ],
         render: [
-          ga4Row(['/1abcdefghijklmnopqrstuvwx', '記事タイトルA'], [30000, 10]),
-          ga4Row(['/blog/1abcdefghijklmnopqrstuvwx', '記事タイトルA別形'], [10000, 10]),
-          ga4Row(['/blog/2abcdefghijklmnopqrstuvwx', '(not set)'], [9000, 3]),
-          ga4Row(['/', 'トップ'], [5000, 5]),
+          ga4Row(['20261108', '/1abcdefghijklmnopqrstuvwx', '記事タイトルA'], [30000, 10]),
+          ga4Row(['20261108', '/blog/1abcdefghijklmnopqrstuvwx', '記事タイトルA別形'], [10000, 10]),
+          ga4Row(['20261109', '/blog/2abcdefghijklmnopqrstuvwx', '(not set)'], [9000, 3]),
+          ga4Row(['20261109', '/', 'トップ'], [5000, 5]),
+        ],
+        slow: [
+          ga4Row(['20261108', '/1abcdefghijklmnopqrstuvwx'], [1]),
+          ga4Row(['20261109', '/blog/2abcdefghijklmnopqrstuvwx'], [2]),
+          ga4Row(['20261109', '/'], [5]),
         ],
         posts: [
           ga4Row(['/1abcdefghijklmnopqrstuvwx', '記事タイトルA'], [10]),
@@ -1443,6 +1483,9 @@ describe('SNS follower counts', () => {
         ga4Requests.push(body);
         const dimensions = (body.dimensions || []).map((d) => d.name);
         const filterText = JSON.stringify(body.dimensionFilter || {});
+        if (filterText.includes('article_render_slow')) {
+          return res(200, { rows: bodies.slow });
+        }
         if (filterText.includes('article_render')) {
           return res(200, { rows: bodies.render });
         }
@@ -1471,7 +1514,7 @@ describe('SNS follower counts', () => {
       spreadsheet = {
         getSheetByName: (name) => sheets[name] || null,
         insertSheet: (name) => {
-          sheets[name] = makeSheet();
+          sheets[name] = makeSheet(name);
           return sheets[name];
         },
       };
@@ -1681,21 +1724,23 @@ describe('SNS follower counts', () => {
       expect(Code.fetchBlogPostsData_('561730442')).toBeNull();
     });
 
-    it('merges split article paths for the speed data and sorts by average', () => {
+    it('merges split article paths per day for the speed data', () => {
       mockGa4Blog();
-      const speed = Code.fetchBlogSpeedData_('561730442');
+      const speed = Code.fetchBlogSpeedDailyData_('561730442');
       expect(speed).toEqual([
         {
-          path: '/blog/2abcdefghijklmnopqrstuvwx',
-          title: '',
-          total_render_ms: 9000,
-          samples: 3,
-        },
-        {
+          date: '2026-11-08',
           path: '/blog/1abcdefghijklmnopqrstuvwx',
           title: '記事タイトルA',
           total_render_ms: 40000,
           samples: 20,
+        },
+        {
+          date: '2026-11-09',
+          path: '/blog/2abcdefghijklmnopqrstuvwx',
+          title: '',
+          total_render_ms: 9000,
+          samples: 3,
         },
       ]);
       const renderBody = ga4Requests.find((body) =>
@@ -1705,17 +1750,23 @@ describe('SNS follower counts', () => {
         { name: 'customEvent:render_ms' },
         { name: 'eventCount' },
       ]);
+      expect(renderBody.dimensions).toEqual([
+        { name: 'date' },
+        { name: 'pagePath' },
+        { name: 'pageTitle' },
+      ]);
     });
 
     it('returns null for the speed data when the report fails', () => {
       fetchHandler = () => res(500, { error: { message: 'boom' } });
-      expect(Code.fetchBlogSpeedData_('561730442')).toBeNull();
+      expect(Code.fetchBlogSpeedDailyData_('561730442')).toBeNull();
     });
 
-    it('builds blog_speed rows with totals and sample counts', () => {
+    it('builds blog_speed rows with the day, totals and sample counts', () => {
       const rows = Code.buildBlogSpeedRows_(
         [
           {
+            date: '2026-11-08',
             path: '/blog/1abcdefghijklmnopqrstuvwx',
             title: '記事タイトルA',
             total_render_ms: 40000,
@@ -1724,16 +1775,70 @@ describe('SNS follower counts', () => {
         ],
         '2026-11-09T03:00:00.000Z'
       );
+      // No slow count on the entry: the last cell stays empty,
+      // which the upsert merge reads as "keep the stored count".
       expect(rows).toEqual([
         [
+          '2026-11-08',
           '/blog/1abcdefghijklmnopqrstuvwx',
           '記事タイトルA',
           40000,
           20,
           '2026-11-09T03:00:00.000Z',
+          '',
         ],
       ]);
       expect(Code.buildBlogSpeedRows_(null, 't')).toEqual([]);
+    });
+
+    it('builds blog_speed rows with the slow count in the last cell', () => {
+      const rows = Code.buildBlogSpeedRows_(
+        [
+          {
+            date: '2026-11-08',
+            path: '/blog/1abcdefghijklmnopqrstuvwx',
+            title: '記事タイトルA',
+            total_render_ms: 40000,
+            samples: 20,
+            slow_count: 1,
+          },
+        ],
+        '2026-11-09T03:00:00.000Z'
+      );
+      expect(rows).toEqual([
+        [
+          '2026-11-08',
+          '/blog/1abcdefghijklmnopqrstuvwx',
+          '記事タイトルA',
+          40000,
+          20,
+          '2026-11-09T03:00:00.000Z',
+          1,
+        ],
+      ]);
+    });
+
+    it('merges split article paths per day for the slow counts', () => {
+      mockGa4Blog();
+      expect(Code.fetchBlogSlowCounts_('561730442')).toEqual({
+        '2026-11-08|/blog/1abcdefghijklmnopqrstuvwx': 1,
+        '2026-11-09|/blog/2abcdefghijklmnopqrstuvwx': 2,
+      });
+      const slowBody = ga4Requests.find((body) =>
+        JSON.stringify(body.dimensionFilter || {}).includes(
+          'article_render_slow'
+        )
+      );
+      expect(slowBody.metrics).toEqual([{ name: 'eventCount' }]);
+      expect(slowBody.dimensions).toEqual([
+        { name: 'date' },
+        { name: 'pagePath' },
+      ]);
+    });
+
+    it('returns null for the slow counts when the report fails', () => {
+      fetchHandler = () => res(500, { error: { message: 'boom' } });
+      expect(Code.fetchBlogSlowCounts_('561730442')).toBeNull();
     });
 
     it('writes the blog_speed tab end to end', () => {
@@ -1743,18 +1848,132 @@ describe('SNS follower counts', () => {
         Code.SNS_HISTORY_BLOG_SPEED_COLUMNS
       );
       expect(sheets.blog_speed.rows).toHaveLength(3);
-      expect(sheets.blog_speed.rows[1].slice(0, 4)).toEqual([
-        '/blog/2abcdefghijklmnopqrstuvwx',
-        '',
-        9000,
-        3,
-      ]);
-      expect(sheets.blog_speed.rows[2].slice(0, 4)).toEqual([
+      expect(sheets.blog_speed.rows[1].slice(0, 5)).toEqual([
+        '2026-11-08',
         '/blog/1abcdefghijklmnopqrstuvwx',
         '記事タイトルA',
         40000,
         20,
       ]);
+      expect(sheets.blog_speed.rows[2].slice(0, 5)).toEqual([
+        '2026-11-09',
+        '/blog/2abcdefghijklmnopqrstuvwx',
+        '',
+        9000,
+        3,
+      ]);
+      // The slow counts land in the last cell of each day row.
+      expect(sheets.blog_speed.rows[1][6]).toBe(1);
+      expect(sheets.blog_speed.rows[2][6]).toBe(2);
+    });
+
+    it('keeps the stored slow counts when the slow report fails', () => {
+      mockGa4Blog();
+      const inner = fetchHandler;
+      fetchHandler = (url, options) => {
+        const body = JSON.parse(options.payload);
+        if (
+          JSON.stringify(body.dimensionFilter || {}).includes(
+            'article_render_slow'
+          )
+        ) {
+          return res(500, { error: { message: 'boom' } });
+        }
+        return inner(url, options);
+      };
+      const stored = makeSheet('blog_speed');
+      stored.rows = [
+        Code.SNS_HISTORY_BLOG_SPEED_COLUMNS,
+        [
+          '2026-11-08',
+          '/blog/1abcdefghijklmnopqrstuvwx',
+          '記事タイトルA',
+          30000,
+          15,
+          '2026-11-08T03:00:00.000Z',
+          4,
+        ],
+      ];
+      sheets.blog_speed = stored;
+      Code.appendBlogHistory_();
+      const row = sheets.blog_speed.rows.find(
+        (cells) =>
+          cells[0] === '2026-11-08' &&
+          cells[1] === '/blog/1abcdefghijklmnopqrstuvwx'
+      );
+      // The fresh totals replaced the stored ones, but the slow
+      // count survived from the stored row.
+      expect(row.slice(0, 5)).toEqual([
+        '2026-11-08',
+        '/blog/1abcdefghijklmnopqrstuvwx',
+        '記事タイトルA',
+        40000,
+        20,
+      ]);
+      expect(row[6]).toBe(4);
+    });
+
+    it('overwrites a stored day when GA4 restates it, keyed by date + path', () => {
+      mockGa4Blog();
+      Code.appendBlogHistory_();
+      mockGa4Blog({
+        render: [
+          ga4Row(['20261108', '/blog/1abcdefghijklmnopqrstuvwx', '記事タイトルA'], [55555, 11]),
+          ga4Row(['20261109', '/blog/2abcdefghijklmnopqrstuvwx', '(not set)'], [9000, 3]),
+        ],
+      });
+      Code.appendBlogHistory_();
+      // The restated 11-08 row replaced the stored one instead of
+      // adding a second row for the same day + article, and the
+      // untouched 11-09 row is unchanged.
+      expect(sheets.blog_speed.rows).toHaveLength(3);
+      expect(sheets.blog_speed.rows[1].slice(0, 5)).toEqual([
+        '2026-11-08',
+        '/blog/1abcdefghijklmnopqrstuvwx',
+        '記事タイトルA',
+        55555,
+        11,
+      ]);
+      expect(sheets.blog_speed.rows[2].slice(0, 5)).toEqual([
+        '2026-11-09',
+        '/blog/2abcdefghijklmnopqrstuvwx',
+        '',
+        9000,
+        3,
+      ]);
+    });
+
+    it('archives a cumulative blog_speed tab before the first daily write', () => {
+      const legacy = makeSheet('blog_speed');
+      legacy.rows = [
+        Code.SNS_HISTORY_BLOG_SPEED_CUMULATIVE_COLUMNS.slice(),
+        ['/blog/1abcdefghijklmnopqrstuvwx', '記事タイトルA', 40000, 20, '2026-11-09T00:00:00.000Z'],
+        ['/blog/2abcdefghijklmnopqrstuvwx', '', 9000, 3, '2026-11-09T00:00:00.000Z'],
+      ];
+      sheets.blog_speed = legacy;
+      mockGa4Blog();
+      Code.appendBlogHistory_();
+      // The cumulative rows moved aside untouched, under the
+      // archive tab, and the daily tab holds only daily rows.
+      expect(sheets[Code.BLOG_SPEED_CUMULATIVE_TAB]).toBe(legacy);
+      expect(legacy.rows).toHaveLength(3);
+      expect(legacy.rows[1].slice(0, 4)).toEqual([
+        '/blog/1abcdefghijklmnopqrstuvwx',
+        '記事タイトルA',
+        40000,
+        20,
+      ]);
+      expect(sheets.blog_speed).not.toBe(legacy);
+      expect(sheets.blog_speed.rows[0]).toEqual(
+        Code.SNS_HISTORY_BLOG_SPEED_COLUMNS
+      );
+      expect(sheets.blog_speed.rows).toHaveLength(3);
+      // A second collection neither re-archives nor disturbs
+      // the archive.
+      Code.appendBlogHistory_();
+      expect(sheets[Code.BLOG_SPEED_CUMULATIVE_TAB]).toBe(legacy);
+      expect(legacy.rows).toHaveLength(3);
+      expect(sheets.blog_speed.rows).toHaveLength(3);
     });
 
     it('writes the blog tabs end to end and upserts on the next run', () => {
