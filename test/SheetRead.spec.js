@@ -718,7 +718,7 @@ describe('Sheet-backed read side (stage 2)', () => {
       expect(Code.getCachedText_(cache, 'absent')).toBeNull();
       // A payload past the chunk cap is refused, not truncated.
       expect(
-        Code.putCachedText_(cache, 'big', 'y'.repeat(30000 * 41), 60)
+        Code.putCachedText_(cache, 'big', 'y'.repeat(30000 * 121), 60)
       ).toBe(false);
       expect(Code.getCachedText_(null, 'k')).toBeNull();
     });
@@ -768,9 +768,9 @@ describe('Sheet-backed read side (stage 2)', () => {
       expect(row.interactions_saves).toBe(1130);
     });
 
-    it('reads only the newest 2400 account rows for sns_history', () => {
+    it('reads only the newest 6600 account rows for sns_history', () => {
       const rows = [Code.SNS_HISTORY_ACCOUNT_COLUMNS];
-      const total = 2405; // SNS_HISTORY_MAX_ROWS (2400) + 5
+      const total = 6605; // SNS_HISTORY_MAX_ROWS (6600) + 5
       const base = Date.parse('2026-01-01T00:00:00.000Z');
       for (let i = 0; i < total; i++) {
         rows.push(
@@ -782,9 +782,9 @@ describe('Sheet-backed read side (stage 2)', () => {
       }
       serveTabs({ account: rows });
       const response = Code.buildSnsHistoryResponse_();
-      expect(response.rows).toHaveLength(2400);
+      expect(response.rows).toHaveLength(6600);
       expect(response.rows[0].ig_followers).toBe(5);
-      expect(response.rows[2399].ig_followers).toBe(2404);
+      expect(response.rows[6599].ig_followers).toBe(6604);
     });
 
     it('falls back to a full account scan when the last row has no timestamp', () => {

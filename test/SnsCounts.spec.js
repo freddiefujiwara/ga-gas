@@ -2088,16 +2088,16 @@ describe('SNS follower counts', () => {
       expect(json.rows.map((row) => row.ig_followers)).toEqual([1988, 2000]);
     });
 
-    it('caps the response at the newest 2400 rows', () => {
+    it('caps the response at the newest 6600 rows', () => {
       const rows = [HEADER];
-      for (let i = 0; i < 2405; i += 1) {
+      for (let i = 0; i < 6605; i += 1) {
         const at = new Date(Date.UTC(2026, 0, 1) + i * 3600 * 1000);
         rows.push(dataRow({ collected_at: at.toISOString(), ig_followers: i }));
       }
       const json = serveHistory(makeReadableSheet(rows));
-      expect(json.rows).toHaveLength(2400);
+      expect(json.rows).toHaveLength(6600);
       expect(json.rows[0].ig_followers).toBe(5);
-      expect(json.rows[2399].ig_followers).toBe(2404);
+      expect(json.rows[6599].ig_followers).toBe(6604);
     });
 
     it('rejects anonymous calls while authentication is configured', () => {
