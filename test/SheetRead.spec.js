@@ -740,6 +740,34 @@ describe('Sheet-backed read side (stage 2)', () => {
       expect(openById).toHaveBeenCalledTimes(1);
     });
 
+    it('serves the interaction breakdown columns in sns_history rows', () => {
+      serveTabs({
+        account: [
+          Code.SNS_HISTORY_ACCOUNT_COLUMNS,
+          accountRow({
+            collected_at: AT_NEW,
+            views_30d: 500000,
+            reach_30d: 130000,
+            interactions_total: 6400,
+            interactions_likes: 4400,
+            interactions_comments: 140,
+            interactions_shares: 320,
+            interactions_saves: 1130,
+          }),
+        ],
+      });
+      const response = Code.buildSnsHistoryResponse_();
+      expect(response.rows).toHaveLength(1);
+      const row = response.rows[0];
+      expect(row.views_30d).toBe(500000);
+      expect(row.reach_30d).toBe(130000);
+      expect(row.interactions_total).toBe(6400);
+      expect(row.interactions_likes).toBe(4400);
+      expect(row.interactions_comments).toBe(140);
+      expect(row.interactions_shares).toBe(320);
+      expect(row.interactions_saves).toBe(1130);
+    });
+
     it('reads only the newest 2400 account rows for sns_history', () => {
       const rows = [Code.SNS_HISTORY_ACCOUNT_COLUMNS];
       const total = 2405; // SNS_HISTORY_MAX_ROWS (2400) + 5
