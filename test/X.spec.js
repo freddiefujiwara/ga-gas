@@ -246,6 +246,33 @@ describe('X via tweet-gas (GAS-to-GAS sync)', () => {
       expect(detail.followers).toBe(321);
     });
 
+    it('maps the usage half when the dates arrive as ISO timestamps', () => {
+      configureSync();
+      fetchHandler = () =>
+        res(200, {
+          ok: true,
+          x: { followers: 321, username: 'freddiefujiwara', recent_posts: [] },
+          x_error: null,
+          posts_error: null,
+          x_usage: {
+            credit_balance_usd: 41.65,
+            cycle_posts_consumed: 321,
+            daily_posts: [
+              { date: '2026-11-10T00:00:00.000Z', tweets_consumed: 96 },
+              { date: '2026-11-09T00:00:00.000Z', tweets_consumed: 140 },
+            ],
+          },
+          usage_error: null,
+        });
+      const detail = Code.fetchXDetail_();
+      expect(detail.api_balance_usd).toBe(41.65);
+      // The timestamp shape production sends is cut to its day.
+      expect(detail.api_daily_posts).toEqual([
+        { date: '2026-11-09', tweets_consumed: 140 },
+        { date: '2026-11-10', tweets_consumed: 96 },
+      ]);
+    });
+
     it('passes a partial usage failure through as usage_error', () => {
       configureSync();
       fetchHandler = () =>
@@ -325,6 +352,55 @@ describe('X via tweet-gas (GAS-to-GAS sync)', () => {
       ]);
     });
 
+    it('normalizes ISO timestamp dates to their calendar day', () => {
+      const usage = Code.extractXUsage_({
+        x_usage: {
+          credit_balance_usd: 41.65,
+          daily_posts: [
+            { date: '2026-11-10T00:00:00.000Z', tweets_consumed: 96 },
+            { date: '2026-11-09T12:34:56.789Z', tweets_consumed: 140 },
+          ],
+        },
+      });
+      expect(usage.daily_posts).toEqual([
+        { date: '2026-11-09', tweets_consumed: 140 },
+        { date: '2026-11-10', tweets_consumed: 96 },
+      ]);
+    });
+
+    it('keeps one entry when both date shapes of a day arrive', () => {
+      const usage = Code.extractXUsage_({
+        x_usage: {
+          credit_balance_usd: null,
+          daily_posts: [
+            { date: '2026-11-09', tweets_consumed: 100 },
+            { date: '2026-11-09T00:00:00.000Z', tweets_consumed: 140 },
+          ],
+        },
+      });
+      expect(usage.daily_posts).toEqual([
+        { date: '2026-11-09', tweets_consumed: 140 },
+      ]);
+    });
+
+    it('ignores usage fields it does not consume', () => {
+      const usage = Code.extractXUsage_({
+        x_usage: {
+          credit_balance_usd: 41.65,
+          cycle_posts_consumed: 321,
+          prepaid_balance_usd: 25,
+          free_balance_usd: 16.65,
+          daily_posts: [{ date: '2026-11-08', tweets_consumed: 120 }],
+        },
+        usage_error: null,
+      });
+      expect(usage).toEqual({
+        balance_usd: 41.65,
+        daily_posts: [{ date: '2026-11-08', tweets_consumed: 120 }],
+        usage_error: null,
+      });
+    });
+
     it('returns all nulls when x_usage itself is null or absent', () => {
       expect(Code.extractXUsage_({ x_usage: null })).toEqual({
         balance_usd: null,
@@ -350,6 +426,33 @@ describe('X via tweet-gas (GAS-to-GAS sync)', () => {
       });
       expect(usage.usage_error).toBe('tweet-gas bearer unavailable');
       expect(usage.balance_usd).toBeNull();
+    });
+  });
+
+  describe('xDailyDateKey_', () => {
+    it('keeps a plain date and cuts an ISO timestamp to its day', () => {
+      expect(Code.xDailyDateKey_('2026-11-10')).toBe('2026-11-10');
+      expect(Code.xDailyDateKey_('2026-11-10T00:00:00.000Z')).toBe(
+        '2026-11-10'
+      );
+    });
+
+    it('formats a stored Date cell in Asia/Tokyo', () => {
+      expect(Code.xDailyDateKey_(new Date('2026-11-10T00:00:00.000Z'))).toBe(
+        '2026-11-10'
+      );
+      // 16:00 UTC is already the next day in Tokyo.
+      expect(Code.xDailyDateKey_(new Date('2026-11-09T16:00:00.000Z'))).toBe(
+        '2026-11-10'
+      );
+    });
+
+    it('returns null for anything without a leading date', () => {
+      expect(Code.xDailyDateKey_('not-a-date')).toBeNull();
+      expect(Code.xDailyDateKey_('')).toBeNull();
+      expect(Code.xDailyDateKey_(null)).toBeNull();
+      expect(Code.xDailyDateKey_(undefined)).toBeNull();
+      expect(Code.xDailyDateKey_(20261110)).toBeNull();
     });
   });
 
@@ -422,6 +525,16 @@ describe('X via tweet-gas (GAS-to-GAS sync)', () => {
       expect(Code.buildSnsHistoryXDailyRows_(snap)).toEqual([]);
     });
 
+    it('keys x_daily rows by the calendar day of timestamp-shaped dates', () => {
+      const snap = snapshotWithX();
+      snap.x.api_daily_posts = [
+        { date: '2026-11-09T00:00:00.000Z', tweets_consumed: 140 },
+      ];
+      expect(Code.buildSnsHistoryXDailyRows_(snap)).toEqual([
+        ['2026-11-09', 140, '2026-11-10T00:00:00.000Z'],
+      ]);
+    });
+
     it('upserts x_daily end to end through appendSnsHistory_', () => {
       const snap = snapshotWithX();
       snap.x.api_daily_posts = [{ date: '2026-11-09', tweets_consumed: 100 }];
@@ -433,6 +546,23 @@ describe('X via tweet-gas (GAS-to-GAS sync)', () => {
       Code.appendSnsHistory_(snap);
       // Still one row for the day, carrying the newer count.
       expect(sheets.x_daily.rows).toHaveLength(2);
+      expect(sheets.x_daily.rows[1][1]).toBe(140);
+    });
+
+    it('merges a stored timestamp-shaped x_daily row into the normalized day', () => {
+      serveTabs({
+        x_daily: [
+          Code.SNS_HISTORY_X_DAILY_COLUMNS,
+          ['2026-11-09T00:00:00.000Z', 100, '2026-11-10T00:00:00.000Z'],
+        ],
+      });
+      const snap = snapshotWithX();
+      snap.x.api_daily_posts = [{ date: '2026-11-09', tweets_consumed: 140 }];
+      Code.appendSnsHistory_(snap);
+      // The legacy row converges onto the day key instead of
+      // surviving as a second row for the same day.
+      expect(sheets.x_daily.rows).toHaveLength(2);
+      expect(sheets.x_daily.rows[1][0]).toBe('2026-11-09');
       expect(sheets.x_daily.rows[1][1]).toBe(140);
     });
 
@@ -529,6 +659,33 @@ describe('X via tweet-gas (GAS-to-GAS sync)', () => {
       const detail = Code.buildSnsDetailFromSheet_();
       expect(detail.x.api_daily_posts).toEqual([
         { date: '2026-11-08', tweets_consumed: null },
+        { date: '2026-11-09', tweets_consumed: 140 },
+      ]);
+    });
+
+    it('normalizes stored x_daily date shapes on the read side', () => {
+      serveTabs({
+        account: [
+          Code.SNS_HISTORY_ACCOUNT_COLUMNS,
+          accountRow({
+            collected_at: '2026-11-10T00:00:00.000Z',
+            x_followers: 321,
+            x_api_balance_usd: 41.65,
+          }),
+        ],
+        x_daily: [
+          Code.SNS_HISTORY_X_DAILY_COLUMNS,
+          // A row stored in the timestamp shape, the same day
+          // stored again normalized, and a date cell Sheets
+          // coerced into a Date: one entry per calendar day.
+          ['2026-11-09T00:00:00.000Z', 100, '2026-11-10T00:00:00.000Z'],
+          ['2026-11-09', 140, '2026-11-10T01:00:00.000Z'],
+          [new Date('2026-11-08T00:00:00.000Z'), 55, '2026-11-10T00:00:00.000Z'],
+        ],
+      });
+      const detail = Code.buildSnsDetailFromSheet_();
+      expect(detail.x.api_daily_posts).toEqual([
+        { date: '2026-11-08', tweets_consumed: 55 },
         { date: '2026-11-09', tweets_consumed: 140 },
       ]);
     });

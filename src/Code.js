@@ -1146,6 +1146,46 @@ function xWireNumberOrNull_(value) {
   return Number.isFinite(num) ? num : null;
 }
 
+// The day key of one X daily-posts entry: the leading
+// "YYYY-MM-DD" of the wire date, or null when the value does
+// not start with that shape. tweet-gas has shipped the dates
+// both as plain "YYYY-MM-DD" and as full ISO timestamps
+// ("2026-11-10T00:00:00.000Z" — seen in production on
+// 2026-11-13, with a tweet-gas-side trim in flight); only the
+// leading date part names the day, so anything past it is cut
+// here instead of letting the two shapes split one day into
+// two x_daily keys. A Date (what Sheets hands back for a
+// stored date cell) is formatted in Asia/Tokyo by the same
+// rule the stored upsert keys use.
+function xDailyDateKey_(value) {
+  if (value instanceof Date) {
+    return snsHistoryKeyCell_(value) || null;
+  }
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const match = /^(\d{4}-\d{2}-\d{2})/.exec(value.trim());
+  return match ? match[1] : null;
+}
+
+// One entry per day out of normalized daily-posts entries:
+// entries the normalization could not date are dropped, a day
+// that arrives twice (e.g. once per date shape) keeps its last
+// entry — the same winner the x_daily upsert would keep — and
+// the result is ascending, capped at the newest days.
+function dedupeXDailyPosts_(entries) {
+  const byDate = {};
+  (entries || []).forEach((entry) => {
+    if (entry && entry.date) {
+      byDate[entry.date] = entry;
+    }
+  });
+  return Object.keys(byDate)
+    .sort()
+    .slice(-SNS_X_DAILY_POSTS_LIMIT)
+    .map((date) => byDate[date]);
+}
+
 // The X API usage section from the tweet-gas response: the
 // credit balance (USD) and the daily post consumption, or nulls
 // when the response carries no usage half. The contract (set by
@@ -1154,10 +1194,14 @@ function xWireNumberOrNull_(value) {
 // Bearer token at all) and usage_error (a summary string, or
 // null). Inside x_usage, credit_balance_usd is the balance
 // total and daily_posts is the last 90 days of
-// { date: "YYYY-MM-DD", tweets_consumed } in ascending order;
-// either half may independently be missing (null) when its own
-// fetch failed, with usage_error saying so. A balance the API
-// reports as zero is a real balance and is kept.
+// { date, tweets_consumed } in ascending order — the date
+// nominally "YYYY-MM-DD" but normalized through
+// xDailyDateKey_ because production has also sent full ISO
+// timestamps; either half may independently be missing (null)
+// when its own fetch failed, with usage_error saying so. A
+// balance the API reports as zero is a real balance and is
+// kept. Fields this side does not consume (cycle_posts_consumed
+// and friends) are ignored, never an error.
 function extractXUsage_(data) {
   const result = { balance_usd: null, daily_posts: null, usage_error: null };
   const root = data || {};
@@ -1170,20 +1214,15 @@ function extractXUsage_(data) {
   }
   result.balance_usd = xWireNumberOrNull_(usage.credit_balance_usd);
   if (Array.isArray(usage.daily_posts)) {
-    result.daily_posts = usage.daily_posts
-      .map((entry) => {
+    result.daily_posts = dedupeXDailyPosts_(
+      usage.daily_posts.map((entry) => {
         const item = entry || {};
         return {
-          date:
-            typeof item.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item.date)
-              ? item.date
-              : null,
+          date: xDailyDateKey_(item.date),
           tweets_consumed: xWireNumberOrNull_(item.tweets_consumed),
         };
       })
-      .filter((entry) => entry.date)
-      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))
-      .slice(-SNS_X_DAILY_POSTS_LIMIT);
+    );
   }
   return result;
 }
@@ -3490,22 +3529,30 @@ function buildSnsHistoryXMediaRows_(snapshot) {
 
 // One "x_daily" row per entry of x.api_daily_posts: the X API
 // post consumption of one calendar day, keyed by its date like
-// the Instagram "daily" tab. A failed daily fetch (the snapshot
-// carries null) contributes no rows, so stored days are never
-// erased by an outage; a day whose count the API did not report
-// (tweets_consumed null) still records its date with an empty
-// count cell.
+// the Instagram "daily" tab. The date is normalized through
+// xDailyDateKey_ on the way in, so a snapshot whose days still
+// carry full ISO timestamps keys them by their calendar day.
+// A failed daily fetch (the snapshot carries null) contributes
+// no rows, so stored days are never erased by an outage; a day
+// whose count the API did not report (tweets_consumed null)
+// still records its date with an empty count cell.
 function buildSnsHistoryXDailyRows_(snapshot) {
   const snap = snapshot || {};
   const x = snap.x || {};
   const days = Array.isArray(x.api_daily_posts) ? x.api_daily_posts : [];
-  return days
-    .filter((entry) => entry && typeof entry.date === 'string' && entry.date)
-    .map((entry) => [
-      snsHistoryTextCell_(entry.date),
-      snsHistoryNumCell_(entry.tweets_consumed),
-      snsHistoryTextCell_(snap.collected_at),
-    ]);
+  return dedupeXDailyPosts_(
+    days.map((entry) => {
+      const item = entry || {};
+      return {
+        date: xDailyDateKey_(item.date),
+        tweets_consumed: item.tweets_consumed,
+      };
+    })
+  ).map((entry) => [
+    snsHistoryTextCell_(entry.date),
+    snsHistoryNumCell_(entry.tweets_consumed),
+    snsHistoryTextCell_(snap.collected_at),
+  ]);
 }
 
 // One "ig_demographics" row per (breakdown, segment) of
@@ -3592,7 +3639,13 @@ function ensureSnsHistorySheet_(spreadsheet, name, columns) {
 // upsert matches on. Sheets coerces a "YYYY-MM-DD" string into a
 // Date, so a stored daily key is formatted back in Asia/Tokyo —
 // the timezone every daily key is written in — by shifting the
-// instant nine hours ahead and reading the UTC fields.
+// instant nine hours ahead and reading the UTC fields. A string
+// key that still carries a full ISO timestamp (the shape
+// tweet-gas once sent for the x_daily dates) is cut back to its
+// leading calendar day, so a row stored in that shape merges
+// with — instead of duplicating — the day's normalized row.
+// Non-date keys (post ids, metric names) never match that
+// prefix shape and pass through untouched.
 function snsHistoryKeyCell_(value) {
   if (value instanceof Date) {
     if (Number.isNaN(value.getTime())) {
@@ -3611,7 +3664,9 @@ function snsHistoryKeyCell_(value) {
   if (value === null || value === undefined) {
     return '';
   }
-  return String(value).trim();
+  const text = String(value).trim();
+  const timestamp = /^(\d{4}-\d{2}-\d{2})T/.exec(text);
+  return timestamp ? timestamp[1] : text;
 }
 
 // Reads the data rows (everything under the header) of a history
@@ -4998,14 +5053,17 @@ function buildSnsDetailFromSheet_(openedSpreadsheet) {
     SNS_HISTORY_X_DAILY_COLUMNS
   );
   if (xDailyRows) {
-    x.api_daily_posts = xDailyRows
-      .map((row) => ({
-        date: historyTextOrNull_(row.date),
+    // Stored dates are normalized on the way out as well: a
+    // row written before the ingestion-side normalization (or
+    // a date cell Sheets coerced into a Date) must still read
+    // back as its calendar day, and two stored shapes of one
+    // day must not surface as two entries.
+    x.api_daily_posts = dedupeXDailyPosts_(
+      xDailyRows.map((row) => ({
+        date: xDailyDateKey_(row.date),
         tweets_consumed: num(row.tweets_consumed),
       }))
-      .filter((entry) => entry.date)
-      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))
-      .slice(-SNS_X_DAILY_POSTS_LIMIT);
+    );
   }
   const xRows = readHistoryTabObjects_(
     spreadsheet,
@@ -6058,6 +6116,8 @@ if (typeof exports !== 'undefined') {
   exports.summarizeYouTubeError_ = summarizeYouTubeError_;
   exports.fetchXDetail_ = fetchXDetail_;
   exports.extractXUsage_ = extractXUsage_;
+  exports.xDailyDateKey_ = xDailyDateKey_;
+  exports.dedupeXDailyPosts_ = dedupeXDailyPosts_;
   exports.buildXPostEntry_ = buildXPostEntry_;
   exports.xWireNumberOrNull_ = xWireNumberOrNull_;
   exports.isTokenRefreshDue_ = isTokenRefreshDue_;

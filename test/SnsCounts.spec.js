@@ -1080,6 +1080,12 @@ describe('SNS follower counts', () => {
       expect(
         Code.snsHistoryKeyCell_(new Date('2026-11-08T14:59:59.000Z'))
       ).toBe('2026-11-08');
+      // A key stored as a full ISO timestamp cuts back to its
+      // calendar day; a date alone is not cut further.
+      expect(Code.snsHistoryKeyCell_('2026-11-10T00:00:00.000Z')).toBe(
+        '2026-11-10'
+      );
+      expect(Code.snsHistoryKeyCell_('2026-11-10')).toBe('2026-11-10');
     });
 
     it('blanks null values and the total when every follower count is null', () => {
