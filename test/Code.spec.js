@@ -752,7 +752,8 @@ describe('Code.js', () => {
       expect(issued.ok).toBe(true);
       expect(issued.session_token).toMatch(/^[0-9a-f]{64}$/);
       expect(issued.ttl_seconds).toBe(30 * 24 * 60 * 60);
-      expect(store.OWNER_TOKEN_HASH).toBe(Code.hashShareToken_(issued.session_token));
+      expect(JSON.parse(store.OWNER_SESSIONS)[Code.hashShareToken_(issued.session_token)]).toBe(issued.expires_at);
+      expect(store.OWNER_TOKEN_HASH).toBeUndefined();
       Code.doGet({ parameter: { session_token: issued.session_token } });
       expect(lastJson().ok).toBe(true);
       Code.doGet({ parameter: { session_token: 'bogus' } });
@@ -784,6 +785,96 @@ describe('Code.js', () => {
       Code.doGet({ parameter: { action: 'revoke_session', session_token: 'bogus' } });
       expect(lastJson().ok).toBe(false);
       expect(Code.validateOwnerToken_(token)).not.toBeNull();
+    });
+
+    it('owner sessions: a second session does not invalidate the first', () => {
+      setProperty(PROPERTY_ID);
+      configureAuth();
+      mockAuthFetch({ payload: goodPayload() });
+      mockHistorySheet({ blog_pages: BLOG_PAGES_TAB });
+      const first = Code.issueOwnerSession_().session_token;
+      const second = Code.issueOwnerSession_().session_token;
+      expect(second).not.toBe(first);
+      expect(Code.validateOwnerToken_(first)).not.toBeNull();
+      expect(Code.validateOwnerToken_(second)).not.toBeNull();
+      expect(Object.keys(JSON.parse(store.OWNER_SESSIONS))).toHaveLength(2);
+      Code.doGet({ parameter: { session_token: first } });
+      expect(lastJson().ok).toBe(true);
+      Code.doGet({ parameter: { session_token: second } });
+      expect(lastJson().ok).toBe(true);
+    });
+
+    it('owner sessions: logout revokes only its own session', () => {
+      setProperty(PROPERTY_ID);
+      const first = Code.issueOwnerSession_().session_token;
+      const second = Code.issueOwnerSession_().session_token;
+      Code.doGet({ parameter: { action: 'revoke_session', session_token: first } });
+      expect(lastJson()).toEqual({ ok: true, revoked: true });
+      expect(Code.validateOwnerToken_(first)).toBeNull();
+      expect(Code.validateOwnerToken_(second)).not.toBeNull();
+      // A revoke without a token identifies no session and
+      // must not clear the remaining one.
+      Code.revokeOwnerSession_();
+      expect(Code.validateOwnerToken_(second)).not.toBeNull();
+      Code.revokeOwnerSession_(second);
+      expect(Code.validateOwnerToken_(second)).toBeNull();
+    });
+
+    it('owner sessions: a legacy single token still validates and migrates on issue', () => {
+      const legacyToken = 'legacy-owner-token';
+      const legacyExpires = new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString();
+      store.OWNER_TOKEN_HASH = Code.hashShareToken_(legacyToken);
+      store.OWNER_EXPIRES_AT = legacyExpires;
+      // Validates against the old keys before any new session exists.
+      expect(Code.validateOwnerToken_(legacyToken)).toEqual({ expires_at: legacyExpires });
+      // Issuing a new session migrates the legacy one into the map
+      // instead of overwriting it, and removes the legacy keys.
+      const issued = Code.issueOwnerSession_();
+      expect(Code.validateOwnerToken_(legacyToken)).toEqual({ expires_at: legacyExpires });
+      expect(Code.validateOwnerToken_(issued.session_token)).not.toBeNull();
+      expect(store.OWNER_TOKEN_HASH).toBeUndefined();
+      expect(store.OWNER_EXPIRES_AT).toBeUndefined();
+      const map = JSON.parse(store.OWNER_SESSIONS);
+      expect(map[Code.hashShareToken_(legacyToken)]).toBe(legacyExpires);
+      expect(map[Code.hashShareToken_(issued.session_token)]).toBe(issued.expires_at);
+      // Revoking the migrated legacy session leaves the new one live.
+      Code.revokeOwnerSession_(legacyToken);
+      expect(Code.validateOwnerToken_(legacyToken)).toBeNull();
+      expect(Code.validateOwnerToken_(issued.session_token)).not.toBeNull();
+    });
+
+    it('owner sessions: an expired legacy token and expired map entries are rejected', () => {
+      const legacyToken = 'expired-legacy-token';
+      store.OWNER_TOKEN_HASH = Code.hashShareToken_(legacyToken);
+      store.OWNER_EXPIRES_AT = '2000-01-01T00:00:00.000Z';
+      expect(Code.validateOwnerToken_(legacyToken)).toBeNull();
+      const token = 'expired-map-token';
+      store.OWNER_SESSIONS = JSON.stringify({
+        [Code.hashShareToken_(token)]: '2000-01-01T00:00:00.000Z',
+      });
+      expect(Code.validateOwnerToken_(token)).toBeNull();
+      // Issuing prunes the expired entry instead of carrying it over.
+      const issued = Code.issueOwnerSession_();
+      const map = JSON.parse(store.OWNER_SESSIONS);
+      expect(Object.keys(map)).toEqual([Code.hashShareToken_(issued.session_token)]);
+    });
+
+    it('owner sessions: a corrupt OWNER_SESSIONS value does not break issue or validate', () => {
+      store.OWNER_SESSIONS = 'not-json{';
+      const issued = Code.issueOwnerSession_();
+      expect(Code.validateOwnerToken_(issued.session_token)).not.toBeNull();
+    });
+
+    it('share sessions: reissuing still invalidates the previous share link', () => {
+      const first = Code.issueShareSession_().share_token;
+      const second = Code.issueShareSession_().share_token;
+      expect(second).not.toBe(first);
+      expect(Code.validateShareToken_(first)).toBeNull();
+      expect(Code.validateShareToken_(second)).not.toBeNull();
+      // Owner sessions are stored separately and are untouched.
+      const owner = Code.issueOwnerSession_().session_token;
+      Code.issueShareSession_();
+      expect(Code.validateOwnerToken_(owner)).not.toBeNull();
     });
 
     it('private actions fail closed when auth properties are unset', () => {

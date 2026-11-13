@@ -396,18 +396,96 @@ function validateShareToken_(token) {
 // --- Owner sessions (long-lived sign-in) ---
 // Google ID tokens expire after about an hour, which used to drop the
 // owner back at the sign-in gate. After a Google sign-in the frontend
-// exchanges the ID token for one of these 30-day owner sessions (same
-// Script Properties storage as the share session, separate keys) and
-// uses it for all later calls. Issuing a new one overwrites the old
-// one, and the frontend revokes its session on logout.
+// exchanges the ID token for one of these 30-day owner sessions and
+// uses it for all later calls. The frontend revokes only its own
+// session on logout.
+//
+// Storage: a JSON map in the Script Property OWNER_SESSIONS, of the
+// form { "<sha256 hash of token>": "<expires_at ISO>", ... }.
+// Owner sessions coexist across devices and browsers: issuing a new
+// one adds an entry and does NOT overwrite or revoke the others
+// (unlike share sessions, where reissuing must invalidate the old
+// link -- that behaviour is unchanged and lives in separate keys).
+// A Script Property map is used instead of a sheet tab because this
+// app's history spreadsheet is optional (SNS_HISTORY_SHEET_ID may be
+// unset, in which case SpreadsheetApp is never touched), while auth
+// must work regardless; share and owner sessions have always lived
+// in Script Properties here. Each entry is about 100 bytes, expired
+// entries are pruned on load, and the map is capped at
+// OWNER_SESSIONS_MAX newest entries, so it stays far below the
+// per-property size limit. The property is created by this code on
+// first issue, so no manual property setup is needed.
+//
+// Backward compatibility: the previous single-session keys
+// OWNER_TOKEN_HASH / OWNER_EXPIRES_AT are still honoured.
+// loadOwnerSessions_() merges a live legacy entry into the map in
+// memory, so a token issued before this change keeps working until
+// its own 30-day expiry; issueOwnerSession_() then persists the
+// merged map and deletes the legacy keys (the migration).
+
+const OWNER_SESSIONS_PROPERTY = 'OWNER_SESSIONS';
+const OWNER_SESSIONS_MAX = 10;
+
+function loadOwnerSessions_(props) {
+  const nowIso = new Date().toISOString();
+  const sessions = {};
+  try {
+    const parsed = JSON.parse(props.getProperty(OWNER_SESSIONS_PROPERTY) || '{}');
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      for (const hash of Object.keys(parsed)) {
+        const expiresAt = parsed[hash];
+        if (typeof expiresAt === 'string' && expiresAt > nowIso) {
+          sessions[hash] = expiresAt;
+        }
+      }
+    }
+  } catch (err) {
+    // A corrupt map must not lock the owner out: start from an
+    // empty map; a live legacy entry below is still merged in.
+  }
+  const legacyHash = props.getProperty('OWNER_TOKEN_HASH');
+  const legacyExpiresAt = props.getProperty('OWNER_EXPIRES_AT');
+  if (
+    legacyHash &&
+    legacyExpiresAt &&
+    legacyExpiresAt > nowIso &&
+    !(legacyHash in sessions)
+  ) {
+    sessions[legacyHash] = legacyExpiresAt;
+  }
+  return sessions;
+}
+
+function saveOwnerSessions_(props, sessions) {
+  let entries = Object.entries(sessions);
+  if (entries.length > OWNER_SESSIONS_MAX) {
+    entries.sort((a, b) => (a[1] < b[1] ? 1 : a[1] > b[1] ? -1 : 0));
+    entries = entries.slice(0, OWNER_SESSIONS_MAX);
+  }
+  if (!entries.length) {
+    props.deleteProperty(OWNER_SESSIONS_PROPERTY);
+    return {};
+  }
+  const trimmed = {};
+  for (const [hash, expiresAt] of entries) {
+    trimmed[hash] = expiresAt;
+  }
+  props.setProperty(OWNER_SESSIONS_PROPERTY, JSON.stringify(trimmed));
+  return trimmed;
+}
 
 function issueOwnerSession_() {
   const now = new Date();
   const expires = new Date(now.getTime() + SHARE_TTL_SECONDS * 1000);
   const token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
   const props = PropertiesService.getScriptProperties();
-  props.setProperty('OWNER_TOKEN_HASH', hashShareToken_(token));
-  props.setProperty('OWNER_EXPIRES_AT', expires.toISOString());
+  const sessions = loadOwnerSessions_(props);
+  sessions[hashShareToken_(token)] = expires.toISOString();
+  saveOwnerSessions_(props, sessions);
+  // The merged map now carries any legacy session, so the old
+  // single-session keys are removed (the migration step).
+  props.deleteProperty('OWNER_TOKEN_HASH');
+  props.deleteProperty('OWNER_EXPIRES_AT');
   return {
     session_token: token,
     issued_at: now.toISOString(),
@@ -416,10 +494,22 @@ function issueOwnerSession_() {
   };
 }
 
-function revokeOwnerSession_() {
+function revokeOwnerSession_(token) {
   const props = PropertiesService.getScriptProperties();
-  props.deleteProperty('OWNER_TOKEN_HASH');
-  props.deleteProperty('OWNER_EXPIRES_AT');
+  if (token) {
+    const hash = hashShareToken_(token);
+    const sessions = loadOwnerSessions_(props);
+    if (hash in sessions) {
+      delete sessions[hash];
+      saveOwnerSessions_(props, sessions);
+    }
+    if (props.getProperty('OWNER_TOKEN_HASH') === hash) {
+      props.deleteProperty('OWNER_TOKEN_HASH');
+      props.deleteProperty('OWNER_EXPIRES_AT');
+    }
+  }
+  // Without a token the session to revoke cannot be identified, so
+  // no other session is touched (mirrors health-gas).
   return { revoked: true };
 }
 
@@ -428,12 +518,9 @@ function validateOwnerToken_(token) {
     return null;
   }
   const props = PropertiesService.getScriptProperties();
-  const hash = props.getProperty('OWNER_TOKEN_HASH');
-  if (!hash || hashShareToken_(token) !== hash) {
-    return null;
-  }
-  const expiresAt = props.getProperty('OWNER_EXPIRES_AT');
-  if (!expiresAt || expiresAt <= new Date().toISOString()) {
+  const sessions = loadOwnerSessions_(props);
+  const expiresAt = sessions[hashShareToken_(token)];
+  if (!expiresAt) {
     return null;
   }
   return { expires_at: expiresAt };
@@ -6188,7 +6275,7 @@ function doGet(e) {
       if (!parameter.session_token || !validateOwnerToken_(parameter.session_token)) {
         return jsonOut_({ ok: false, status: 401, error: 'session expired or invalid' });
       }
-      return jsonOut_(Object.assign({ ok: true }, revokeOwnerSession_()));
+      return jsonOut_(Object.assign({ ok: true }, revokeOwnerSession_(parameter.session_token)));
     }
     if (parameter.action === 'issue_share' || parameter.action === 'revoke_share') {
       try {
@@ -6264,6 +6351,10 @@ if (typeof exports !== 'undefined') {
   exports.issueOwnerSession_ = issueOwnerSession_;
   exports.revokeOwnerSession_ = revokeOwnerSession_;
   exports.validateOwnerToken_ = validateOwnerToken_;
+  exports.loadOwnerSessions_ = loadOwnerSessions_;
+  exports.saveOwnerSessions_ = saveOwnerSessions_;
+  exports.OWNER_SESSIONS_PROPERTY = OWNER_SESSIONS_PROPERTY;
+  exports.OWNER_SESSIONS_MAX = OWNER_SESSIONS_MAX;
   exports.hashShareToken_ = hashShareToken_;
   exports.isAuthConfigured_ = isAuthConfigured_;
   exports.extractIdToken_ = extractIdToken_;
