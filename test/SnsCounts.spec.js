@@ -897,7 +897,7 @@ describe('SNS follower counts', () => {
 
     const expectedAccountValues = [
       1988, 59, 252, 8, 2248, 2404, 10000, 96.3, 5000, 1200, 3000, 2000, 300,
-      400, 300, 46, 'total_value', 498, 58, 123456, 42, '',
+      400, 300, 46, 'total_value', 498, 58, 123456, 42, '', '',
     ];
 
     beforeEach(() => {
@@ -2070,11 +2070,12 @@ describe('SNS follower counts', () => {
           unfollows_30d: 30,
           yt_total_views: 123456,
           x_followers: 321,
+          x_api_balance_usd: null,
         },
       ]);
-      // Only the 18 served columns come back: no anemone counts, no
+      // Only the 19 served columns come back: no anemone counts, no
       // taps source, no other sheet columns leak into the response.
-      expect(Object.keys(json.rows[0])).toHaveLength(18);
+      expect(Object.keys(json.rows[0])).toHaveLength(19);
     });
 
     it('sorts ascending by collected_at and drops timestamp-less rows', () => {
