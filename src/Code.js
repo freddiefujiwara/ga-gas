@@ -221,11 +221,6 @@ function getScriptProperty_(key) {
   return PropertiesService.getScriptProperties().getProperty(key) || '';
 }
 
-function isAuthConfigured_() {
-  return Boolean(getScriptProperty_('GOOGLE_OAUTH_CLIENT_ID')) &&
-    getAllowedEmails_().length > 0;
-}
-
 function extractIdToken_(e) {
   const headers = (e && e.headers) || {};
   const auth = headers.Authorization || headers.authorization || '';
@@ -6550,7 +6545,6 @@ if (typeof exports !== 'undefined') {
   exports.OWNER_SESSIONS_PROPERTY = OWNER_SESSIONS_PROPERTY;
   exports.OWNER_SESSIONS_MAX = OWNER_SESSIONS_MAX;
   exports.hashShareToken_ = hashShareToken_;
-  exports.isAuthConfigured_ = isAuthConfigured_;
   exports.extractIdToken_ = extractIdToken_;
   exports.getAllowedEmails_ = getAllowedEmails_;
   exports.verifyGoogleIdTokenOrThrow_ = verifyGoogleIdTokenOrThrow_;

@@ -551,14 +551,6 @@ describe('Code.js', () => {
         overrides || {}
       );
 
-    it('isAuthConfigured_ reflects the two properties', () => {
-      expect(Code.isAuthConfigured_()).toBe(false);
-      store.GOOGLE_OAUTH_CLIENT_ID = CLIENT_ID;
-      expect(Code.isAuthConfigured_()).toBe(false);
-      store.AVAILABLE_GMAILS = EMAIL;
-      expect(Code.isAuthConfigured_()).toBe(true);
-    });
-
     it('extractIdToken_ prefers the Bearer header and falls back to the parameter', () => {
       expect(
         Code.extractIdToken_({ headers: { Authorization: 'Bearer abc' }, parameter: {} })
