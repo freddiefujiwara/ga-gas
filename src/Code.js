@@ -3411,6 +3411,23 @@ const SNS_HISTORY_BLOG_SOURCES_COLUMNS = [
   'views_28d',
   'collected_at',
 ];
+// "blog_scroll" (key: canonical article path) carries each
+// article's read-depth counts over the window, from the blog's
+// article_scroll events: how many displays reached each of the
+// 25 / 50 / 75 / 100 percent scroll marks (the event's
+// percent_scrolled custom dimension, pivoted into one column
+// per level). A level an article never reached stays 0 in its
+// row; articles with no article_scroll event at all have no
+// row. Like blog_posts, every collection re-fetches the whole
+// window, so the counts are the window's latest figures.
+const SNS_HISTORY_BLOG_SCROLL_COLUMNS = [
+  'path',
+  'scroll_25',
+  'scroll_50',
+  'scroll_75',
+  'scroll_100',
+  'collected_at',
+];
 // "blog_speed" (key: JST date + canonical article path) carries
 // each article's total article_render time and sample count for
 // one calendar day, from the blog's article_render event
@@ -3989,6 +4006,13 @@ function appendSnsHistory_(snapshot) {
 //     be summed out of blog_daily; it is collected as-is.
 //   - "blog_sources" (key: channel): the window's views split
 //     by sessionDefaultChannelGroup, for the sources ranking.
+//   - "blog_scroll" (key: path): one row per article, carrying
+//     its article_scroll counts over the window pivoted by the
+//     percent_scrolled marks (25 / 50 / 75 / 100), so the
+//     screen can show how far each article is actually read.
+//     The event only exists since the blog started sending it
+//     (2026-11-14), so older articles simply have no counts
+//     until they are read again.
 //   - "blog_speed" (key: date + path): one row per article per
 //     calendar day, carrying that day's total article_render
 //     time and sample count, from the blog's article_render
@@ -4032,6 +4056,20 @@ const BLOG_RENDER_SLOW_METRIC = 'customEvent:render_slow_count';
 // window-only fetches' does not; the cap sits well above the
 // observed volume (a few dozen rows a day) without paging.
 const BLOG_SPEED_DAILY_FETCH_LIMIT = 5000;
+// The blog's read-depth event: article_scroll fires once per
+// display at each of the 25 / 50 / 75 / 100 percent scroll
+// marks, carrying the mark in the percent_scrolled custom
+// dimension (registered in GA4 with event scope). Counting a
+// named event needs no custom metric — eventCount split by
+// that dimension is the whole report.
+const BLOG_SCROLL_EVENT_NAME = 'article_scroll';
+const BLOG_SCROLL_DIMENSION = 'customEvent:percent_scrolled';
+const BLOG_SCROLL_LEVELS = [25, 50, 75, 100];
+// The scroll fetch keys rows by pagePath x percent_scrolled,
+// so its row count grows with the article count times the
+// levels in a way the window-only fetches' does not; the cap
+// sits well above the observed volume without paging.
+const BLOG_SCROLL_FETCH_LIMIT = 5000;
 
 // One runReport call for the blog history: the report's rows, or
 // null when the API did not answer 200 (or the fetch itself
@@ -4577,6 +4615,82 @@ function migrateBlogSpeedTab_(spreadsheet) {
   }
 }
 
+// The blog's per-article read depth over the last 28 days:
+// the article_scroll eventCount split by pagePath x
+// percent_scrolled, merged under the canonical /blog/<id>
+// path like blog_posts and pivoted into one count per scroll
+// level ({ path, scroll_25, scroll_50, scroll_75,
+// scroll_100 }). Levels with no event stay 0; percent values
+// outside BLOG_SCROLL_LEVELS, non-article paths and zero
+// counts are dropped. Returns null when the report failed —
+// while the percent_scrolled custom dimension is
+// unregistered in GA4 (or no article_scroll event has been
+// recorded yet) the API answers an error, which reads as a
+// failed report and simply skips the tab.
+function fetchBlogScrollData_(propertyId) {
+  const rows = fetchBlogReportRows_(propertyId, {
+    startDate: BLOG_POSTS_WINDOW_DAYS + 'daysAgo',
+    endDate: 'today',
+    metrics: ['eventCount'],
+    dimensions: ['pagePath', BLOG_SCROLL_DIMENSION],
+    limit: BLOG_SCROLL_FETCH_LIMIT,
+    offset: 0,
+    filters: parseFilterClauses_(
+      'eventName:exact:' + BLOG_SCROLL_EVENT_NAME
+    ),
+  });
+  if (!rows) {
+    return null;
+  }
+  const byPath = {};
+  rows.forEach((row) => {
+    const dimensionValues = (row && row.dimensionValues) || [];
+    const id = articleIdFromPath_(
+      dimensionValues[0] && dimensionValues[0].value
+    );
+    if (!id) {
+      return;
+    }
+    const level = Number(
+      dimensionValues[1] && dimensionValues[1].value
+    );
+    if (BLOG_SCROLL_LEVELS.indexOf(level) === -1) {
+      return;
+    }
+    const count = blogReportMetric_(row, 0) || 0;
+    if (!count) {
+      return;
+    }
+    const path = '/blog/' + id;
+    if (!byPath[path]) {
+      const entry = { path };
+      BLOG_SCROLL_LEVELS.forEach((mark) => {
+        entry['scroll_' + mark] = 0;
+      });
+      byPath[path] = entry;
+    }
+    byPath[path]['scroll_' + level] += count;
+  });
+  return Object.keys(byPath)
+    .map((path) => byPath[path])
+    .sort((a, b) => b.scroll_25 - a.scroll_25);
+}
+
+// One "blog_scroll" row per entry of fetchBlogScrollData_.
+function buildBlogScrollRows_(entries, collectedAt) {
+  return (entries || []).map((entry) => {
+    const item = entry || {};
+    return [
+      snsHistoryTextCell_(item.path),
+      snsHistoryNumCell_(item.scroll_25),
+      snsHistoryNumCell_(item.scroll_50),
+      snsHistoryNumCell_(item.scroll_75),
+      snsHistoryNumCell_(item.scroll_100),
+      snsHistoryTextCell_(collectedAt),
+    ];
+  });
+}
+
 // One "blog_sources" row per entry of fetchBlogSourcesData_.
 function buildBlogSourcesRows_(entries, collectedAt) {
   return (entries || []).map((entry) => {
@@ -4666,6 +4780,18 @@ function appendBlogHistory_() {
       );
     } else {
       console.log('Blog history: sources report failed, blog_sources skipped');
+    }
+    const scroll = fetchBlogScrollData_(propertyId);
+    if (scroll) {
+      upsertSnsHistorySheet_(
+        spreadsheet,
+        'blog_scroll',
+        SNS_HISTORY_BLOG_SCROLL_COLUMNS,
+        0,
+        buildBlogScrollRows_(scroll, collectedAt)
+      );
+    } else {
+      console.log('Blog history: scroll report failed, blog_scroll skipped');
     }
     migrateBlogSpeedTab_(spreadsheet);
     const speed = fetchBlogSpeedDailyData_(propertyId);
@@ -5388,6 +5514,19 @@ function blogReportShape_(params) {
       ? 'totals'
       : null;
   }
+  // The per-article read-depth report: pagePath x the
+  // percent_scrolled custom dimension, counted with
+  // eventCount, served from the blog_scroll tab in the same
+  // GA4 shape the live report would return (one row per
+  // article x level; a level with no count has no row).
+  if (
+    dims.length === 2 &&
+    dims[0] === 'pagePath' &&
+    dims[1] === BLOG_SCROLL_DIMENSION &&
+    metrics.join(',') === 'eventCount'
+  ) {
+    return 'scroll';
+  }
   // The per-article display-time report: pagePath x the
   // article_render metric pair (total render_ms, sample count),
   // served from the blog_speed tab in the same GA4 shape the
@@ -5618,6 +5757,58 @@ function blogSourcesData_(spreadsheet, params) {
   };
 }
 
+// The blog_scroll tab in the GA4 report shape: one row per
+// article x scroll level of the newest collection batch, as
+// dimensionValues [path, percent] and metricValues [count].
+// A level whose stored count is 0 (or empty) emits no row,
+// exactly like the live report, which only returns the
+// combinations that occurred. Articles are ordered by their
+// 25% count descending (the widest reach first), levels
+// ascending inside an article.
+function blogScrollData_(spreadsheet) {
+  const rows = readHistoryTabObjects_(
+    spreadsheet,
+    'blog_scroll',
+    SNS_HISTORY_BLOG_SCROLL_COLUMNS
+  );
+  if (!rows) {
+    return null;
+  }
+  const entries = latestBatchRows_(rows)
+    .map((row) => {
+      const entry = { path: historyTextOrNull_(row.path) };
+      BLOG_SCROLL_LEVELS.forEach((mark) => {
+        entry['scroll_' + mark] = snsHistoryNumberCell_(
+          row['scroll_' + mark]
+        );
+      });
+      return entry;
+    })
+    .filter(
+      (entry) =>
+        entry.path &&
+        BLOG_SCROLL_LEVELS.some((mark) => entry['scroll_' + mark])
+    )
+    .sort((a, b) => (b.scroll_25 || 0) - (a.scroll_25 || 0));
+  const reportRows = [];
+  entries.forEach((entry) => {
+    BLOG_SCROLL_LEVELS.forEach((mark) => {
+      const count = entry['scroll_' + mark];
+      if (!count) {
+        return;
+      }
+      reportRows.push({
+        dimensionValues: [
+          { value: String(entry.path) },
+          { value: String(mark) },
+        ],
+        metricValues: [{ value: String(count) }],
+      });
+    });
+  });
+  return { rows: reportRows, rowCount: reportRows.length };
+}
+
 // The report response for the screen's fixed blog reports,
 // assembled from the history sheet. The envelope matches the
 // old live bridge's exactly (including _share, which share
@@ -5687,6 +5878,8 @@ function buildBlogReportResponse_(params, shareSession) {
           data = blogSourcesData_(spreadsheet, params);
         } else if (shape === 'speed') {
           data = blogSpeedData_(spreadsheet, params.metrics.length);
+        } else if (shape === 'scroll') {
+          data = blogScrollData_(spreadsheet);
         }
       }
     } catch (err) {
@@ -5806,6 +5999,7 @@ function precomputeReadCaches_() {
     ],
     ['speed', 2, () => blogSpeedData_(spreadsheet, 2)],
     ['speed', 3, () => blogSpeedData_(spreadsheet, 3)],
+    ['scroll', 1, () => blogScrollData_(spreadsheet)],
   ];
   blogShapes.forEach(([shape, metricsLength, build]) => {
     try {
@@ -6466,6 +6660,12 @@ if (typeof exports !== 'undefined') {
   exports.buildBlogTotalsRows_ = buildBlogTotalsRows_;
   exports.fetchBlogSourcesData_ = fetchBlogSourcesData_;
   exports.buildBlogSourcesRows_ = buildBlogSourcesRows_;
+  exports.fetchBlogScrollData_ = fetchBlogScrollData_;
+  exports.buildBlogScrollRows_ = buildBlogScrollRows_;
+  exports.blogScrollData_ = blogScrollData_;
+  exports.BLOG_SCROLL_EVENT_NAME = BLOG_SCROLL_EVENT_NAME;
+  exports.BLOG_SCROLL_DIMENSION = BLOG_SCROLL_DIMENSION;
+  exports.BLOG_SCROLL_LEVELS = BLOG_SCROLL_LEVELS;
   exports.fetchBlogSpeedDailyData_ = fetchBlogSpeedDailyData_;
   exports.fetchBlogSlowCounts_ = fetchBlogSlowCounts_;
   exports.migrateBlogSpeedTab_ = migrateBlogSpeedTab_;
@@ -6506,6 +6706,7 @@ if (typeof exports !== 'undefined') {
   exports.SNS_HISTORY_BLOG_PAGES_COLUMNS = SNS_HISTORY_BLOG_PAGES_COLUMNS;
   exports.SNS_HISTORY_BLOG_TOTALS_COLUMNS = SNS_HISTORY_BLOG_TOTALS_COLUMNS;
   exports.SNS_HISTORY_BLOG_SOURCES_COLUMNS = SNS_HISTORY_BLOG_SOURCES_COLUMNS;
+  exports.SNS_HISTORY_BLOG_SCROLL_COLUMNS = SNS_HISTORY_BLOG_SCROLL_COLUMNS;
   exports.SNS_HISTORY_BLOG_SPEED_COLUMNS = SNS_HISTORY_BLOG_SPEED_COLUMNS;
   exports.SNS_HISTORY_BLOG_SPEED_CUMULATIVE_COLUMNS =
     SNS_HISTORY_BLOG_SPEED_CUMULATIVE_COLUMNS;
