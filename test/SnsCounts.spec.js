@@ -1461,6 +1461,15 @@ describe('SNS follower counts', () => {
           ga4Row(['20261109', '/blog/2abcdefghijklmnopqrstuvwx'], [2]),
           ga4Row(['20261109', '/'], [5]),
         ],
+        scroll: [
+          ga4Row(['/1abcdefghijklmnopqrstuvwx', '25'], [20]),
+          ga4Row(['/blog/1abcdefghijklmnopqrstuvwx', '25'], [5]),
+          ga4Row(['/blog/1abcdefghijklmnopqrstuvwx', '50'], [15]),
+          ga4Row(['/blog/1abcdefghijklmnopqrstuvwx', '100'], [4]),
+          ga4Row(['/blog/2abcdefghijklmnopqrstuvwx', '25'], [3]),
+          ga4Row(['/blog/2abcdefghijklmnopqrstuvwx', '10'], [9]),
+          ga4Row(['/', '25'], [7]),
+        ],
         posts: [
           ga4Row(['/1abcdefghijklmnopqrstuvwx', '記事タイトルA'], [10]),
           ga4Row(['/blog/1abcdefghijklmnopqrstuvwx', '記事タイトルA別形'], [5]),
@@ -1483,6 +1492,9 @@ describe('SNS follower counts', () => {
         ga4Requests.push(body);
         const dimensions = (body.dimensions || []).map((d) => d.name);
         const filterText = JSON.stringify(body.dimensionFilter || {});
+        if (filterText.includes('article_scroll')) {
+          return res(200, { rows: bodies.scroll });
+        }
         if (filterText.includes('article_render_slow')) {
           return res(200, { rows: bodies.slow });
         }
@@ -1839,6 +1851,112 @@ describe('SNS follower counts', () => {
     it('returns null for the slow counts when the report fails', () => {
       fetchHandler = () => res(500, { error: { message: 'boom' } });
       expect(Code.fetchBlogSlowCounts_('561730442')).toBeNull();
+    });
+
+    it('pivots the scroll counts by level, merging split article paths', () => {
+      mockGa4Blog();
+      const scroll = Code.fetchBlogScrollData_('561730442');
+      expect(scroll).toEqual([
+        {
+          path: '/blog/1abcdefghijklmnopqrstuvwx',
+          scroll_25: 25,
+          scroll_50: 15,
+          scroll_75: 0,
+          scroll_100: 4,
+        },
+        {
+          path: '/blog/2abcdefghijklmnopqrstuvwx',
+          scroll_25: 3,
+          scroll_50: 0,
+          scroll_75: 0,
+          scroll_100: 0,
+        },
+      ]);
+      const scrollBody = ga4Requests.find((body) =>
+        JSON.stringify(body.dimensionFilter || {}).includes('article_scroll')
+      );
+      expect(scrollBody.metrics).toEqual([{ name: 'eventCount' }]);
+      expect(scrollBody.dimensions).toEqual([
+        { name: 'pagePath' },
+        { name: 'customEvent:percent_scrolled' },
+      ]);
+      expect(scrollBody.dateRanges).toEqual([
+        { startDate: '28daysAgo', endDate: 'today' },
+      ]);
+    });
+
+    it('returns null for the scroll data when the report fails', () => {
+      fetchHandler = () => res(500, { error: { message: 'boom' } });
+      expect(Code.fetchBlogScrollData_('561730442')).toBeNull();
+    });
+
+    it('builds blog_scroll rows with one count per level', () => {
+      const rows = Code.buildBlogScrollRows_(
+        [
+          {
+            path: '/blog/1abcdefghijklmnopqrstuvwx',
+            scroll_25: 25,
+            scroll_50: 15,
+            scroll_75: 0,
+            scroll_100: 4,
+          },
+        ],
+        '2026-11-09T03:00:00.000Z'
+      );
+      expect(rows).toEqual([
+        [
+          '/blog/1abcdefghijklmnopqrstuvwx',
+          25,
+          15,
+          0,
+          4,
+          '2026-11-09T03:00:00.000Z',
+        ],
+      ]);
+      expect(Code.buildBlogScrollRows_(null, 't')).toEqual([]);
+    });
+
+    it('writes the blog_scroll tab end to end', () => {
+      mockGa4Blog();
+      Code.appendBlogHistory_();
+      expect(sheets.blog_scroll.rows[0]).toEqual(
+        Code.SNS_HISTORY_BLOG_SCROLL_COLUMNS
+      );
+      expect(sheets.blog_scroll.rows).toHaveLength(3);
+      expect(sheets.blog_scroll.rows[1].slice(0, 5)).toEqual([
+        '/blog/1abcdefghijklmnopqrstuvwx',
+        25,
+        15,
+        0,
+        4,
+      ]);
+      expect(sheets.blog_scroll.rows[2].slice(0, 5)).toEqual([
+        '/blog/2abcdefghijklmnopqrstuvwx',
+        3,
+        0,
+        0,
+        0,
+      ]);
+    });
+
+    it('skips the blog_scroll tab when the scroll report fails', () => {
+      mockGa4Blog();
+      const inner = fetchHandler;
+      fetchHandler = (url, options) => {
+        const body = JSON.parse(options.payload);
+        if (
+          JSON.stringify(body.dimensionFilter || {}).includes(
+            'article_scroll'
+          )
+        ) {
+          return res(500, { error: { message: 'boom' } });
+        }
+        return inner(url, options);
+      };
+      Code.appendBlogHistory_();
+      expect(sheets.blog_scroll).toBeUndefined();
+      // The other tabs are unaffected by the failed scroll report.
+      expect(sheets.blog_posts.rows).toHaveLength(3);
     });
 
     it('writes the blog_speed tab end to end', () => {

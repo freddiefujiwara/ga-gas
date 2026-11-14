@@ -654,6 +654,91 @@ describe('Sheet-backed read side (stage 2)', () => {
       ]);
     });
 
+    it('serves the scroll shape from blog_scroll, one row per article x level', () => {
+      serveTabs(
+        Object.assign(blogTabs(), {
+          blog_scroll: [
+            Code.SNS_HISTORY_BLOG_SCROLL_COLUMNS,
+            // A stale batch row must not leak into the ranking.
+            ['/blog/9stalearticle00000000000', 999, 999, 999, 999, AT_OLD],
+            ['/blog/1abcdefghijklmnopqrstuvwx', 25, 15, 0, 4, AT_NEW],
+            ['/blog/2abcdefghijklmnopqrstuvwx', 3, 0, 0, 0, AT_NEW],
+          ],
+        })
+      );
+      const response = Code.buildBlogReportResponse_(
+        paramsFor({
+          dimensions: ['pagePath', 'customEvent:percent_scrolled'],
+          metrics: ['eventCount'],
+          limit: 25,
+        }),
+        null
+      );
+      expect(response.ok).toBe(true);
+      // The zero counts (75% of the first article, everything
+      // past 25% of the second) emit no row, like the live
+      // report.
+      expect(response.data).toEqual({
+        rows: [
+          {
+            dimensionValues: [
+              { value: '/blog/1abcdefghijklmnopqrstuvwx' },
+              { value: '25' },
+            ],
+            metricValues: [{ value: '25' }],
+          },
+          {
+            dimensionValues: [
+              { value: '/blog/1abcdefghijklmnopqrstuvwx' },
+              { value: '50' },
+            ],
+            metricValues: [{ value: '15' }],
+          },
+          {
+            dimensionValues: [
+              { value: '/blog/1abcdefghijklmnopqrstuvwx' },
+              { value: '100' },
+            ],
+            metricValues: [{ value: '4' }],
+          },
+          {
+            dimensionValues: [
+              { value: '/blog/2abcdefghijklmnopqrstuvwx' },
+              { value: '25' },
+            ],
+            metricValues: [{ value: '3' }],
+          },
+        ],
+        rowCount: 4,
+      });
+      expect(
+        Code.blogReportShape_(
+          paramsFor({
+            dimensions: ['pagePath', 'customEvent:percent_scrolled'],
+            metrics: ['eventCount'],
+          })
+        )
+      ).toBe('scroll');
+      // The scroll shape with a filter stays unserved, like
+      // every other shape.
+      expect(
+        Code.buildBlogReportResponse_(
+          paramsFor({
+            dimensions: ['pagePath', 'customEvent:percent_scrolled'],
+            metrics: ['eventCount'],
+            filters: [
+              {
+                fieldName: 'eventName',
+                matchType: 'EXACT',
+                value: 'article_scroll',
+              },
+            ],
+          }),
+          null
+        ).ok
+      ).toBe(false);
+    });
+
     it('serves the sources shape sorted by views', () => {
       serveTabs(blogTabs());
       const response = Code.buildBlogReportResponse_(
